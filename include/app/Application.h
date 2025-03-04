@@ -90,6 +90,8 @@ private:
      */
     void setupWatchdog();
 
+    void checkAndReconnectAllStreams();
+
 private:
     // 成员变量
     bool running_;                           // 运行状态
@@ -102,6 +104,9 @@ private:
     std::unique_ptr<Watchdog> watchdog_;     // 看门狗
     bool useWatchdog_;                       // 是否使用看门狗
     int watchdogIntervalSeconds_;            // 看门狗检查间隔（秒）
+
+    int periodicReconnectInterval_; // 周期性重连间隔（秒）
+    int64_t lastPeriodicReconnectTime_ = 0; // 上次周期性重连时间
 };
 
 /**

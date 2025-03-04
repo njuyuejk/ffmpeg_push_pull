@@ -52,6 +52,19 @@ bool Application::initialize(const std::string& configFilePath) {
         AppConfig::saveToFile(configFilePath_);
     }
 
+    // 读取周期性重连设置
+    periodicReconnectInterval_ = 0; // 默认禁用
+    for (const auto& [key, value] : AppConfig::getExtraOptions()) {
+        if (key == "periodicReconnectInterval") {
+            periodicReconnectInterval_ = std::stoi(value);
+        }
+    }
+
+    if (periodicReconnectInterval_ > 0) {
+        Logger::info("Periodic reconnect enabled, interval: " +
+                     std::to_string(periodicReconnectInterval_) + " seconds");
+    }
+
     // 初始化日志系统
     LogLevel logLevel = static_cast<LogLevel>(AppConfig::getLogLevel());
     Logger::init(AppConfig::getLogToFile(), AppConfig::getLogFilePath(), logLevel);
@@ -82,17 +95,21 @@ bool Application::initialize(const std::string& configFilePath) {
     // 创建流管理器
     streamManager_ = std::make_unique<MultiStreamManager>(AppConfig::getThreadPoolSize());
 
-    // 设置看门狗 - 确保这个调用在这里!
+    // 设置看门狗
     if (useWatchdog_) {
         try {
-            setupWatchdog();
-            Logger::info("Watchdog setup completed successfully");
+            watchdog_ = std::make_unique<Watchdog>(watchdogIntervalSeconds_ * 1000);
+            watchdog_->start();
+
+            // 将看门狗设置到流管理器
+            streamManager_->setWatchdog(watchdog_.get());
+
+            Logger::info("Watchdog started with interval: " + std::to_string(watchdogIntervalSeconds_) + "s");
         } catch (const std::exception& e) {
             Logger::error("Failed to setup watchdog: " + std::string(e.what()));
-            // 继续初始化，不要因为看门狗失败而中断应用启动
+            useWatchdog_ = false;
+            watchdog_.reset();
         }
-    } else {
-        Logger::info("Watchdog is disabled in configuration");
     }
 
     running_ = true;
@@ -220,14 +237,11 @@ int Application::run() {
     // 启动所有配置的流
     startAllStreams();
 
+    lastPeriodicReconnectTime_ = time(nullptr);
+
     // 监控循环
     while (running_) {
         monitorStreams();
-
-        // 喂食看门狗，表示应用程序仍在正常运行
-        if (watchdog_ && useWatchdog_) {
-            watchdog_->feedTarget("application");
-        }
 
         // 延迟
         for (int i = 0; i < monitorIntervalSeconds_ && running_; i++) {
@@ -247,11 +261,14 @@ void Application::handleSignal(int signal) {
 // 清理应用
 void Application::cleanup() {
     Logger::info("Cleaning up application...");
+    running_ = false;  // 首先确保主循环终止
 
     // 停止看门狗
     if (watchdog_) {
         try {
             watchdog_->stop();
+            // 停止看门狗后等待片刻，确保其线程有时间终止
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             watchdog_.reset();
             Logger::info("Watchdog stopped and cleaned up");
         } catch (const std::exception& e) {
@@ -261,10 +278,15 @@ void Application::cleanup() {
         }
     }
 
+    // 等待一小段时间确保所有线程都注意到应用程序已停止
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
     // 停止所有流
     if (streamManager_) {
         try {
             stopAllStreams();
+            // 在释放指针前等待片刻，确保所有后台操作完成
+            std::this_thread::sleep_for(std::chrono::seconds(1));
             streamManager_.reset();
             Logger::info("Stream manager cleaned up");
         } catch (const std::exception& e) {
@@ -280,8 +302,6 @@ void Application::cleanup() {
     } catch (...) {
         std::cerr << "Error shutting down logger" << std::endl;
     }
-
-    running_ = false;
 }
 
 // 列出所有流
@@ -313,7 +333,6 @@ void Application::monitorStreams() {
 
     static std::map<std::string, int> restartAttempts;  // 跟踪每个流的重启尝试次数
     static std::map<std::string, int64_t> lastRestartTime;  // 上次重启时间
-    const int MAX_RESTART_ATTEMPTS = 10;  // 最大重启尝试次数
     const int RESTART_RESET_TIME = 300;   // 5分钟无错误后重置重启计数器
 
     // 查找并重启出错的流
@@ -340,28 +359,25 @@ void Application::monitorStreams() {
                 restartAttempts[streamId] = 0;
             }
 
-            // 超过最大重启次数，跳过此次重启
-            if (restartAttempts[streamId] >= MAX_RESTART_ATTEMPTS) {
-                if (restartAttempts[streamId] == MAX_RESTART_ATTEMPTS) {
-                    Logger::error("Stream " + streamId + " exceeded maximum restart attempts ("
-                                  + std::to_string(MAX_RESTART_ATTEMPTS)
-                                  + "). Will not attempt further restarts until application restart.");
-                    restartAttempts[streamId]++; // 增加计数以避免重复记录此消息
-                }
-                continue;
+            // 删除最大尝试次数限制，修改为无限重试，但逐渐增加间隔
+            // 计算重启延迟（使用指数退避策略，但有上限）
+            int backoffSeconds = std::min(60, 1 << std::min(restartAttempts[streamId], 10));
+
+            // 检查最后一次重启时间，确保不会太频繁重启
+            int64_t currentTime = time(nullptr);
+            if (lastRestartTime.find(streamId) != lastRestartTime.end() &&
+                currentTime - lastRestartTime[streamId] < backoffSeconds) {
+                continue; // 还没到重试时间
             }
 
-            Logger::warning("Detected issue in stream: " + streamId + ", attempting restart (attempt "
-                            + std::to_string(restartAttempts[streamId] + 1) + "/"
-                            + std::to_string(MAX_RESTART_ATTEMPTS) + ")");
+            Logger::warning("Attempting to reconnect stream: " + streamId + " (attempt "
+                            + std::to_string(restartAttempts[streamId] + 1) + ")");
 
             // 停止流
             streamManager_->stopStream(streamId);
 
-            // 计算重启延迟（使用指数退避策略）
-            int backoffSeconds = std::min(30, 1 << restartAttempts[streamId]);
-            Logger::info("Waiting " + std::to_string(backoffSeconds) + " seconds before restarting stream " + streamId);
-            std::this_thread::sleep_for(std::chrono::seconds(backoffSeconds));
+            // 等待指定的重启延迟
+            std::this_thread::sleep_for(std::chrono::seconds(2));
 
             // 获取配置并重新启动
             StreamConfig config = AppConfig::findStreamConfigById(streamId);
@@ -373,6 +389,7 @@ void Application::monitorStreams() {
                     restartAttempts[streamId]++;
                 } catch (const FFmpegException& e) {
                     Logger::error("Failed to restart stream " + streamId + ": " + e.what());
+                    lastRestartTime[streamId] = time(nullptr);
                     restartAttempts[streamId]++;
                 }
             } else {
@@ -413,6 +430,11 @@ void Application::startAllStreams() {
         }
     }
 
+    // 添加周期性喂养看门狗的代码
+    if (watchdog_) {
+        watchdog_->feedTarget("application");
+    }
+
     Logger::info("Started " + std::to_string(successCount) + " of " +
                  std::to_string(configs.size()) + " streams");
 }
@@ -423,4 +445,55 @@ void Application::stopAllStreams() {
 
     streamManager_->stopAll();
     Logger::info("Stopped all streams");
+}
+
+// 添加新方法
+void Application::checkAndReconnectAllStreams() {
+    Logger::info("Performing periodic reconnect check...");
+
+    std::vector<std::string> failedStreams;
+
+    // 检查所有已配置的流
+    const std::vector<StreamConfig>& configs = AppConfig::getStreamConfigs();
+    for (const auto& config : configs) {
+        bool streamExists = false;
+        bool streamRunning = false;
+        bool streamHasError = false;
+
+        // 检查流是否已经存在
+        std::vector<std::string> currentStreams = streamManager_->listStreams();
+        for (const auto& streamId : currentStreams) {
+            if (streamId == config.id) {
+                streamExists = true;
+                streamRunning = streamManager_->isStreamRunning(streamId);
+                streamHasError = streamManager_->hasStreamError(streamId);
+                break;
+            }
+        }
+
+        // 如果流不存在或有错误，尝试启动/重启
+        if (!streamExists || !streamRunning || streamHasError) {
+            try {
+                // 如果流存在但有问题，先停止
+                if (streamExists) {
+                    streamManager_->stopStream(config.id);
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                }
+
+                // 启动流
+                streamManager_->startStream(config);
+                Logger::info("Periodic check: Started stream " + config.id);
+            } catch (const FFmpegException& e) {
+                Logger::warning("Periodic check: Failed to start stream " + config.id + ": " + e.what());
+                failedStreams.push_back(config.id);
+            }
+        }
+    }
+
+    if (failedStreams.empty()) {
+        Logger::info("Periodic reconnect check completed, all streams handled");
+    } else {
+        Logger::warning("Periodic reconnect check completed with " +
+                        std::to_string(failedStreams.size()) + " failed streams");
+    }
 }

@@ -11,7 +11,7 @@ StreamProcessor::StreamProcessor(const StreamConfig& config)
         : config_(config), isRunning_(false), hasError_(false),
           reconnectAttempts_(0), maxReconnectAttempts_(5),
           lastFrameTime_(0), noDataTimeout_(10000000), // 10秒无数据视为停滞
-          isReconnecting_(false), watchdog_(nullptr), inputFormatContext_(nullptr),
+          isReconnecting_(false), inputFormatContext_(nullptr),
           outputFormatContext_(nullptr) {
 
     // 验证配置
@@ -39,22 +39,9 @@ StreamProcessor::StreamProcessor(const StreamConfig& config)
 
 StreamProcessor::~StreamProcessor() {
     try {
-        // 首先从看门狗中取消注册
-        if (watchdog_ && !watchdogId_.empty()) {
-            try {
-                watchdog_->unregisterTarget(watchdogId_);
-                Logger::debug("Stream " + config_.id + " unregistered from watchdog");
-            } catch (const std::exception& e) {
-                Logger::warning("Error unregistering stream " + config_.id + " from watchdog: " + e.what());
-            }
-            watchdog_ = nullptr; // 防止后续代码再次尝试访问
-        }
-
-        // 然后停止流处理
         stop();
         cleanup();
     } catch (const std::exception& e) {
-        // 析构函数中不应抛出异常
         Logger::error("Exception in StreamProcessor destructor: " + std::string(e.what()));
     } catch (...) {
         Logger::error("Unknown exception in StreamProcessor destructor");
@@ -78,25 +65,29 @@ void StreamProcessor::start() {
         Logger::info("Started stream processing: " + config_.id + " (" +
                      config_.inputUrl + " -> " + config_.outputUrl + ")");
     } catch (const FFmpegException& e) {
+        // 改变这里的处理方式，标记为错误但不重新抛出异常
         Logger::error("Failed to start stream " + config_.id + ": " + std::string(e.what()));
         cleanup();
         hasError_ = true;
-        throw;
+        isRunning_ = false;
+        // 不要在这里重新抛出异常，让调用者认为流已启动，
+        // 然后由监控系统检测到错误并尝试重连
     }
 }
 
 void StreamProcessor::stop() {
-    if (!isRunning_) {
-        return;
+    // 使用局部变量，避免多次设置原子变量
+    bool wasRunning = isRunning_.exchange(false);
+
+    if (wasRunning && processingThread_.joinable()) {
+        try {
+            processingThread_.join();
+            Logger::info("Processing thread joined for stream: " + config_.id);
+        } catch (const std::exception& e) {
+            Logger::error("Exception joining processing thread: " + std::string(e.what()));
+            // 不抛出异常，因为我们正在清理
+        }
     }
-
-    isRunning_ = false;
-
-    if (processingThread_.joinable()) {
-        processingThread_.join();
-    }
-
-    Logger::info("Stopped stream processing: " + config_.id);
 }
 
 bool StreamProcessor::isRunning() const {
@@ -1104,8 +1095,6 @@ void StreamProcessor::processLoop() {
                     processVideoPacket(packet, streamCtx);
                     packetProcessed = true;
                     frameCount++;
-                    // 在这里添加：
-                    feedWatchdog();  // 成功处理视频帧，喂养看门狗
                     break;
                 }
             }
@@ -1116,8 +1105,6 @@ void StreamProcessor::processLoop() {
                     if (packet->stream_index == streamCtx.streamIndex) {
                         processAudioPacket(packet, streamCtx);
                         packetProcessed = true;
-                        // 在这里添加：
-                        feedWatchdog();  // 成功处理视频帧，喂养看门狗
                         break;
                     }
                 }
@@ -1136,9 +1123,6 @@ void StreamProcessor::processLoop() {
                               std::to_string(runTime) + " seconds)");
 
                 lastLogTime = currentTime;
-
-                // 在这里添加：
-                feedWatchdog();  // 定期喂养看门狗
             }
 
             // 释放包
@@ -1525,85 +1509,5 @@ bool StreamProcessor::reconnect() {
         hasError_ = true;
         isReconnecting_ = false;
         return false;
-    }
-}
-
-void StreamProcessor::registerWithWatchdog(Watchdog* watchdog) {
-    if (!watchdog) {
-        Logger::warning("Attempted to register stream " + config_.id + " with null watchdog");
-        return;
-    }
-
-    // 如果已注册到另一个看门狗，先取消注册
-    if (watchdog_ && watchdog_ != watchdog && !watchdogId_.empty()) {
-        try {
-            watchdog_->unregisterTarget(watchdogId_);
-            Logger::debug("Stream " + config_.id + " unregistered from previous watchdog");
-        } catch (const std::exception& e) {
-            Logger::warning("Error unregistering from previous watchdog: " + std::string(e.what()));
-        }
-    }
-
-    // 检查流配置中是否启用了看门狗
-    if (!config_.isWatchdogEnabled()) {
-        Logger::info("Watchdog disabled for stream " + config_.id + " in configuration");
-        return;
-    }
-
-    watchdog_ = watchdog;
-    watchdogId_ = "stream_" + config_.id;
-
-    // 向看门狗注册此流
-    try {
-        bool registered = watchdog_->registerTarget(watchdogId_,
-                                                    [this]() -> bool {
-                                                        // 健康检查 - 流是否在运行且没有错误
-                                                        return this->isRunning() && !this->hasError();
-                                                    },
-                                                    [this]() {
-                                                        // 恢复 - 尝试重连流
-                                                        Logger::warning("Watchdog initiating recovery for stream: " + config_.id);
-                                                        try {
-                                                            // 如果流正在运行，先停止
-                                                            if (this->isRunning()) {
-                                                                this->stop();
-                                                                std::this_thread::sleep_for(std::chrono::seconds(1)); // 短暂等待确保完全停止
-                                                            }
-
-                                                            // 重新启动流
-                                                            this->start();
-                                                            Logger::info("Watchdog successfully restarted stream: " + config_.id);
-                                                        } catch (const std::exception& e) {
-                                                            Logger::error("Watchdog failed to restart stream " + config_.id + ": " + e.what());
-                                                        }
-                                                    }
-        );
-
-        if (registered) {
-            Logger::info("Stream " + config_.id + " registered with watchdog");
-        } else {
-            Logger::warning("Failed to register stream " + config_.id + " with watchdog");
-        }
-    } catch (const std::exception& e) {
-        Logger::error("Exception during watchdog registration for stream " + config_.id + ": " + e.what());
-        watchdog_ = nullptr;
-        watchdogId_ = "";
-    } catch (...) {
-        Logger::error("Unknown exception during watchdog registration for stream " + config_.id);
-        watchdog_ = nullptr;
-        watchdogId_ = "";
-    }
-}
-
-// 添加 feedWatchdog 方法
-void StreamProcessor::feedWatchdog() {
-    try {
-        if (watchdog_ && !watchdogId_.empty() && isRunning_ && !hasError_) {
-            watchdog_->feedTarget(watchdogId_);
-        }
-    } catch (const std::exception& e) {
-        Logger::warning("Exception in feedWatchdog for stream " + config_.id + ": " + e.what());
-    } catch (...) {
-        Logger::warning("Unknown exception in feedWatchdog for stream " + config_.id);
     }
 }

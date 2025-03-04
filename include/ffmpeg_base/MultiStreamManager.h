@@ -95,6 +95,16 @@ private:
     Watchdog* watchdog_ = nullptr;  // 看门狗指针
 
     std::string generateStreamId();
+
+    // 用于看门狗的互斥锁
+    std::mutex watchdogMutex_;
+
+    // 看门狗喂食线程和运行标志
+    std::thread watchdogFeederThread_;
+    std::atomic<bool> watchdogFeederRunning_{false};
+
+    // 看门狗喂食循环
+    void watchdogFeederLoop();
 };
 
 #endif // MULTI_STREAM_MANAGER_H

@@ -70,17 +70,6 @@ public:
      */
     bool updateConfig(const StreamConfig& config);
 
-    /**
-     * @brief 向看门狗注册此流处理器
-     * @param watchdog 看门狗指针
-     */
-    void registerWithWatchdog(Watchdog* watchdog);
-
-    /**
-     * @brief 喂养看门狗（表示流处理器仍在正常工作）
-     */
-    void feedWatchdog();
-
 private:
     // 流处理上下文结构体
     struct StreamContext {
@@ -119,10 +108,6 @@ private:
     std::atomic<int64_t> lastFrameTime_;
     std::atomic<int64_t> noDataTimeout_;
     std::atomic<bool> isReconnecting_;
-
-    // 看门狗相关
-    Watchdog* watchdog_ = nullptr;
-    std::string watchdogId_;
 
     // 私有方法
     void initialize();
