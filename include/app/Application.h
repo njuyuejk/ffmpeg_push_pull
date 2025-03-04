@@ -85,13 +85,6 @@ private:
      */
     void monitorStreams();
 
-    /**
-     * @brief 设置看门狗
-     */
-    void setupWatchdog();
-
-    void checkAndReconnectAllStreams();
-
 private:
     // 成员变量
     bool running_;                           // 运行状态
