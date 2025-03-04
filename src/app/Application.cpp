@@ -29,7 +29,9 @@ Application::Application()
         : running_(false),
           configFilePath_("D:/project/C++/my/ffmpeg-new-pull-push/config.ini"),
           monitorIntervalSeconds_(30),
-          autoRestartStreams_(true) {
+          autoRestartStreams_(true),
+          useWatchdog_(true),
+          watchdogIntervalSeconds_(5) {
 
     g_applicationInstance = this;
 }
@@ -66,6 +68,13 @@ bool Application::initialize(const std::string& configFilePath) {
         }
     }
 
+    // 读取看门狗配置
+    useWatchdog_ = AppConfig::getUseWatchdog();
+    watchdogIntervalSeconds_ = AppConfig::getWatchdogInterval();
+
+    Logger::info("Configuration loaded - watchdog: " + std::string(useWatchdog_ ? "enabled" : "disabled") +
+                 ", interval: " + std::to_string(watchdogIntervalSeconds_) + "s");
+
     // 注册信号处理器
     std::signal(SIGINT, signalHandlerWrapper);
     std::signal(SIGTERM, signalHandlerWrapper);
@@ -73,10 +82,134 @@ bool Application::initialize(const std::string& configFilePath) {
     // 创建流管理器
     streamManager_ = std::make_unique<MultiStreamManager>(AppConfig::getThreadPoolSize());
 
+    // 设置看门狗 - 确保这个调用在这里!
+    if (useWatchdog_) {
+        try {
+            setupWatchdog();
+            Logger::info("Watchdog setup completed successfully");
+        } catch (const std::exception& e) {
+            Logger::error("Failed to setup watchdog: " + std::string(e.what()));
+            // 继续初始化，不要因为看门狗失败而中断应用启动
+        }
+    } else {
+        Logger::info("Watchdog is disabled in configuration");
+    }
+
     running_ = true;
 
     Logger::info("Application initialized with config: " + configFilePath_);
     return true;
+}
+
+// 设置看门狗
+void Application::setupWatchdog() {
+    try {
+        if (!useWatchdog_) {
+            Logger::info("Watchdog disabled in configuration");
+            return;
+        }
+
+        // 确保 watchdogIntervalSeconds_ 是合理的值
+        if (watchdogIntervalSeconds_ < 1) {
+            watchdogIntervalSeconds_ = 5; // 默认5秒
+            Logger::warning("Invalid watchdog interval, using default (5 seconds)");
+        }
+
+        // 创建看门狗实例
+        watchdog_ = std::make_unique<Watchdog>(watchdogIntervalSeconds_ * 1000);
+
+        // 注册应用程序本身作为监控目标
+        bool appRegistered = watchdog_->registerTarget("application",
+                                                       [this]() -> bool {
+                                                           // 应用健康检查 - 简单地检查应用是否正在运行
+                                                           return this->isRunning();
+                                                       },
+                                                       [this]() {
+                                                           // 应用恢复 - 如果应用需要恢复，记录日志
+                                                           Logger::warning("Application recovery triggered by watchdog");
+                                                           // 在实际应用中，可以添加更多恢复操作
+                                                       }
+        );
+
+        if (!appRegistered) {
+            Logger::warning("Failed to register application with watchdog");
+        }
+
+        // 注册流管理器作为监控目标
+        if (streamManager_) {
+            bool smRegistered = watchdog_->registerTarget("stream_manager",
+                                                          [this]() -> bool {
+                                                              try {
+                                                                  // 检查流管理器的健康状态
+                                                                  // 只要有一个流在正常运行就认为健康
+                                                                  std::vector<std::string> streams = streamManager_->listStreams();
+                                                                  if (streams.empty()) return true; // 没有流时也视为健康
+
+                                                                  for (const auto& streamId : streams) {
+                                                                      if (streamManager_->isStreamRunning(streamId) && !streamManager_->hasStreamError(streamId)) {
+                                                                          return true;
+                                                                      }
+                                                                  }
+                                                                  return false;
+                                                              } catch (const std::exception& e) {
+                                                                  Logger::error("Exception in stream_manager health check: " + std::string(e.what()));
+                                                                  return false;
+                                                              }
+                                                          },
+                                                          [this]() {
+                                                              try {
+                                                                  // 流管理器恢复 - 尝试重启所有错误的流
+                                                                  Logger::warning("Stream manager recovery triggered by watchdog");
+                                                                  std::vector<std::string> streams = streamManager_->listStreams();
+                                                                  for (const auto& streamId : streams) {
+                                                                      try {
+                                                                          if (streamManager_->hasStreamError(streamId) || !streamManager_->isStreamRunning(streamId)) {
+                                                                              Logger::info("Watchdog attempting to restart stream: " + streamId);
+                                                                              StreamConfig config = AppConfig::findStreamConfigById(streamId);
+                                                                              if (config.id == streamId) {
+                                                                                  streamManager_->stopStream(streamId);
+                                                                                  std::this_thread::sleep_for(std::chrono::seconds(2)); // 等待2秒确保彻底停止
+                                                                                  streamManager_->startStream(config);
+                                                                                  Logger::info("Watchdog successfully restarted stream: " + streamId);
+                                                                              }
+                                                                          }
+                                                                      } catch (const std::exception& e) {
+                                                                          Logger::error("Watchdog failed to restart stream " + streamId + ": " + e.what());
+                                                                      }
+                                                                  }
+                                                              } catch (const std::exception& e) {
+                                                                  Logger::error("Exception in stream_manager recovery: " + std::string(e.what()));
+                                                              }
+                                                          }
+            );
+
+            if (!smRegistered) {
+                Logger::warning("Failed to register stream manager with watchdog");
+            }
+        }
+
+        // 将看门狗设置到流管理器
+        if (streamManager_ && watchdog_) {
+            try {
+                streamManager_->setWatchdog(watchdog_.get());
+            } catch (const std::exception& e) {
+                Logger::error("Failed to set watchdog to stream manager: " + std::string(e.what()));
+            }
+        }
+
+        // 启动看门狗
+        watchdog_->start();
+        Logger::info("Watchdog started with interval: " + std::to_string(watchdogIntervalSeconds_) + "s");
+
+    } catch (const std::exception& e) {
+        Logger::error("Failed to setup watchdog: " + std::string(e.what()));
+        useWatchdog_ = false; // 禁用看门狗
+        watchdog_.reset(); // 释放已分配的资源
+    } catch (...) {
+        Logger::error("Unknown exception in setupWatchdog");
+        useWatchdog_ = false;
+        watchdog_.reset();
+    }
 }
 
 // 运行应用
@@ -84,29 +217,17 @@ int Application::run() {
     // 主循环 - 监控所有流
     Logger::info("Starting main loop, press Ctrl+C to exit");
 
-//    std::mutex mtx;
-
     // 启动所有配置的流
     startAllStreams();
-
-    // 启动一个线程等待用户输入来决定何时停止
-//    std::thread control_thread([&](){
-//        std::string cmd;
-//        while (true) {
-//            std::cin >> cmd;
-//            if (cmd == "q" || cmd == "quit") {
-//                {
-//                    std::lock_guard<std::mutex> lock(mtx);
-//                    running_ = false;
-//                }
-//                break;
-//            }
-//        }
-//    });
 
     // 监控循环
     while (running_) {
         monitorStreams();
+
+        // 喂食看门狗，表示应用程序仍在正常运行
+        if (watchdog_ && useWatchdog_) {
+            watchdog_->feedTarget("application");
+        }
 
         // 延迟
         for (int i = 0; i < monitorIntervalSeconds_ && running_; i++) {
@@ -127,16 +248,38 @@ void Application::handleSignal(int signal) {
 void Application::cleanup() {
     Logger::info("Cleaning up application...");
 
-    // 停止所有流
-    if (streamManager_) {
-        stopAllStreams();
+    // 停止看门狗
+    if (watchdog_) {
+        try {
+            watchdog_->stop();
+            watchdog_.reset();
+            Logger::info("Watchdog stopped and cleaned up");
+        } catch (const std::exception& e) {
+            Logger::error("Error stopping watchdog: " + std::string(e.what()));
+        } catch (...) {
+            Logger::error("Unknown error stopping watchdog");
+        }
     }
 
-    // 清理流管理器
-    streamManager_.reset();
+    // 停止所有流
+    if (streamManager_) {
+        try {
+            stopAllStreams();
+            streamManager_.reset();
+            Logger::info("Stream manager cleaned up");
+        } catch (const std::exception& e) {
+            Logger::error("Error cleaning up stream manager: " + std::string(e.what()));
+        } catch (...) {
+            Logger::error("Unknown error cleaning up stream manager");
+        }
+    }
 
     // 关闭日志系统
-    Logger::shutdown();
+    try {
+        Logger::shutdown();
+    } catch (...) {
+        std::cerr << "Error shutting down logger" << std::endl;
+    }
 
     running_ = false;
 }
@@ -168,18 +311,57 @@ void Application::monitorStreams() {
         return;
     }
 
+    static std::map<std::string, int> restartAttempts;  // 跟踪每个流的重启尝试次数
+    static std::map<std::string, int64_t> lastRestartTime;  // 上次重启时间
+    const int MAX_RESTART_ATTEMPTS = 10;  // 最大重启尝试次数
+    const int RESTART_RESET_TIME = 300;   // 5分钟无错误后重置重启计数器
+
     // 查找并重启出错的流
     std::vector<std::string> streams = streamManager_->listStreams();
     for (const auto& streamId : streams) {
-        printf("attempt restart stream\n");
-        printf("%d\n", streamManager_->hasStreamError(streamId));
-        printf("%d\n", !streamManager_->isStreamRunning(streamId));
-        if (streamManager_->hasStreamError(streamId) && !streamManager_->isStreamRunning(streamId)) {
-            printf("start stream\n");
-            Logger::warning("Detected error in stream: " + streamId + ", attempting restart");
+        bool hasError = streamManager_->hasStreamError(streamId);
+        bool isRunning = streamManager_->isStreamRunning(streamId);
+
+        // 检查是否应该重置重启计数器
+        if (!hasError && isRunning) {
+            int64_t currentTime = time(nullptr);
+            if (lastRestartTime.find(streamId) != lastRestartTime.end() &&
+                currentTime - lastRestartTime[streamId] > RESTART_RESET_TIME) {
+                restartAttempts[streamId] = 0;
+                Logger::debug("Reset restart counter for stream: " + streamId);
+            }
+            continue; // 流正常运行，无需处理
+        }
+
+        // 流出错或未运行，尝试重启
+        if (hasError || !isRunning) {
+            // 初始化重启计数器
+            if (restartAttempts.find(streamId) == restartAttempts.end()) {
+                restartAttempts[streamId] = 0;
+            }
+
+            // 超过最大重启次数，跳过此次重启
+            if (restartAttempts[streamId] >= MAX_RESTART_ATTEMPTS) {
+                if (restartAttempts[streamId] == MAX_RESTART_ATTEMPTS) {
+                    Logger::error("Stream " + streamId + " exceeded maximum restart attempts ("
+                                  + std::to_string(MAX_RESTART_ATTEMPTS)
+                                  + "). Will not attempt further restarts until application restart.");
+                    restartAttempts[streamId]++; // 增加计数以避免重复记录此消息
+                }
+                continue;
+            }
+
+            Logger::warning("Detected issue in stream: " + streamId + ", attempting restart (attempt "
+                            + std::to_string(restartAttempts[streamId] + 1) + "/"
+                            + std::to_string(MAX_RESTART_ATTEMPTS) + ")");
 
             // 停止流
             streamManager_->stopStream(streamId);
+
+            // 计算重启延迟（使用指数退避策略）
+            int backoffSeconds = std::min(30, 1 << restartAttempts[streamId]);
+            Logger::info("Waiting " + std::to_string(backoffSeconds) + " seconds before restarting stream " + streamId);
+            std::this_thread::sleep_for(std::chrono::seconds(backoffSeconds));
 
             // 获取配置并重新启动
             StreamConfig config = AppConfig::findStreamConfigById(streamId);
@@ -187,9 +369,14 @@ void Application::monitorStreams() {
                 try {
                     streamManager_->startStream(config);
                     Logger::info("Restarted stream: " + streamId);
+                    lastRestartTime[streamId] = time(nullptr);
+                    restartAttempts[streamId]++;
                 } catch (const FFmpegException& e) {
                     Logger::error("Failed to restart stream " + streamId + ": " + e.what());
+                    restartAttempts[streamId]++;
                 }
+            } else {
+                Logger::error("Could not find configuration for stream: " + streamId);
             }
         }
     }
@@ -207,7 +394,7 @@ void Application::startAllStreams() {
         bool autoStart = true;
         for (const auto& [key, value] : config.extraOptions) {
             if (key == "autoStart") {
-                autoStart = value.c_str();
+                autoStart = (value == "true" || value == "1");
                 break;
             }
         }

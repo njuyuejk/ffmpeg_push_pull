@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(ffmpeg_new_pull_push)
+project(ffmpeg_pull_push)
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -41,6 +41,8 @@ set(common
         include/common/ThreadPool.h
         src/common/StreamConfig.cpp
         include/common/StreamConfig.h
+        src/common/Watchdog.cpp
+        include/common/Watchdog.h
 )
 
 set(ffmpeg_base
@@ -56,7 +58,7 @@ set(logger
         src/logger/Logger.cpp
         include/logger/Logger.h)
 
-add_executable(ffmpeg_new_pull_push main.cpp ${app} ${common} ${ffmpeg_base} ${logger})
+add_executable(ffmpeg_pull_push main.cpp ${app} ${common} ${ffmpeg_base} ${logger})
 
 # 链接 FFmpeg 库
-target_link_libraries(ffmpeg_new_pull_push PRIVATE ${FOUND_FFMPEG_LIBS} pthread)
+target_link_libraries(ffmpeg_pull_push PRIVATE ${FOUND_FFMPEG_LIBS} pthread)

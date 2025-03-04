@@ -13,7 +13,7 @@ int main(int argc, char* argv[]) {
         Application& app = Application::getInstance();
 
         // 初始化应用程序（使用默认配置文件路径）
-        if (!app.initialize("D:/project/C++/my/ffmpeg-new-pull-push/config.ini")) {
+        if (!app.initialize("D:/project/C++/my/ffmpeg_push_pull/config.ini")) {
             return 1;
         }
 

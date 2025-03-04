@@ -3,6 +3,7 @@
 
 #include "ffmpeg_base/MultiStreamManager.h"
 #include "common/StreamConfig.h"
+#include "common/Watchdog.h"
 #include <string>
 #include <memory>
 
@@ -84,6 +85,11 @@ private:
      */
     void monitorStreams();
 
+    /**
+     * @brief 设置看门狗
+     */
+    void setupWatchdog();
+
 private:
     // 成员变量
     bool running_;                           // 运行状态
@@ -91,6 +97,11 @@ private:
     std::unique_ptr<MultiStreamManager> streamManager_; // 流管理器
     int monitorIntervalSeconds_;             // 监控间隔（秒）
     bool autoRestartStreams_;                // 是否自动重启出错的流
+
+    // 看门狗相关
+    std::unique_ptr<Watchdog> watchdog_;     // 看门狗
+    bool useWatchdog_;                       // 是否使用看门狗
+    int watchdogIntervalSeconds_;            // 看门狗检查间隔（秒）
 };
 
 /**

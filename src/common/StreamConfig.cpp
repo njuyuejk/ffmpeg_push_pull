@@ -55,6 +55,8 @@ std::string AppConfig::logFilePath = "ffmpeg_stream_processor.log";
 int AppConfig::logLevel = 1; // INFO
 int AppConfig::threadPoolSize = 4;
 std::map<std::string, std::string> AppConfig::extraOptions;
+bool AppConfig::useWatchdog = true;
+int AppConfig::watchdogInterval = 5;
 
 StreamConfig StreamConfig::createDefault() {
     StreamConfig config;
@@ -69,7 +71,19 @@ StreamConfig StreamConfig::createDefault() {
     config.bufferSize = 1000000;
     config.enableHardwareAccel = true;
     config.hwaccelType = "auto";
+
+    // 设置默认的重连参数
     config.extraOptions["autoStart"] = "true";
+    config.extraOptions["maxReconnectAttempts"] = "5";
+    config.extraOptions["noDataTimeout"] = "10000";  // 10秒无数据超时
+    config.extraOptions["input_reconnect"] = "1";
+    config.extraOptions["input_reconnect_streamed"] = "1";
+    config.extraOptions["input_reconnect_delay_max"] = "5";
+
+    // 设置看门狗相关参数
+    config.extraOptions["watchdogEnabled"] = "true";  // 默认为每个流启用看门狗
+    config.extraOptions["watchdogFailThreshold"] = "3";  // 失败3次后触发恢复
+
     return config;
 }
 
@@ -103,8 +117,24 @@ StreamConfig StreamConfig::fromString(const std::string& configStr) {
         else if (key == "hwaccelType") config.hwaccelType = value;
         else if (key == "width") config.width = std::stoi(value);
         else if (key == "height") config.height = std::stoi(value);
+            // 处理重连相关的配置选项
+        else if (key == "maxReconnectAttempts" ||
+                 key == "noDataTimeout" ||
+                 key == "input_reconnect" ||
+                 key == "input_reconnect_streamed" ||
+                 key == "input_reconnect_delay_max") {
+            // 显式处理这些选项，确保它们被正确记录到日志
+            config.extraOptions[key] = value;
+            Logger::debug("Setting reconnection parameter: " + key + "=" + value);
+        }
+            // 处理看门狗相关的配置选项
+        else if (key == "watchdogEnabled" ||
+                 key == "watchdogFailThreshold") {
+            config.extraOptions[key] = value;
+            Logger::debug("Setting watchdog parameter: " + key + "=" + value);
+        }
         else {
-            // 额外选项
+            // 其他额外选项
             config.extraOptions[key] = value;
         }
     }
@@ -116,6 +146,47 @@ bool StreamConfig::validate() const {
     // 基本验证
     if (inputUrl.empty() || outputUrl.empty()) {
         return false;
+    }
+
+    // 验证重连相关参数
+    if (extraOptions.find("maxReconnectAttempts") != extraOptions.end()) {
+        try {
+            int attempts = std::stoi(extraOptions.at("maxReconnectAttempts"));
+            if (attempts < 0) {
+                Logger::warning("Invalid maxReconnectAttempts value (must be >= 0): " + extraOptions.at("maxReconnectAttempts"));
+                return false;
+            }
+        } catch (const std::exception& e) {
+            Logger::warning("Invalid maxReconnectAttempts format: " + extraOptions.at("maxReconnectAttempts"));
+            return false;
+        }
+    }
+
+    if (extraOptions.find("noDataTimeout") != extraOptions.end()) {
+        try {
+            int timeout = std::stoi(extraOptions.at("noDataTimeout"));
+            if (timeout < 1000) { // 至少1秒
+                Logger::warning("Invalid noDataTimeout value (must be >= 1000 ms): " + extraOptions.at("noDataTimeout"));
+                return false;
+            }
+        } catch (const std::exception& e) {
+            Logger::warning("Invalid noDataTimeout format: " + extraOptions.at("noDataTimeout"));
+            return false;
+        }
+    }
+
+    // 验证看门狗相关参数
+    if (extraOptions.find("watchdogFailThreshold") != extraOptions.end()) {
+        try {
+            int threshold = std::stoi(extraOptions.at("watchdogFailThreshold"));
+            if (threshold < 1) {
+                Logger::warning("Invalid watchdogFailThreshold value (must be >= 1): " + extraOptions.at("watchdogFailThreshold"));
+                return false;
+            }
+        } catch (const std::exception& e) {
+            Logger::warning("Invalid watchdogFailThreshold format: " + extraOptions.at("watchdogFailThreshold"));
+            return false;
+        }
     }
 
     // 更多验证规则可以根据需要添加
@@ -142,13 +213,36 @@ std::string StreamConfig::toString() const {
     ss << "width=" << width << "\n";
     ss << "height=" << height << "\n";
 
+    // 优先输出重要的参数，以便在配置文件中更容易找到
+    // 重连参数
+    if (extraOptions.find("maxReconnectAttempts") != extraOptions.end()) {
+        ss << "maxReconnectAttempts=" << extraOptions.at("maxReconnectAttempts") << "\n";
+    }
+    if (extraOptions.find("noDataTimeout") != extraOptions.end()) {
+        ss << "noDataTimeout=" << extraOptions.at("noDataTimeout") << "\n";
+    }
+
+    // 看门狗参数
+    if (extraOptions.find("watchdogEnabled") != extraOptions.end()) {
+        ss << "watchdogEnabled=" << extraOptions.at("watchdogEnabled") << "\n";
+    }
+    if (extraOptions.find("watchdogFailThreshold") != extraOptions.end()) {
+        ss << "watchdogFailThreshold=" << extraOptions.at("watchdogFailThreshold") << "\n";
+    }
+
+    // 其他所有额外选项
     for (const auto& [key, value] : extraOptions) {
-        ss << key << "=" << value << "\n";
+        // 跳过已经输出的重要参数
+        if (key != "maxReconnectAttempts" && key != "noDataTimeout" &&
+            key != "watchdogEnabled" && key != "watchdogFailThreshold") {
+            ss << key << "=" << value << "\n";
+        }
     }
 
     return ss.str();
 }
 
+// AppConfig 相关方法
 bool AppConfig::loadFromFile(const std::string& configFilePath) {
     std::ifstream file(configFilePath);
     if (!file.is_open()) {
@@ -201,6 +295,8 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
             else if (key == "logFilePath") logFilePath = value;
             else if (key == "logLevel") logLevel = std::stoi(value);
             else if (key == "threadPoolSize") threadPoolSize = std::stoi(value);
+            else if (key == "useWatchdog") useWatchdog = (value == "true" || value == "1");
+            else if (key == "watchdogInterval") watchdogInterval = std::stoi(value);
             else {
                 // 其他全局选项保存到额外选项中
                 extraOptions[key] = value;
@@ -220,6 +316,30 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
     }
 
     file.close();
+
+    // 输出加载信息
+    Logger::info("Loaded " + std::to_string(streamConfigs.size()) + " stream configurations");
+    Logger::info("Global watchdog settings: useWatchdog=" + std::string(useWatchdog ? "true" : "false") +
+                 ", interval=" + std::to_string(watchdogInterval) + "s");
+
+    for (const auto& config : streamConfigs) {
+        Logger::debug("Loaded stream: " + config.id + " (" + config.inputUrl + " -> " + config.outputUrl + ")");
+
+        // 记录重连和看门狗相关配置
+        if (config.extraOptions.find("maxReconnectAttempts") != config.extraOptions.end()) {
+            Logger::debug("  maxReconnectAttempts: " + config.extraOptions.at("maxReconnectAttempts"));
+        }
+        if (config.extraOptions.find("noDataTimeout") != config.extraOptions.end()) {
+            Logger::debug("  noDataTimeout: " + config.extraOptions.at("noDataTimeout") + " ms");
+        }
+        if (config.extraOptions.find("watchdogEnabled") != config.extraOptions.end()) {
+            Logger::debug("  watchdogEnabled: " + config.extraOptions.at("watchdogEnabled"));
+        }
+        if (config.extraOptions.find("watchdogFailThreshold") != config.extraOptions.end()) {
+            Logger::debug("  watchdogFailThreshold: " + config.extraOptions.at("watchdogFailThreshold"));
+        }
+    }
+
     return true;
 }
 
@@ -230,24 +350,39 @@ bool AppConfig::saveToFile(const std::string& configFilePath) {
     }
 
     // 写入常规部分
+    file << "#===========================================================\n";
+    file << "# FFmpeg Stream Processor Configuration\n";
+    file << "#===========================================================\n\n";
+
     file << "[general]\n";
+    file << "# 日志配置\n";
     file << "logToFile=" << (logToFile ? "true" : "false") << "\n";
     file << "logFilePath=" << logFilePath << "\n";
-    file << "logLevel=" << logLevel << "\n";
-    file << "threadPoolSize=" << threadPoolSize << "\n";
+    file << "logLevel=" << logLevel << "\n\n";
 
-    // 写入额外的应用程序选项
-    file << "# Application settings\n";
+    file << "# 线程池配置\n";
+    file << "threadPoolSize=" << threadPoolSize << "\n\n";
+
+    file << "# 应用程序设置\n";
     file << "monitorInterval=30\n";  // 监控间隔（秒）
-    file << "autoRestartStreams=true\n";  // 是否自动重启出错的流
+    file << "autoRestartStreams=true\n\n";  // 是否自动重启出错的流
 
+    file << "# 看门狗配置\n";
+    file << "useWatchdog=" << (useWatchdog ? "true" : "false") << "\n";
+    file << "watchdogInterval=" << watchdogInterval << "  # 看门狗检查间隔（秒）\n\n";
+
+    // 写入其他全局选项
     for (const auto& [key, value] : extraOptions) {
-        if (key != "monitorInterval" && key != "autoRestartStreams") {
+        if (key != "monitorInterval" && key != "autoRestartStreams" &&
+            key != "useWatchdog" && key != "watchdogInterval") {
             file << key << "=" << value << "\n";
         }
     }
 
     file << "\n";
+    file << "#===========================================================\n";
+    file << "# 流配置\n";
+    file << "#===========================================================\n\n";
 
     // 写入每个流配置
     for (size_t i = 0; i < streamConfigs.size(); ++i) {
@@ -281,6 +416,14 @@ const std::map<std::string, std::string>& AppConfig::getExtraOptions() {
 
 const std::vector<StreamConfig>& AppConfig::getStreamConfigs() {
     return streamConfigs;
+}
+
+bool AppConfig::getUseWatchdog() {
+    return useWatchdog;
+}
+
+int AppConfig::getWatchdogInterval() {
+    return watchdogInterval;
 }
 
 void AppConfig::addStreamConfig(const StreamConfig& config) {

@@ -66,6 +66,74 @@ struct StreamConfig {
      * @return 配置的字符串表示
      */
     std::string toString() const;
+
+    /**
+     * @brief 获取重连尝试次数
+     * @return 最大重连尝试次数，如果未设置则返回默认值5
+     */
+    int getMaxReconnectAttempts() const {
+        auto it = extraOptions.find("maxReconnectAttempts");
+        if (it != extraOptions.end()) {
+            try {
+                return std::stoi(it->second);
+            } catch (...) {
+                return 5; // 默认值
+            }
+        }
+        return 5; // 默认值
+    }
+
+    /**
+     * @brief 获取无数据超时时间（毫秒）
+     * @return 无数据超时时间，如果未设置则返回默认值10000ms
+     */
+    int getNoDataTimeout() const {
+        auto it = extraOptions.find("noDataTimeout");
+        if (it != extraOptions.end()) {
+            try {
+                return std::stoi(it->second);
+            } catch (...) {
+                return 10000; // 默认值
+            }
+        }
+        return 10000; // 默认值
+    }
+
+    /**
+     * @brief 检查是否启用自动重连
+     * @return 是否启用重连
+     */
+    bool isReconnectEnabled() const {
+        return getMaxReconnectAttempts() > 0;
+    }
+
+    /**
+     * @brief 检查是否为此流启用看门狗
+     * @return 是否启用看门狗
+     */
+    bool isWatchdogEnabled() const {
+        auto it = extraOptions.find("watchdogEnabled");
+        if (it != extraOptions.end()) {
+            return (it->second == "true" || it->second == "1");
+        }
+        return true; // 默认启用
+    }
+
+    /**
+     * @brief 获取看门狗失败阈值
+     * @return 失败次数阈值，如果未设置则返回默认值3
+     */
+    int getWatchdogFailThreshold() const {
+        auto it = extraOptions.find("watchdogFailThreshold");
+        if (it != extraOptions.end()) {
+            try {
+                return std::stoi(it->second);
+            } catch (...) {
+                return 3; // 默认值
+            }
+        }
+        return 3; // 默认值
+    }
 };
 
 /**
@@ -106,6 +174,12 @@ public:
     static const std::map<std::string, std::string>& getExtraOptions();
 
     /**
+     * @brief 获取看门狗配置
+     */
+    static bool getUseWatchdog();
+    static int getWatchdogInterval();
+
+    /**
      * @brief 获取全部流配置
      */
     static const std::vector<StreamConfig>& getStreamConfigs();
@@ -144,6 +218,8 @@ private:
     static int logLevel;
     static int threadPoolSize;
     static std::map<std::string, std::string> extraOptions;
+    static bool useWatchdog;
+    static int watchdogInterval;
 };
 
 #endif // STREAM_CONFIG_H

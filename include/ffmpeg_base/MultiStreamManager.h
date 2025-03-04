@@ -3,6 +3,7 @@
 
 #include "StreamProcessor.h"
 #include "common/ThreadPool.h"
+#include "common/Watchdog.h"
 #include <memory>
 #include <map>
 #include <mutex>
@@ -80,11 +81,18 @@ public:
      */
     bool updateStreamConfig(const std::string& streamId, const StreamConfig& config);
 
+    /**
+     * @brief 设置看门狗
+     * @param watchdog 看门狗指针
+     */
+    void setWatchdog(Watchdog* watchdog);
+
 private:
     int maxConcurrentStreams_;
     std::unique_ptr<ThreadPool> threadPool_;
     std::mutex streamsMutex_;
     std::map<std::string, std::shared_ptr<StreamProcessor>> streams_;
+    Watchdog* watchdog_ = nullptr;  // 看门狗指针
 
     std::string generateStreamId();
 };

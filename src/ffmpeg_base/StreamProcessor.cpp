@@ -8,11 +8,25 @@ extern "C" {
 }
 
 StreamProcessor::StreamProcessor(const StreamConfig& config)
-        : config_(config), isRunning_(false), hasError_(false) {
+        : config_(config), isRunning_(false), hasError_(false),
+          reconnectAttempts_(0), maxReconnectAttempts_(5),
+          lastFrameTime_(0), noDataTimeout_(10000000), // 10秒无数据视为停滞
+          isReconnecting_(false), watchdog_(nullptr), inputFormatContext_(nullptr),
+          outputFormatContext_(nullptr) {
 
     // 验证配置
     if (!config.validate()) {
         throw FFmpegException("Invalid stream configuration for: " + config.id);
+    }
+
+    // 检查配置中是否有重连相关参数
+    for (const auto& [key, value] : config.extraOptions) {
+        if (key == "maxReconnectAttempts") {
+            maxReconnectAttempts_ = std::stoi(value);
+        } else if (key == "noDataTimeout") {
+            // 配置中以毫秒为单位，转换为微秒
+            noDataTimeout_ = std::stoll(value) * 1000;
+        }
     }
 
     // 初始化FFmpeg网络功能
@@ -24,8 +38,27 @@ StreamProcessor::StreamProcessor(const StreamConfig& config)
 }
 
 StreamProcessor::~StreamProcessor() {
-    stop();
-    cleanup();
+    try {
+        // 首先从看门狗中取消注册
+        if (watchdog_ && !watchdogId_.empty()) {
+            try {
+                watchdog_->unregisterTarget(watchdogId_);
+                Logger::debug("Stream " + config_.id + " unregistered from watchdog");
+            } catch (const std::exception& e) {
+                Logger::warning("Error unregistering stream " + config_.id + " from watchdog: " + e.what());
+            }
+            watchdog_ = nullptr; // 防止后续代码再次尝试访问
+        }
+
+        // 然后停止流处理
+        stop();
+        cleanup();
+    } catch (const std::exception& e) {
+        // 析构函数中不应抛出异常
+        Logger::error("Exception in StreamProcessor destructor: " + std::string(e.what()));
+    } catch (...) {
+        Logger::error("Unknown exception in StreamProcessor destructor");
+    }
 }
 
 void StreamProcessor::start() {
@@ -38,6 +71,8 @@ void StreamProcessor::start() {
         initialize();
         isRunning_ = true;
         hasError_ = false;
+        reconnectAttempts_ = 0;  // 重置重连计数器
+        lastFrameTime_ = av_gettime(); // 初始化最后一帧时间
 
         processingThread_ = std::thread(&StreamProcessor::processLoop, this);
         Logger::info("Started stream processing: " + config_.id + " (" +
@@ -957,10 +992,12 @@ void StreamProcessor::processLoop() {
     int64_t lastLogTime = 0;
     int frameCount = 0;
     int streamErrorCount = 0;
-    const int MAX_ERRORS_BEFORE_ABORT = 100; // 最大连续错误数
+    const int MAX_ERRORS_BEFORE_RECONNECT = 20; // 连续错误阈值减小，触发重连更敏感
+    bool reconnectInProgress = false;
 
     // 记录开始处理时间
     int64_t startTime = av_gettime() / 1000000;
+    lastFrameTime_ = av_gettime(); // 初始化最后一帧时间
     Logger::info("Starting process loop for stream: " + config_.id);
 
     // 输出更多的流信息
@@ -1000,6 +1037,23 @@ void StreamProcessor::processLoop() {
 
     while (isRunning_) {
         try {
+            // 检查流是否停滞
+            if (isStreamStalled() && !reconnectInProgress) {
+                Logger::warning("Stream " + config_.id + " appears stalled (no data for "
+                                + std::to_string(noDataTimeout_ / 1000000) + " seconds)");
+
+                reconnectInProgress = true;
+                if (!reconnect()) {
+                    // 重连失败，设置错误并退出循环
+                    hasError_ = true;
+                    break;
+                }
+                reconnectInProgress = false;
+                streamErrorCount = 0;
+                // 重连后继续循环
+                continue;
+            }
+
             // 读取输入包
             int ret = av_read_frame(inputFormatContext_, packet);
             if (ret < 0) {
@@ -1013,16 +1067,32 @@ void StreamProcessor::processLoop() {
                     continue;
                 } else {
                     streamErrorCount++;
-                    if (streamErrorCount > MAX_ERRORS_BEFORE_ABORT) {
-                        throw FFmpegException("Too many consecutive errors, aborting stream", ret);
+                    if (streamErrorCount > MAX_ERRORS_BEFORE_RECONNECT && !reconnectInProgress) {
+                        Logger::warning("Too many consecutive errors (" + std::to_string(streamErrorCount)
+                                        + "), attempting reconnection");
+
+                        reconnectInProgress = true;
+                        if (!reconnect()) {
+                            // 重连失败，设置错误并退出循环
+                            hasError_ = true;
+                            break;
+                        }
+                        reconnectInProgress = false;
+                        streamErrorCount = 0;
+                        // 重连后继续循环
+                        continue;
                     }
+
                     Logger::warning("Error reading frame (attempt " + std::to_string(streamErrorCount) +
-                                    "/" + std::to_string(MAX_ERRORS_BEFORE_ABORT) + "): " +
+                                    "/" + std::to_string(MAX_ERRORS_BEFORE_RECONNECT) + "): " +
                                     std::to_string(ret));
                     av_usleep(100000);  // 错误后休眠100ms
                     continue;
                 }
             }
+
+            // 更新最后一帧时间
+            lastFrameTime_ = av_gettime();
 
             // 重置错误计数
             streamErrorCount = 0;
@@ -1034,6 +1104,8 @@ void StreamProcessor::processLoop() {
                     processVideoPacket(packet, streamCtx);
                     packetProcessed = true;
                     frameCount++;
+                    // 在这里添加：
+                    feedWatchdog();  // 成功处理视频帧，喂养看门狗
                     break;
                 }
             }
@@ -1044,6 +1116,8 @@ void StreamProcessor::processLoop() {
                     if (packet->stream_index == streamCtx.streamIndex) {
                         processAudioPacket(packet, streamCtx);
                         packetProcessed = true;
+                        // 在这里添加：
+                        feedWatchdog();  // 成功处理视频帧，喂养看门狗
                         break;
                     }
                 }
@@ -1062,6 +1136,9 @@ void StreamProcessor::processLoop() {
                               std::to_string(runTime) + " seconds)");
 
                 lastLogTime = currentTime;
+
+                // 在这里添加：
+                feedWatchdog();  // 定期喂养看门狗
             }
 
             // 释放包
@@ -1070,16 +1147,25 @@ void StreamProcessor::processLoop() {
         } catch (const FFmpegException& e) {
             Logger::error("Stream processing error: " + std::string(e.what()));
             av_packet_unref(packet);
-            hasError_ = true;
-            isRunning_ = false;
 
-            // 如果是致命错误，退出循环
-            if (e.getErrorCode() != AVERROR(EAGAIN) && e.getErrorCode() != AVERROR(EINTR)) {
+            if (!reconnectInProgress && isRunning_) {
+                // 尝试重连
+                Logger::warning("Stream error detected, attempting reconnection");
+                reconnectInProgress = true;
+                if (!reconnect()) {
+                    // 重连失败，设置错误并退出循环
+                    hasError_ = true;
+                    isRunning_ = false;
+                    break;
+                }
+                reconnectInProgress = false;
+                streamErrorCount = 0;
+            } else {
+                // 如果已经在重连中或流已停止，则退出
+                hasError_ = true;
+                isRunning_ = false;
                 break;
             }
-
-            // 短暂暂停后继续
-            av_usleep(500000);  // 500ms
         }
     }
 
@@ -1383,4 +1469,141 @@ bool StreamProcessor::isCodecSupported(const AVCodec* codec, AVPixelFormat pixFm
         i++;
     }
     return false;
+}
+
+// 添加重置错误状态的方法
+void StreamProcessor::resetErrorState() {
+    hasError_ = false;
+    reconnectAttempts_ = 0;
+    lastFrameTime_ = av_gettime(); // 重置最后一帧时间
+}
+
+// 添加检查流是否停滞的方法
+bool StreamProcessor::isStreamStalled() const {
+    if (lastFrameTime_ == 0) return false; // 流尚未开始
+
+    int64_t currentTime = av_gettime();
+    return (currentTime - lastFrameTime_) > noDataTimeout_;
+}
+
+// 添加重连方法
+bool StreamProcessor::reconnect() {
+    if (reconnectAttempts_ >= maxReconnectAttempts_) {
+        Logger::error("Stream " + config_.id + " exceeded maximum reconnection attempts ("
+                      + std::to_string(maxReconnectAttempts_) + ")");
+        return false;
+    }
+
+    Logger::warning("Attempting to reconnect stream: " + config_.id + " (attempt "
+                    + std::to_string(reconnectAttempts_ + 1) + "/"
+                    + std::to_string(maxReconnectAttempts_) + ")");
+
+    isReconnecting_ = true;
+    reconnectAttempts_++;
+
+    // 计算重连延迟（使用指数退避策略）
+    // 1秒，2秒，4秒，8秒...
+    int64_t reconnectDelay = 1000000 * (1 << (reconnectAttempts_ - 1));
+    if (reconnectDelay > 30000000) reconnectDelay = 30000000; // 最大30秒
+
+    Logger::info("Waiting " + std::to_string(reconnectDelay / 1000000) + " seconds before reconnecting");
+    av_usleep(reconnectDelay);
+
+    try {
+        // 清理旧资源
+        cleanup();
+
+        // 重新初始化连接
+        initialize();
+
+        Logger::info("Successfully reconnected stream: " + config_.id);
+        resetErrorState();
+        isReconnecting_ = false;
+        return true;
+    } catch (const FFmpegException& e) {
+        Logger::error("Failed to reconnect stream " + config_.id + ": " + std::string(e.what()));
+        hasError_ = true;
+        isReconnecting_ = false;
+        return false;
+    }
+}
+
+void StreamProcessor::registerWithWatchdog(Watchdog* watchdog) {
+    if (!watchdog) {
+        Logger::warning("Attempted to register stream " + config_.id + " with null watchdog");
+        return;
+    }
+
+    // 如果已注册到另一个看门狗，先取消注册
+    if (watchdog_ && watchdog_ != watchdog && !watchdogId_.empty()) {
+        try {
+            watchdog_->unregisterTarget(watchdogId_);
+            Logger::debug("Stream " + config_.id + " unregistered from previous watchdog");
+        } catch (const std::exception& e) {
+            Logger::warning("Error unregistering from previous watchdog: " + std::string(e.what()));
+        }
+    }
+
+    // 检查流配置中是否启用了看门狗
+    if (!config_.isWatchdogEnabled()) {
+        Logger::info("Watchdog disabled for stream " + config_.id + " in configuration");
+        return;
+    }
+
+    watchdog_ = watchdog;
+    watchdogId_ = "stream_" + config_.id;
+
+    // 向看门狗注册此流
+    try {
+        bool registered = watchdog_->registerTarget(watchdogId_,
+                                                    [this]() -> bool {
+                                                        // 健康检查 - 流是否在运行且没有错误
+                                                        return this->isRunning() && !this->hasError();
+                                                    },
+                                                    [this]() {
+                                                        // 恢复 - 尝试重连流
+                                                        Logger::warning("Watchdog initiating recovery for stream: " + config_.id);
+                                                        try {
+                                                            // 如果流正在运行，先停止
+                                                            if (this->isRunning()) {
+                                                                this->stop();
+                                                                std::this_thread::sleep_for(std::chrono::seconds(1)); // 短暂等待确保完全停止
+                                                            }
+
+                                                            // 重新启动流
+                                                            this->start();
+                                                            Logger::info("Watchdog successfully restarted stream: " + config_.id);
+                                                        } catch (const std::exception& e) {
+                                                            Logger::error("Watchdog failed to restart stream " + config_.id + ": " + e.what());
+                                                        }
+                                                    }
+        );
+
+        if (registered) {
+            Logger::info("Stream " + config_.id + " registered with watchdog");
+        } else {
+            Logger::warning("Failed to register stream " + config_.id + " with watchdog");
+        }
+    } catch (const std::exception& e) {
+        Logger::error("Exception during watchdog registration for stream " + config_.id + ": " + e.what());
+        watchdog_ = nullptr;
+        watchdogId_ = "";
+    } catch (...) {
+        Logger::error("Unknown exception during watchdog registration for stream " + config_.id);
+        watchdog_ = nullptr;
+        watchdogId_ = "";
+    }
+}
+
+// 添加 feedWatchdog 方法
+void StreamProcessor::feedWatchdog() {
+    try {
+        if (watchdog_ && !watchdogId_.empty() && isRunning_ && !hasError_) {
+            watchdog_->feedTarget(watchdogId_);
+        }
+    } catch (const std::exception& e) {
+        Logger::warning("Exception in feedWatchdog for stream " + config_.id + ": " + e.what());
+    } catch (...) {
+        Logger::warning("Unknown exception in feedWatchdog for stream " + config_.id);
+    }
 }
