@@ -1,0 +1,135 @@
+#ifndef STREAM_PROCESSOR_H
+#define STREAM_PROCESSOR_H
+
+#include "common/StreamConfig.h"
+#include <atomic>
+#include <thread>
+#include <memory>
+#include <vector>
+#include <string>
+
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+#include <libavutil/hwcontext.h>
+#include <libswscale/swscale.h>
+}
+
+/**
+ * @brief 单个流处理类
+ * 负责处理单个流的转码和推送
+ */
+class StreamProcessor {
+public:
+    /**
+     * @brief 构造函数
+     * @param config 流配置
+     */
+    StreamProcessor(const StreamConfig& config);
+
+    /**
+     * @brief 析构函数
+     */
+    ~StreamProcessor();
+
+    /**
+     * @brief 启动流处理
+     * @throw FFmpegException 启动失败时抛出异常
+     */
+    void start();
+
+    /**
+     * @brief 停止流处理
+     */
+    void stop();
+
+    /**
+     * @brief 查询流是否在运行
+     * @return 是否正在运行
+     */
+    bool isRunning() const;
+
+    /**
+     * @brief 查询是否发生错误
+     * @return 是否有错误
+     */
+    bool hasError() const;
+
+    /**
+     * @brief 获取流配置
+     * @return 流配置
+     */
+    const StreamConfig& getConfig() const;
+
+    /**
+     * @brief 更新流配置（需要先停止流）
+     * @param config 新配置
+     * @return 更新是否成功
+     */
+    bool updateConfig(const StreamConfig& config);
+
+private:
+    // 流处理上下文结构体
+    struct StreamContext {
+        int streamIndex = -1;
+        AVStream* inputStream = nullptr;
+        AVStream* outputStream = nullptr;
+
+        AVCodecContext* decoderContext = nullptr;
+        AVCodecContext* encoderContext = nullptr;
+
+        AVBufferRef* hwDeviceContext = nullptr;
+
+        AVPacket* packet = nullptr;
+        AVFrame* frame = nullptr;
+        AVFrame* hwFrame = nullptr;  // 用于硬件解码/编码
+
+        SwsContext* swsContext = nullptr;
+    };
+
+    // 成员变量
+    StreamConfig config_;
+    std::atomic<bool> isRunning_;
+    std::atomic<bool> hasError_;
+    std::thread processingThread_;
+
+    // FFmpeg上下文
+    AVFormatContext* inputFormatContext_ = nullptr;
+    AVFormatContext* outputFormatContext_ = nullptr;
+
+    std::vector<StreamContext> videoStreams_;
+    std::vector<StreamContext> audioStreams_;
+
+    // 私有方法
+    void initialize();
+    void openInput();
+    void openOutput();
+    AVBufferRef* createHardwareDevice();
+
+    /**
+     * @brief 根据硬件加速类型获取适合的编码器
+     * @param hwType 硬件加速类型
+     * @param codecId 编解码器ID
+     * @return 编码器指针，如果未找到返回nullptr
+     */
+    const AVCodec* getEncoderByHardwareType(AVHWDeviceType hwType, AVCodecID codecId);
+
+    /**
+     * @brief 检查编解码器是否支持指定的像素格式
+     * @param codec 编解码器
+     * @param pixFmt 像素格式
+     * @return 是否支持
+     */
+    bool isCodecSupported(const AVCodec* codec, AVPixelFormat pixFmt);
+
+    void setupStreams();
+    void setupVideoStream(AVStream* inputStream);
+    void setupAudioStream(AVStream* inputStream);
+    void processLoop();
+    void processVideoPacket(AVPacket* packet, StreamContext& streamCtx);
+    void processAudioPacket(AVPacket* packet, StreamContext& streamCtx);
+    void cleanup();
+};
+
+#endif // STREAM_PROCESSOR_H
