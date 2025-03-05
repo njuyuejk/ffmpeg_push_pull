@@ -1,6 +1,6 @@
 #include "app/Application.h"
 #include <iostream>
-#include <signal.h>
+#include <csignal>
 #include <stdexcept>
 #include "logger/Logger.h"
 
