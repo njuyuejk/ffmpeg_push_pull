@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <future>   // 添加此头文件以支持std::future
 
 /**
  * @brief 多路流管理器类
@@ -86,6 +87,18 @@ public:
      * @param watchdog 看门狗指针
      */
     void setWatchdog(Watchdog* watchdog);
+
+    /**
+     * @brief 重连流
+     * @param streamId 流ID
+     */
+    void reconnectStream(const std::string& streamId);
+
+    /**
+     * @brief 异步重连流（使用线程池）
+     * @param streamId 流ID
+     */
+    void asyncReconnectStream(const std::string& streamId);
 
 private:
     int maxConcurrentStreams_;

@@ -100,8 +100,6 @@ std::string MultiStreamManager::startStream(const StreamConfig& config) {
         }
     }
 
-    // 其他代码不变
-
     // 创建流处理器
     StreamConfig streamConfig = config;
     streamConfig.id = streamId;
@@ -128,9 +126,22 @@ std::string MultiStreamManager::startStream(const StreamConfig& config) {
     // 将流处理器添加到映射中
     streams_[streamId] = processor;
 
-    // 启动处理器
+    // 使用线程池启动处理器
     try {
-        processor->start();
+        // 由于启动操作可能需要一定时间，我们使用线程池进行异步处理
+        // 但我们需要等待启动完成再返回结果
+        auto startFuture = threadPool_->enqueue([processor]() {
+            processor->start();
+            return true;
+        });
+
+        // 等待启动完成，最多10秒
+        auto status = startFuture.wait_for(std::chrono::seconds(10));
+        if (status != std::future_status::ready) {
+            Logger::warning("Timeout waiting for stream to start: " + streamId);
+            // 即使超时，我们也保留处理器，它可能仍在启动中
+        }
+
         Logger::info("Started stream: " + streamId);
     } catch (const FFmpegException& e) {
         // 启动失败，从映射中移除
@@ -153,7 +164,7 @@ bool MultiStreamManager::stopStream(const std::string& streamId) {
         if (it != streams_.end()) {
             processor = it->second;
             found = true;
-            // 立即从map中移除，防止其他线程访问
+            // 立即从映射中移除，防止其他线程访问
             streams_.erase(it);
             Logger::info("Removed stream " + streamId + " from manager");
         }
@@ -179,18 +190,31 @@ bool MultiStreamManager::stopStream(const std::string& streamId) {
         Logger::error("Error accessing watchdog");
     }
 
-    // 安全地停止流处理器
-    bool stopResult = false;
-    if (processor) {
+    // 使用线程池异步停止处理器
+    auto stopFuture = threadPool_->enqueue([processor, streamId]() -> bool {
         try {
-            // 直接调用停止方法，它现在有内部超时保护
             processor->stop();
-            stopResult = true;
+            Logger::info("Stopped stream: " + streamId);
+            return true;
         } catch (const std::exception& e) {
             Logger::error("Error stopping stream " + streamId + ": " + e.what());
         } catch (...) {
             Logger::error("Unknown error stopping stream " + streamId);
         }
+        return false;
+    });
+
+    // 等待停止操作完成，带超时
+    bool stopResult = false;
+    try {
+        auto stopStatus = stopFuture.wait_for(std::chrono::seconds(5));
+        if (stopStatus != std::future_status::ready) {
+            Logger::warning("Timeout waiting for stream " + streamId + " to stop");
+        } else {
+            stopResult = stopFuture.get();
+        }
+    } catch (const std::exception& e) {
+        Logger::error("Exception waiting for stream stop: " + std::string(e.what()));
     }
 
     return stopResult;
@@ -200,10 +224,9 @@ void MultiStreamManager::stopAll() {
     std::vector<std::shared_ptr<StreamProcessor>> processorsToStop;
     std::vector<std::string> streamIds;
 
-    // 收集所有流处理器
+    // 收集所有处理器
     {
         std::lock_guard<std::mutex> lock(streamsMutex_);
-
         for (const auto& pair : streams_) {
             processorsToStop.push_back(pair.second);
             streamIds.push_back(pair.first);
@@ -222,65 +245,68 @@ void MultiStreamManager::stopAll() {
         }
     }
 
-    // 使用适当的超时处理停止所有流处理器
-    int failureCount = 0;
-    std::vector<std::thread> stopThreads;
-    std::vector<std::atomic<bool>> stopCompleted(processorsToStop.size());
+    // 使用线程池并行停止所有处理器
+    std::vector<std::future<bool>> stopFutures;
+    stopFutures.reserve(processorsToStop.size());
 
-    // 在单独的线程中启动所有停止操作
     for (size_t i = 0; i < processorsToStop.size(); i++) {
-        stopCompleted[i] = false;
-        stopThreads.emplace_back([i, &processorsToStop, &streamIds, &stopCompleted]() {
+        auto processor = processorsToStop[i];
+        auto streamId = streamIds[i];
+
+        stopFutures.push_back(threadPool_->enqueue([processor, streamId]() -> bool {
             try {
-                Logger::info("Stopping stream: " + streamIds[i]);
-                processorsToStop[i]->stop();
-                stopCompleted[i] = true;
+                Logger::info("Stopping stream: " + streamId);
+                processor->stop();
+                return true;
             } catch (const std::exception& e) {
-                Logger::error("Error stopping stream " + streamIds[i] + ": " + std::string(e.what()));
+                Logger::error("Error stopping stream " + streamId + ": " + std::string(e.what()));
+                return false;
             }
-        });
+        }));
     }
 
-    // 等待所有停止操作（带超时）
+    // 等待所有停止操作完成（带超时）
+    int successCount = 0;
+    int failureCount = 0;
+
     auto stopStartTime = std::chrono::steady_clock::now();
-    auto stopEndTime = stopStartTime + std::chrono::seconds(15);  // 总共15秒超时
+    auto stopEndTime = stopStartTime + std::chrono::seconds(15);  // 15秒全局超时
 
-    for (size_t i = 0; i < stopThreads.size(); i++) {
-        if (!stopThreads[i].joinable()) continue;
-
+    for (size_t i = 0; i < stopFutures.size(); i++) {
         auto currentTime = std::chrono::steady_clock::now();
         if (currentTime >= stopEndTime) {
-            // 达到全局超时，分离剩余线程
+            // 已达到全局超时
             Logger::warning("Global timeout reached while stopping streams");
-            stopThreads[i].detach();
+            failureCount += stopFutures.size() - i;
+            break;
+        }
+
+        // 计算此future的剩余超时时间
+        auto remainingTime = stopEndTime - currentTime;
+
+        // 使用剩余超时时间等待此future
+        auto status = stopFutures[i].wait_for(remainingTime);
+        if (status != std::future_status::ready) {
+            Logger::warning("Timeout stopping stream " + streamIds[i]);
             failureCount++;
             continue;
         }
 
-        // 计算剩余超时时间
-        auto remainingTime = stopEndTime - currentTime;
-
-        // 使用剩余超时时间等待此线程
-        bool stoppedInTime = false;
-        {
-            std::mutex mtx;
-            std::unique_lock<std::mutex> lock(mtx);
-            std::condition_variable cv;
-            stoppedInTime = cv.wait_for(lock, remainingTime, [&stopCompleted, i]() { return stopCompleted[i].load(); });
-        }
-
-        if (!stoppedInTime) {
-            // 线程超时
-            Logger::warning("Timeout stopping stream " + streamIds[i]);
-            stopThreads[i].detach();
+        // 获取结果
+        try {
+            bool result = stopFutures[i].get();
+            if (result) {
+                successCount++;
+            } else {
+                failureCount++;
+            }
+        } catch (const std::exception& e) {
+            Logger::error("Exception getting stop result: " + std::string(e.what()));
             failureCount++;
-        } else {
-            // 线程成功完成
-            stopThreads[i].join();
         }
     }
 
-    // 清空映射
+    // 现在清空流映射
     {
         std::lock_guard<std::mutex> lock(streamsMutex_);
         streams_.clear();
@@ -433,6 +459,10 @@ void MultiStreamManager::setWatchdog(Watchdog* watchdog) {
 
 void MultiStreamManager::watchdogFeederLoop() {
     const int FEED_INTERVAL_MS = 3000; // 每3秒喂食一次
+    const int MAX_FAILURE_COUNT_BEFORE_RECONNECT = 3; // 连续3次失败后尝试重连
+
+    // 记录失败计数的映射
+    std::map<std::string, int> streamFailureCounts;
 
     Logger::info("Watchdog feeder thread started");
 
@@ -461,11 +491,34 @@ void MultiStreamManager::watchdogFeederLoop() {
                         if (watchdog_) {
                             watchdog_->feedTarget("stream_" + streamId);
                         }
+
+                        // 重置此流的失败计数
+                        streamFailureCounts[streamId] = 0;
                     } else {
-                        // 流有问题但我们不再由看门狗自动处理 - 仅记录问题
-                        Logger::debug("Stream " + streamId + " has issues: running=" +
-                                      (processor->isRunning() ? "yes" : "no") +
-                                      ", error=" + (processor->hasError() ? "yes" : "no"));
+                        // 增加失败计数
+                        if (streamFailureCounts.find(streamId) == streamFailureCounts.end()) {
+                            streamFailureCounts[streamId] = 0;
+                        }
+                        streamFailureCounts[streamId]++;
+
+                        // 如果连续失败次数达到阈值，尝试重连
+                        if (streamFailureCounts[streamId] >= MAX_FAILURE_COUNT_BEFORE_RECONNECT) {
+                            Logger::warning("Stream " + streamId + " failed " +
+                                            std::to_string(streamFailureCounts[streamId]) +
+                                            " times, attempting auto-reconnect");
+
+                            // 使用异步方式重连流
+                            asyncReconnectStream(streamId);
+
+                            // 重置失败计数
+                            streamFailureCounts[streamId] = 0;
+                        } else {
+                            // 流有问题但尚未达到重连阈值，记录问题
+                            Logger::debug("Stream " + streamId + " has issues: running=" +
+                                          (processor->isRunning() ? "yes" : "no") +
+                                          ", error=" + (processor->hasError() ? "yes" : "no") +
+                                          ", failure count=" + std::to_string(streamFailureCounts[streamId]));
+                        }
                     }
                 }
             }
@@ -486,4 +539,45 @@ void MultiStreamManager::watchdogFeederLoop() {
     }
 
     Logger::info("Watchdog feeder thread exited");
+}
+
+void MultiStreamManager::reconnectStream(const std::string& streamId) {
+    std::shared_ptr<StreamProcessor> processor;
+
+    // 获取处理器
+    {
+        std::lock_guard<std::mutex> lock(streamsMutex_);
+        auto it = streams_.find(streamId);
+        if (it == streams_.end()) {
+            Logger::warning("Stream not found for reconnect: " + streamId);
+            return;
+        }
+        processor = it->second;
+    }
+
+    StreamConfig config = processor->getConfig();
+
+    // 停止处理器
+    bool stopSuccess = stopStream(streamId);
+    if (!stopSuccess) {
+        Logger::warning("Failed to stop stream for reconnect: " + streamId);
+    }
+
+    // 短暂暂停后重连
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    // 使用相同配置启动新的处理器
+    try {
+        startStream(config);
+        Logger::info("Successfully reconnected stream: " + streamId);
+    } catch (const FFmpegException& e) {
+        Logger::error("Failed to reconnect stream " + streamId + ": " + std::string(e.what()));
+    }
+}
+
+void MultiStreamManager::asyncReconnectStream(const std::string& streamId) {
+    // 提交重连任务到线程池
+    threadPool_->enqueue([this, streamId]() {
+        this->reconnectStream(streamId);
+    });
 }

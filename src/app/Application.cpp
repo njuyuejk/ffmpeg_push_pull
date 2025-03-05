@@ -328,28 +328,12 @@ void Application::monitorStreams() {
                                 + std::to_string(restartAttempts[streamId] + 1) + ")");
             }
 
-            // 停止流
-            streamManager_->stopStream(streamId);
+            // 使用异步重连方法替代原有的重启逻辑
+            streamManager_->asyncReconnectStream(streamId);
 
-            // 等待指定的重启延迟
-            std::this_thread::sleep_for(std::chrono::seconds(10));
-
-            // 获取配置并重启
-            StreamConfig config = AppConfig::findStreamConfigById(streamId);
-            if (config.id == streamId) {
-                try {
-                    streamManager_->startStream(config);
-                    Logger::info("Restarted stream: " + streamId);
-                    lastRestartTime[streamId] = time(nullptr);
-                    restartAttempts[streamId]++;
-                } catch (const FFmpegException& e) {
-                    Logger::error("Failed to restart stream " + streamId + ": " + e.what());
-                    lastRestartTime[streamId] = time(nullptr);
-                    restartAttempts[streamId]++;
-                }
-            } else {
-                Logger::error("Could not find configuration for stream: " + streamId);
-            }
+            // 更新重连状态
+            lastRestartTime[streamId] = time(nullptr);
+            restartAttempts[streamId]++;
         }
     }
 
@@ -367,26 +351,10 @@ void Application::monitorStreams() {
                 }
             }
 
-            // 重启每个失败的流
+            // 重启每个失败的流（使用线程池异步方式）
             for (const auto& streamId : errorStreams) {
                 Logger::info("Periodic reconnect for stream with error: " + streamId);
-
-                // 停止流
-                streamManager_->stopStream(streamId);
-
-                // 短暂暂停
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-
-                // 重启流
-                StreamConfig config = AppConfig::findStreamConfigById(streamId);
-                if (config.id == streamId) {
-                    try {
-                        streamManager_->startStream(config);
-                        Logger::info("Periodic reconnect successful for stream: " + streamId);
-                    } catch (const FFmpegException& e) {
-                        Logger::error("Periodic reconnect failed for stream " + streamId + ": " + e.what());
-                    }
-                }
+                streamManager_->asyncReconnectStream(streamId);
             }
 
             lastPeriodicReconnectTime_ = currentTime;
