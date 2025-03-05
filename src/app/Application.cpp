@@ -243,6 +243,8 @@ void Application::listStreams() {
         Logger::info("  - " + streamId + " [" + status + "] " +
                      config.inputUrl + " -> " + config.outputUrl);
     }
+    streams.clear();
+    std::vector<std::string>().swap(streams);
 }
 
 // 监控流状态
@@ -360,6 +362,12 @@ void Application::monitorStreams() {
             lastPeriodicReconnectTime_ = currentTime;
         }
     }
+    streams.clear();
+    restartAttempts.clear();
+    lastRestartTime.clear();
+    std::vector<std::string>().swap(streams);
+    std::map<std::string, int>().swap(restartAttempts);
+    std::map<std::string, int64_t >().swap(lastRestartTime);
 }
 
 // 启动所有流

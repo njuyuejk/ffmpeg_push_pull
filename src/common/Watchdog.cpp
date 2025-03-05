@@ -261,6 +261,8 @@ void Watchdog::monitorLoop() {
         } catch (...) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
+        healthCheckTasks.clear();
+        std::vector<HealthCheckTask>().swap(healthCheckTasks);
     }
 
     Logger::debug("Watchdog monitor loop exited");
