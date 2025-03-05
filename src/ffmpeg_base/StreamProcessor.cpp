@@ -1308,131 +1308,165 @@ void StreamProcessor::processLoop() {
 
 void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& streamCtx) {
     int ret;
+    bool frameAcquired = false;
+    bool hwFrameUsed = false;
 
-    // 发送包到解码器
-    ret = avcodec_send_packet(streamCtx.decoderContext, packet);
-    if (ret < 0) {
-        throw FFmpegException("Error sending packet to decoder", ret);
-    }
-
-    while (ret >= 0) {
-        // 接收解码帧
-        ret = avcodec_receive_frame(streamCtx.decoderContext, streamCtx.frame);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-            break;
-        } else if (ret < 0) {
-            throw FFmpegException("Error receiving frame from decoder", ret);
-        }
-
-        AVFrame* frameToEncode = streamCtx.frame;
-
-        // 处理硬件加速的帧
-        if (streamCtx.frame->format == AV_PIX_FMT_CUDA ||
-            streamCtx.frame->format == AV_PIX_FMT_VAAPI ||
-            streamCtx.frame->format == AV_PIX_FMT_QSV ||
-            streamCtx.frame->format == AV_PIX_FMT_D3D11 ||
-            streamCtx.frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
-
-            // 从硬件帧转换为软件帧（如果需要）
-            if (!streamCtx.encoderContext->hw_frames_ctx) {
-                ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
-                if (ret < 0) {
-                    throw FFmpegException("Error transferring data from hardware frame", ret);
-                }
-                frameToEncode = streamCtx.hwFrame;
-            }
-        }
-
-        // 如果需要缩放
-        if (streamCtx.encoderContext->width != frameToEncode->width ||
-            streamCtx.encoderContext->height != frameToEncode->height ||
-            streamCtx.encoderContext->pix_fmt != frameToEncode->format) {
-
-            // 如果swsContext尚未初始化，则初始化
-            if (!streamCtx.swsContext) {
-                streamCtx.swsContext = sws_getContext(
-                        frameToEncode->width, frameToEncode->height, (AVPixelFormat)frameToEncode->format,
-                        streamCtx.encoderContext->width, streamCtx.encoderContext->height,
-                        streamCtx.encoderContext->pix_fmt,
-                        SWS_BILINEAR, nullptr, nullptr, nullptr
-                );
-
-                if (!streamCtx.swsContext) {
-                    throw FFmpegException("Failed to create scaling context");
-                }
-            }
-
-            // 分配转换后的帧
-            if (!streamCtx.hwFrame->data[0]) {
-                streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
-                streamCtx.hwFrame->width = streamCtx.encoderContext->width;
-                streamCtx.hwFrame->height = streamCtx.encoderContext->height;
-                ret = av_frame_get_buffer(streamCtx.hwFrame, 0);
-                if (ret < 0) {
-                    throw FFmpegException("Failed to allocate frame buffer for scaling", ret);
-                }
-            }
-
-            // 执行缩放
-            ret = sws_scale(streamCtx.swsContext, frameToEncode->data, frameToEncode->linesize, 0,
-                            frameToEncode->height, streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
-            if (ret < 0) {
-                throw FFmpegException("Error during frame scaling", ret);
-            }
-
-            streamCtx.hwFrame->pts = frameToEncode->pts;
-            frameToEncode = streamCtx.hwFrame;
-        }
-
-        // 重新计算PTS
-        frameToEncode->pts = av_rescale_q(
-                frameToEncode->pts,
-                streamCtx.decoderContext->time_base,
-                streamCtx.encoderContext->time_base
-        );
-
-        // 发送帧到编码器
-        ret = avcodec_send_frame(streamCtx.encoderContext, frameToEncode);
+    try {
+        // 将数据包发送到解码器
+        ret = avcodec_send_packet(streamCtx.decoderContext, packet);
         if (ret < 0) {
-            throw FFmpegException("Error sending frame to encoder", ret);
+            throw FFmpegException("Error sending packet to decoder", ret);
         }
 
         while (ret >= 0) {
-            // 接收编码包
-            AVPacket* encodedPacket = av_packet_alloc();
-            ret = avcodec_receive_packet(streamCtx.encoderContext, encodedPacket);
+            // 在每个循环开始时重置标志
+            frameAcquired = false;
+            hwFrameUsed = false;
+
+            // 接收解码后的帧
+            ret = avcodec_receive_frame(streamCtx.decoderContext, streamCtx.frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                av_packet_free(&encodedPacket);
                 break;
             } else if (ret < 0) {
-                av_packet_free(&encodedPacket);
-                throw FFmpegException("Error receiving packet from encoder", ret);
+                throw FFmpegException("Error receiving frame from decoder", ret);
             }
 
-            // 准备要写入的包
-            encodedPacket->stream_index = streamCtx.outputStream->index;
+            frameAcquired = true;
+            AVFrame* frameToEncode = streamCtx.frame;
+
+            // 处理硬件加速帧
+            if (streamCtx.frame->format == AV_PIX_FMT_CUDA ||
+                streamCtx.frame->format == AV_PIX_FMT_VAAPI ||
+                streamCtx.frame->format == AV_PIX_FMT_QSV ||
+                streamCtx.frame->format == AV_PIX_FMT_D3D11 ||
+                streamCtx.frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+
+                // 如果需要，将硬件帧转换为软件帧
+                if (!streamCtx.encoderContext->hw_frames_ctx) {
+                    ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
+                    if (ret < 0) {
+                        throw FFmpegException("Error transferring data from hardware frame", ret);
+                    }
+                    frameToEncode = streamCtx.hwFrame;
+                    hwFrameUsed = true;
+                }
+            }
+
+            // 如果需要缩放
+            if (streamCtx.encoderContext->width != frameToEncode->width ||
+                streamCtx.encoderContext->height != frameToEncode->height ||
+                streamCtx.encoderContext->pix_fmt != frameToEncode->format) {
+
+                // 如果需要，初始化缩放上下文
+                if (!streamCtx.swsContext) {
+                    streamCtx.swsContext = sws_getContext(
+                            frameToEncode->width, frameToEncode->height,
+                            (AVPixelFormat)frameToEncode->format,
+                            streamCtx.encoderContext->width, streamCtx.encoderContext->height,
+                            streamCtx.encoderContext->pix_fmt,
+                            SWS_BILINEAR, nullptr, nullptr, nullptr
+                    );
+
+                    if (!streamCtx.swsContext) {
+                        throw FFmpegException("Failed to create scaling context");
+                    }
+                }
+
+                // 为缩放输出分配帧缓冲区
+                if (!streamCtx.hwFrame->data[0]) {
+                    streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
+                    streamCtx.hwFrame->width = streamCtx.encoderContext->width;
+                    streamCtx.hwFrame->height = streamCtx.encoderContext->height;
+                    ret = av_frame_get_buffer(streamCtx.hwFrame, 0);
+                    if (ret < 0) {
+                        throw FFmpegException("Failed to allocate frame buffer for scaling", ret);
+                    }
+                }
+
+                // 缩放帧
+                ret = sws_scale(streamCtx.swsContext, frameToEncode->data,
+                                frameToEncode->linesize, 0, frameToEncode->height,
+                                streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
+                if (ret < 0) {
+                    throw FFmpegException("Error during frame scaling", ret);
+                }
+
+                streamCtx.hwFrame->pts = frameToEncode->pts;
+                frameToEncode = streamCtx.hwFrame;
+                hwFrameUsed = true;
+            }
 
             // 重新计算时间戳
-            av_packet_rescale_ts(
-                    encodedPacket,
-                    streamCtx.encoderContext->time_base,
-                    streamCtx.outputStream->time_base
+            frameToEncode->pts = av_rescale_q(
+                    frameToEncode->pts,
+                    streamCtx.decoderContext->time_base,
+                    streamCtx.encoderContext->time_base
             );
 
-            // 写入包
-            ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
-            av_packet_free(&encodedPacket);
-
+            // 将帧发送到编码器
+            ret = avcodec_send_frame(streamCtx.encoderContext, frameToEncode);
             if (ret < 0) {
-                throw FFmpegException("Error writing encoded packet", ret);
+                throw FFmpegException("Error sending frame to encoder", ret);
+            }
+
+            // 处理编码后的数据包
+            while (ret >= 0) {
+                AVPacket* encodedPacket = av_packet_alloc();
+                if (!encodedPacket) {
+                    throw FFmpegException("Failed to allocate encoded packet");
+                }
+
+                ret = avcodec_receive_packet(streamCtx.encoderContext, encodedPacket);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    av_packet_free(&encodedPacket);
+                    break;
+                } else if (ret < 0) {
+                    av_packet_free(&encodedPacket);
+                    throw FFmpegException("Error receiving packet from encoder", ret);
+                }
+
+                // 准备输出数据包
+                encodedPacket->stream_index = streamCtx.outputStream->index;
+
+                // 重新计算时间戳
+                av_packet_rescale_ts(
+                        encodedPacket,
+                        streamCtx.encoderContext->time_base,
+                        streamCtx.outputStream->time_base
+                );
+
+                // 写入数据包
+                ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+
+                // 无论写入是否成功，都释放数据包
+                av_packet_free(&encodedPacket);
+
+                if (ret < 0) {
+                    throw FFmpegException("Error writing encoded packet", ret);
+                }
+            }
+
+            // 完成后始终取消引用帧
+            if (frameAcquired) {
+                av_frame_unref(streamCtx.frame);
+            }
+
+            if (hwFrameUsed) {
+                av_frame_unref(streamCtx.hwFrame);
             }
         }
+    } catch (const FFmpegException& e) {
+        // 即使在异常情况下也清理帧
+        if (frameAcquired) {
+            av_frame_unref(streamCtx.frame);
+        }
 
-        // 不再需要帧时释放它
-        av_frame_unref(streamCtx.frame);
-        if (streamCtx.hwFrame->data[0]) {
+        if (hwFrameUsed) {
             av_frame_unref(streamCtx.hwFrame);
         }
+
+        // 重新抛出异常
+        throw;
     }
 }
 
@@ -1504,155 +1538,114 @@ void StreamProcessor::processAudioPacket(AVPacket* packet, StreamContext& stream
 }
 
 void StreamProcessor::cleanup() {
+    std::lock_guard<std::mutex> lock(ffmpegMutex_); // 为清理过程添加互斥锁保护
+
+    // 首先将上下文标记为无效，防止其他线程使用它
+    isContextValid_ = false;
+
     try {
-        // 首先清理视频流资源
+        // 清理视频流
         for (auto& streamCtx : videoStreams_) {
-            // 安全释放所有资源，使用独立的try-catch块
-            try {
-                if (streamCtx.packet) {
-                    av_packet_free(&streamCtx.packet);
-                    streamCtx.packet = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up video packet resources");
+            // 安全地清理数据包
+            if (streamCtx.packet) {
+                av_packet_free(&streamCtx.packet);
+                streamCtx.packet = nullptr;
             }
 
-            try {
-                if (streamCtx.frame) {
-                    av_frame_free(&streamCtx.frame);
-                    streamCtx.frame = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up video frame");
+            // 安全地清理帧
+            if (streamCtx.frame) {
+                av_frame_free(&streamCtx.frame);
+                streamCtx.frame = nullptr;
             }
 
-            try {
-                if (streamCtx.hwFrame) {
-                    av_frame_free(&streamCtx.hwFrame);
-                    streamCtx.hwFrame = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up hardware frame");
+            // 安全地清理硬件帧
+            if (streamCtx.hwFrame) {
+                av_frame_free(&streamCtx.hwFrame);
+                streamCtx.hwFrame = nullptr;
             }
 
-            try {
-                if (streamCtx.swsContext) {
-                    sws_freeContext(streamCtx.swsContext);
-                    streamCtx.swsContext = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up scaling context");
+            // 安全地清理缩放上下文
+            if (streamCtx.swsContext) {
+                sws_freeContext(streamCtx.swsContext);
+                streamCtx.swsContext = nullptr;
             }
 
-            try {
-                if (streamCtx.decoderContext) {
-                    avcodec_free_context(&streamCtx.decoderContext);
-                    streamCtx.decoderContext = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up decoder context");
+            // 安全地清理编解码器上下文
+            if (streamCtx.decoderContext) {
+                avcodec_free_context(&streamCtx.decoderContext);
+                streamCtx.decoderContext = nullptr;
             }
 
-            try {
-                if (streamCtx.encoderContext) {
-                    avcodec_free_context(&streamCtx.encoderContext);
-                    streamCtx.encoderContext = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up encoder context");
+            if (streamCtx.encoderContext) {
+                avcodec_free_context(&streamCtx.encoderContext);
+                streamCtx.encoderContext = nullptr;
             }
 
-            try {
-                if (streamCtx.hwDeviceContext) {
-                    av_buffer_unref(&streamCtx.hwDeviceContext);
-                    streamCtx.hwDeviceContext = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up hardware device context");
+            // 安全地清理硬件设备上下文
+            if (streamCtx.hwDeviceContext) {
+                av_buffer_unref(&streamCtx.hwDeviceContext);
+                streamCtx.hwDeviceContext = nullptr;
             }
         }
 
-        // 使用类似的错误处理清理音频流
+        // 清理音频流（类似的模式）
         for (auto& streamCtx : audioStreams_) {
-            try {
-                if (streamCtx.packet) {
-                    av_packet_free(&streamCtx.packet);
-                    streamCtx.packet = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up audio packet");
+            if (streamCtx.packet) {
+                av_packet_free(&streamCtx.packet);
+                streamCtx.packet = nullptr;
             }
 
-            try {
-                if (streamCtx.frame) {
-                    av_frame_free(&streamCtx.frame);
-                    streamCtx.frame = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up audio frame");
+            if (streamCtx.frame) {
+                av_frame_free(&streamCtx.frame);
+                streamCtx.frame = nullptr;
             }
 
-            try {
-                if (streamCtx.decoderContext) {
-                    avcodec_free_context(&streamCtx.decoderContext);
-                    streamCtx.decoderContext = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up audio decoder context");
+            if (streamCtx.decoderContext) {
+                avcodec_close(streamCtx.decoderContext);
+                avcodec_free_context(&streamCtx.decoderContext);
+                streamCtx.decoderContext = nullptr;
             }
 
-            try {
-                if (streamCtx.encoderContext) {
-                    avcodec_free_context(&streamCtx.encoderContext);
-                    streamCtx.encoderContext = nullptr;
-                }
-            } catch (...) {
-                Logger::error("Error cleaning up audio encoder context");
+            if (streamCtx.encoderContext) {
+                avcodec_close(streamCtx.encoderContext);
+                avcodec_free_context(&streamCtx.encoderContext);
+                streamCtx.encoderContext = nullptr;
             }
         }
 
-        // 特别小心地清理输入和输出上下文
-        if (inputFormatContext_) {
-            try {
-                avformat_close_input(&inputFormatContext_);
-                inputFormatContext_ = nullptr;
-            } catch (...) {
-                Logger::error("Error closing input format context");
-                // 避免悬空指针
-                inputFormatContext_ = nullptr;
-            }
-        }
-
-        // 清理输出上下文
+        // 清理格式上下文
         if (outputFormatContext_) {
-            try {
-                if (!(outputFormatContext_->oformat->flags & AVFMT_NOFILE) &&
-                    outputFormatContext_->pb) {
-                    avio_closep(&outputFormatContext_->pb);
-                }
-            } catch (...) {
-                Logger::error("Error closing output I/O context");
+            // 如果需要，写入尾部
+            if (isContextValid_ && outputFormatContext_->pb) {
+                av_write_trailer(outputFormatContext_);
             }
 
-            try {
-                avformat_free_context(outputFormatContext_);
-                outputFormatContext_ = nullptr;
-            } catch (...) {
-                Logger::error("Error freeing output format context");
-                // 避免悬空指针
-                outputFormatContext_ = nullptr;
+            if (!(outputFormatContext_->oformat->flags & AVFMT_NOFILE) &&
+                outputFormatContext_->pb) {
+                avio_closep(&outputFormatContext_->pb);
             }
+
+            avformat_free_context(outputFormatContext_);
+            outputFormatContext_ = nullptr;
         }
 
-        // 清空流列表
+        if (inputFormatContext_) {
+            avformat_close_input(&inputFormatContext_);
+            inputFormatContext_ = nullptr;
+        }
+
+        // 清空流容器
         videoStreams_.clear();
         audioStreams_.clear();
 
         Logger::debug("Resources cleanup completed for stream " + config_.id);
     } catch (const std::exception& e) {
         Logger::error("Exception during resource cleanup: " + std::string(e.what()));
-    } catch (...) {
-        Logger::error("Unknown exception during resource cleanup");
+        // 即使发生异常，也确保将指针置空以防止释放后使用
+        inputFormatContext_ = nullptr;
+        outputFormatContext_ = nullptr;
+        videoStreams_.clear();
+        audioStreams_.clear();
     }
 }
 
@@ -1688,7 +1681,7 @@ bool StreamProcessor::isStreamStalled() const {
 
 // 添加重连方法
 bool StreamProcessor::reconnect() {
-    // 如果已达到最大重连次数，不要增加重连尝试次数
+    // 如果已经达到最大重连尝试次数，不要继续
     if (reconnectAttempts_ >= maxReconnectAttempts_) {
         Logger::error("Stream " + config_.id + " exceeded maximum reconnection attempts ("
                       + std::to_string(maxReconnectAttempts_) + ")");
@@ -1704,18 +1697,19 @@ bool StreamProcessor::reconnect() {
 
     // 计算重连延迟（指数退避）
     int64_t reconnectDelay = 1000000 * (1 << (reconnectAttempts_ - 1));
-    if (reconnectDelay > 30000000) reconnectDelay = 30000000; // 最大30秒
+    reconnectDelay = std::min(reconnectDelay, (int64_t)30000000); // 最多30秒
 
-    Logger::info("waitting " + std::to_string(reconnectDelay / 1000000) + " seconds before reconnecting");
+    Logger::info("Waiting " + std::to_string(reconnectDelay / 1000000) + " seconds before reconnecting");
     av_usleep(reconnectDelay);
 
     try {
-        // 清理旧资源
+        // 重要：首先清理所有旧资源
         cleanup();
 
-        // 重新初始化连接
+        // 然后初始化新连接
         initialize();
 
+        // 成功后重置状态变量
         Logger::info("Successfully reconnected stream: " + config_.id);
         resetErrorState();
         isReconnecting_ = false;
@@ -1723,27 +1717,21 @@ bool StreamProcessor::reconnect() {
     } catch (const FFmpegException& e) {
         Logger::error("Failed to reconnect stream " + config_.id + ": " + std::string(e.what()));
 
-        // 不要在这里设置hasError_ - 我们希望允许重试
-        // 只将isReconnecting_设置为false以允许新的重连尝试
-        isReconnecting_ = false;
-
-        // 如果我们还没有达到最大尝试次数，允许下一次尝试
-        if (reconnectAttempts_ < maxReconnectAttempts_) {
-            return false;
+        // 确保即使在失败后也处于一致状态
+        try {
+            // 额外的清理尝试，确保资源被释放
+            cleanup();
+        } catch (...) {
+            Logger::error("Error during cleanup after failed reconnection");
         }
 
+        isReconnecting_ = false;
+
         // 只有在达到最大尝试次数时才设置错误标志
-        hasError_ = true;
-        return false;
-    } catch (const std::exception& e) {
-        // 也处理标准异常
-        Logger::error("Unexpected error during reconnection of stream " + config_.id + ": " + std::string(e.what()));
-        isReconnecting_ = false;
-        return false;
-    } catch (...) {
-        // 捕获任何其他错误
-        Logger::error("Unknown error during reconnection of stream " + config_.id);
-        isReconnecting_ = false;
+        if (reconnectAttempts_ >= maxReconnectAttempts_) {
+            hasError_ = true;
+        }
+
         return false;
     }
 }

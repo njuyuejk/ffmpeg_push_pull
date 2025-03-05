@@ -155,69 +155,67 @@ std::string MultiStreamManager::startStream(const StreamConfig& config) {
 
 bool MultiStreamManager::stopStream(const std::string& streamId) {
     std::shared_ptr<StreamProcessor> processor;
-    bool found = false;
 
-    // 首先从映射中获取流处理器
+    // 首先查找流，但不要立即从映射中删除
     {
         std::lock_guard<std::mutex> lock(streamsMutex_);
         auto it = streams_.find(streamId);
-        if (it != streams_.end()) {
-            processor = it->second;
-            found = true;
-            // 立即从映射中移除，防止其他线程访问
-            streams_.erase(it);
-            Logger::info("Removed stream " + streamId + " from manager");
+        if (it == streams_.end()) {
+            Logger::warning("Stream not found to stop: " + streamId);
+            return false;
         }
+        processor = it->second;
     }
 
-    if (!found) {
-        Logger::warning("Stream not found: " + streamId);
-        return false;
-    }
-
-    // 从看门狗注销（如果有）
-    try {
-        std::lock_guard<std::mutex> lock(watchdogMutex_);
-        if (watchdog_) {
-            try {
-                watchdog_->unregisterTarget("stream_" + streamId);
-                Logger::debug("Unregistered stream " + streamId + " from watchdog");
-            } catch (const std::exception& e) {
-                Logger::warning("Failed to unregister stream " + streamId + " from watchdog: " + e.what());
-            }
-        }
-    } catch (...) {
-        Logger::error("Error accessing watchdog");
-    }
-
-    // 使用线程池异步停止处理器
-    auto stopFuture = threadPool_->enqueue([processor, streamId]() -> bool {
+    // 首先从看门狗注销
+    if (watchdog_) {
         try {
-            processor->stop();
-            Logger::info("Stopped stream: " + streamId);
-            return true;
+            watchdog_->unregisterTarget("stream_" + streamId);
+            Logger::debug("Unregistered stream " + streamId + " from watchdog");
         } catch (const std::exception& e) {
-            Logger::error("Error stopping stream " + streamId + ": " + e.what());
-        } catch (...) {
-            Logger::error("Unknown error stopping stream " + streamId);
+            Logger::warning("Error unregistering from watchdog: " + std::string(e.what()));
         }
-        return false;
-    });
+    }
 
-    // 等待停止操作完成，带超时
-    bool stopResult = false;
+    bool stopSuccess = false;
+
+    // 停止处理器
     try {
-        auto stopStatus = stopFuture.wait_for(std::chrono::seconds(5));
-        if (stopStatus != std::future_status::ready) {
-            Logger::warning("Timeout waiting for stream " + streamId + " to stop");
+        // 定义合理的超时时间
+        const int STOP_TIMEOUT_SEC = 10;
+
+        // 使用线程池停止处理器，带有超时
+        auto stopFuture = threadPool_->enqueue([processor, streamId]() {
+            try {
+                processor->stop();
+                Logger::info("Stopped stream: " + streamId);
+                return true;
+            } catch (const std::exception& e) {
+                Logger::error("Error stopping stream " + streamId + ": " + e.what());
+                return false;
+            }
+        });
+
+        // 带超时等待
+        auto status = stopFuture.wait_for(std::chrono::seconds(STOP_TIMEOUT_SEC));
+        if (status == std::future_status::ready) {
+            stopSuccess = stopFuture.get();
         } else {
-            stopResult = stopFuture.get();
+            Logger::warning("Timeout waiting for stream " + streamId + " to stop");
+            stopSuccess = false;
         }
     } catch (const std::exception& e) {
-        Logger::error("Exception waiting for stream stop: " + std::string(e.what()));
+        Logger::error("Exception stopping stream " + streamId + ": " + std::string(e.what()));
+        stopSuccess = false;
     }
 
-    return stopResult;
+    // 停止后从映射中删除
+    {
+        std::lock_guard<std::mutex> lock(streamsMutex_);
+        streams_.erase(streamId);
+    }
+
+    return stopSuccess;
 }
 
 void MultiStreamManager::stopAll() {
