@@ -52,7 +52,6 @@ public:
      * @brief 清理应用程序资源
      */
     void cleanup();
-
 private:
     /**
      * @brief 私有构造函数（单例模式）
