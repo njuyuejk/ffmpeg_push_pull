@@ -53,12 +53,6 @@ public:
      */
     void cleanup();
 
-    /**
-     * @brief 获取应用程序运行状态
-     * @return 是否正在运行
-     */
-    bool isRunning() const { return running_; }
-
 private:
     /**
      * @brief 私有构造函数（单例模式）
