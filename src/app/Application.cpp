@@ -241,14 +241,22 @@ void Application::monitorStreams() {
             continue; // 流正常运行，无需处理
         }
 
-        // 流出错或未运行，尝试重启
-        if (hasError || !isRunning) {
+        // 检查看门狗状态 (新增)
+        bool unhealthyInWatchdog = false;
+        if (watchdog_ && !watchdog_->isTargetHealthy("stream_" + streamId)) {
+            int failCount = watchdog_->getTargetFailCount("stream_" + streamId);
+            Logger::warning("Stream " + streamId + " unhealthy according to watchdog (failures: " +
+                            (failCount >= 0 ? std::to_string(failCount) : "unknown") + ")");
+            unhealthyInWatchdog = true;
+        }
+
+        // 流出错、未运行或在看门狗中不健康，尝试重启
+        if (hasError || !isRunning || unhealthyInWatchdog) {
             // 初始化重启计数器
             if (restartAttempts.find(streamId) == restartAttempts.end()) {
                 restartAttempts[streamId] = 0;
             }
 
-            // 删除最大尝试次数限制，修改为无限重试，但逐渐增加间隔
             // 计算重启延迟（使用指数退避策略，但有上限）
             int backoffSeconds = std::min(60, 1 << std::min(restartAttempts[streamId], 10));
 

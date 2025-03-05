@@ -53,9 +53,8 @@ void Watchdog::stop() {
 }
 
 bool Watchdog::registerTarget(const std::string& targetName,
-                              std::function<bool()> healthCheckFunc,
-                              std::function<void()> recoveryFunc) {
-    if (targetName.empty() || !healthCheckFunc || !recoveryFunc) {
+                              std::function<bool()> healthCheckFunc) {
+    if (targetName.empty() || !healthCheckFunc) {
         Logger::warning("Invalid parameters for watchdog target registration");
         return false;
     }
@@ -77,11 +76,8 @@ bool Watchdog::registerTarget(const std::string& targetName,
     Target target;
     target.name = targetName;
     target.healthCheck = healthCheckFunc;
-    target.recovery = recoveryFunc;
     target.lastFeedTime = std::chrono::steady_clock::now();
     target.failCount = 0;
-    target.needsRecovery = false;
-    target.lastRecoveryTime = std::chrono::steady_clock::now() - std::chrono::minutes(10); // 设置上次恢复时间为10分钟前
 
     targets_.push_back(target);
     Logger::info("Target registered with Watchdog: " + targetName);
@@ -104,12 +100,44 @@ void Watchdog::feedTarget(const std::string& targetName) {
             it->failCount = 0;
             Logger::debug("Target '" + targetName + "' fed, reset failure count to 0");
         }
-        it->needsRecovery = false;
     }
 }
 
 bool Watchdog::isRunning() const {
     return running_;
+}
+
+// 获取目标状态
+bool Watchdog::isTargetHealthy(const std::string& targetName) const {
+    std::lock_guard<std::mutex> lock(targetMutex_);
+
+    auto it = std::find_if(targets_.begin(), targets_.end(),
+                           [&targetName](const Target& target) {
+                               return target.name == targetName;
+                           });
+
+    // 如果目标不存在或者失败计数大于0，则认为是不健康的
+    if (it == targets_.end()) {
+        return false; // 目标不存在视为不健康
+    }
+
+    return it->failCount == 0;
+}
+
+// 获取目标失败计数
+int Watchdog::getTargetFailCount(const std::string& targetName) const {
+    std::lock_guard<std::mutex> lock(targetMutex_);
+
+    auto it = std::find_if(targets_.begin(), targets_.end(),
+                           [&targetName](const Target& target) {
+                               return target.name == targetName;
+                           });
+
+    if (it == targets_.end()) {
+        return -1; // 目标不存在
+    }
+
+    return it->failCount;
 }
 
 // 取消注册目标的方法 - 这对于防止悬空引用很重要
@@ -126,7 +154,6 @@ bool Watchdog::unregisterTarget(const std::string& targetName) {
     if (it != targets_.end()) {
         // 复制函数对象到局部变量，并设置为空，以确保即使在其他线程中也不会被调用
         it->healthCheck = []() { return true; };
-        it->recovery = []() {};
 
         // 从列表中移除
         targets_.erase(it);
@@ -138,25 +165,16 @@ bool Watchdog::unregisterTarget(const std::string& targetName) {
 }
 
 void Watchdog::monitorLoop() {
-    const int MAX_CONSECUTIVE_FAILURES = 3;
-    const int MIN_RECOVERY_INTERVAL_SEC = 60;
+    const int MAX_CONSECUTIVE_FAILURES = 3; // 记录最大连续失败次数，用于日志
 
     while (true) {
-        // 创建健康检查和恢复任务列表
+        // 创建健康检查任务列表
         struct HealthCheckTask {
             std::string targetName;
             std::function<bool()> healthCheck;
-            int failCount;
-            bool needsRecovery;
-        };
-
-        struct RecoveryTask {
-            std::string targetName;
-            std::function<void()> recovery;
         };
 
         std::vector<HealthCheckTask> healthCheckTasks;
-        std::vector<RecoveryTask> recoveryTasks;
 
         // 使用unique_lock，因为我们需要手动解锁
         std::unique_lock<std::mutex> lock(targetMutex_);
@@ -169,62 +187,17 @@ void Watchdog::monitorLoop() {
             auto timeSinceLastFeed = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now() - target.lastFeedTime).count();
 
-            // 检查是否需要恢复
-            auto timeSinceLastRecovery = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now() - target.lastRecoveryTime).count();
-
-            // 如果需要恢复，并且满足恢复间隔条件
-            if (target.needsRecovery && timeSinceLastRecovery >= MIN_RECOVERY_INTERVAL_SEC) {
-                RecoveryTask task;
-                task.targetName = target.name;
-                task.recovery = target.recovery;
-                recoveryTasks.push_back(task);
-
-                // 重置需要恢复标志和更新最后恢复时间
-                target.needsRecovery = false;
-                target.lastRecoveryTime = std::chrono::steady_clock::now();
-            }
-                // 如果需要健康检查
-            else if (timeSinceLastFeed > checkIntervalMs_ / 1000 * 2) {
+            // 如果需要健康检查
+            if (timeSinceLastFeed > checkIntervalMs_ / 1000 * 2) {
                 HealthCheckTask task;
                 task.targetName = target.name;
                 task.healthCheck = target.healthCheck;
-                task.failCount = target.failCount;
-                task.needsRecovery = false;
                 healthCheckTasks.push_back(task);
             }
         }
 
         // 释放锁，这样在执行回调时不会阻塞其他线程
         lock.unlock();
-
-        // 执行恢复任务
-        for (const auto& task : recoveryTasks) {
-            try {
-                Logger::warning("Watchdog attempting recovery for target: " + task.targetName);
-                task.recovery();
-
-                // 恢复锁，更新恢复状态
-                lock.lock();
-
-                // 查找目标，可能在执行恢复过程中已被移除
-                auto it = std::find_if(targets_.begin(), targets_.end(),
-                                       [&task](const Target& t) { return t.name == task.targetName; });
-
-                if (it != targets_.end()) {
-                    it->failCount = 0;
-                    Logger::info("Watchdog recovery completed for target: " + task.targetName);
-                } else {
-                    Logger::warning("Target " + task.targetName + " was removed during recovery");
-                }
-
-                lock.unlock();
-            } catch (const std::exception& e) {
-                Logger::error("Watchdog recovery failed for target " + task.targetName + ": " + e.what());
-            } catch (...) {
-                Logger::error("Unknown exception in watchdog recovery for target: " + task.targetName);
-            }
-        }
 
         // 执行健康检查任务
         for (const auto& task : healthCheckTasks) {
@@ -244,12 +217,6 @@ void Watchdog::monitorLoop() {
                         Logger::warning("Watchdog health check failed for " + task.targetName +
                                         " (failure count: " + std::to_string(it->failCount) +
                                         "/" + std::to_string(MAX_CONSECUTIVE_FAILURES) + ")");
-
-                        // 判断是否需要恢复
-                        if (it->failCount >= MAX_CONSECUTIVE_FAILURES) {
-                            Logger::error("Watchdog: Target " + task.targetName + " requires recovery");
-                            it->needsRecovery = true;
-                        }
                     } else {
                         // 重置失败计数
                         if (it->failCount > 0) {

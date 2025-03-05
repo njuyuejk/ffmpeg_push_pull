@@ -11,7 +11,7 @@
 #include <mutex>
 
 /**
- * @brief 看门狗类，用于监控系统组件并在故障时恢复
+ * @brief 简化的看门狗类，专注于监控系统组件状态
  */
 class Watchdog {
 public:
@@ -40,12 +40,10 @@ public:
      * @brief 注册监控目标
      * @param targetName 目标名称
      * @param healthCheckFunc 健康检查函数，返回true表示健康
-     * @param recoveryFunc 恢复函数
      * @return 注册是否成功
      */
     bool registerTarget(const std::string& targetName,
-                        std::function<bool()> healthCheckFunc,
-                        std::function<void()> recoveryFunc);
+                        std::function<bool()> healthCheckFunc);
 
     /**
      * @brief 取消注册监控目标
@@ -61,6 +59,20 @@ public:
     void feedTarget(const std::string& targetName);
 
     /**
+     * @brief 检查目标状态
+     * @param targetName 目标名称
+     * @return 目标是否健康
+     */
+    bool isTargetHealthy(const std::string& targetName) const;
+
+    /**
+     * @brief 获取目标失败计数
+     * @param targetName 目标名称
+     * @return 失败计数，-1表示目标不存在
+     */
+    int getTargetFailCount(const std::string& targetName) const;
+
+    /**
      * @brief 检查看门狗是否在运行
      * @return 是否在运行
      */
@@ -73,11 +85,8 @@ private:
     struct Target {
         std::string name;
         std::function<bool()> healthCheck;
-        std::function<void()> recovery;
         std::chrono::time_point<std::chrono::steady_clock> lastFeedTime;
         int failCount;
-        bool needsRecovery;
-        std::chrono::time_point<std::chrono::steady_clock> lastRecoveryTime;
     };
 
     /**
@@ -89,7 +98,7 @@ private:
     int checkIntervalMs_;
     std::thread monitorThread_;
     std::vector<Target> targets_;
-    std::mutex targetMutex_;
+    mutable std::mutex targetMutex_;
 };
 
 #endif // WATCHDOG_H

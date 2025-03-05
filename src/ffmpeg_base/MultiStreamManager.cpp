@@ -121,30 +121,6 @@ std::string MultiStreamManager::startStream(const StreamConfig& config) {
                                       }
                                       // 对象已被释放，返回true让看门狗停止监控
                                       return true;
-                                  },
-                // 恢复函数
-                                  [this, streamId, weakPtr]() {
-                                      Logger::warning("Watchdog initiating recovery for stream: " + streamId);
-
-                                      // 尝试获取强引用
-                                      if (auto sp = weakPtr.lock()) {
-                                          try {
-                                              // 通过MultiStreamManager重启流，而不是直接操作StreamProcessor
-                                              this->stopStream(streamId);
-                                              std::this_thread::sleep_for(std::chrono::seconds(2));
-
-                                              // 获取配置并重新启动
-                                              StreamConfig config = AppConfig::findStreamConfigById(streamId);
-                                              if (config.id == streamId) {
-                                                  this->startStream(config);
-                                                  Logger::info("Watchdog successfully restarted stream: " + streamId);
-                                              }
-                                          } catch (const std::exception& e) {
-                                              Logger::error("Watchdog failed to restart stream " + streamId + ": " + e.what());
-                                          }
-                                      } else {
-                                          Logger::warning("Cannot recover stream " + streamId + ": object no longer exists");
-                                      }
                                   }
         );
     }
@@ -367,13 +343,12 @@ void MultiStreamManager::setWatchdog(Watchdog* watchdog) {
         // 保存看门狗指针
         watchdog_ = watchdog;
 
-        // 注册应用程序看门狗目标
-        watchdog_->registerTarget("application",
-                                  []() -> bool { return true; }, // 简单的健康检查，总是返回健康
-                                  []() { Logger::warning("Application recovery triggered"); }
-        );
+        // 注册应用程序看门狗目标 - 简化版本，只监控状态
+        watchdog_->registerTarget("application", []() -> bool {
+            return true; // 简单的健康检查，总是返回健康
+        });
 
-        // 为所有现有流注册看门狗目标
+        // 为所有现有流注册看门狗目标 - 简化版本，只监控状态
         {
             std::lock_guard<std::mutex> streamLock(streamsMutex_);
 
@@ -386,25 +361,7 @@ void MultiStreamManager::setWatchdog(Watchdog* watchdog) {
                                               if (auto processor = weakProcessor.lock()) {
                                                   return processor->isRunning() && !processor->hasError();
                                               }
-                                              return true; // 对象已被释放，返回true表示不需要恢复
-                                          },
-                                          [this, streamId, weakProcessor]() {
-                                              if (auto processor = weakProcessor.lock()) {
-                                                  Logger::warning("Watchdog recovery for stream: " + streamId);
-                                                  try {
-                                                      // 通过MultiStreamManager重启流
-                                                      this->stopStream(streamId);
-                                                      std::this_thread::sleep_for(std::chrono::seconds(2));
-
-                                                      StreamConfig config = AppConfig::findStreamConfigById(streamId);
-                                                      if (config.id == streamId) {
-                                                          this->startStream(config);
-                                                          Logger::info("Watchdog successfully restarted stream: " + streamId);
-                                                      }
-                                                  } catch (const std::exception& e) {
-                                                      Logger::error("Watchdog failed to restart stream " + streamId + ": " + e.what());
-                                                  }
-                                              }
+                                              return true; // 对象已被释放，返回true表示不需要监控
                                           }
                 );
             }
@@ -457,6 +414,11 @@ void MultiStreamManager::watchdogFeederLoop() {
                         if (watchdog_) {
                             watchdog_->feedTarget("stream_" + streamId);
                         }
+                    } else {
+                        // 流有问题但我们不再由看门狗自动处理 - 仅记录问题
+                        Logger::debug("Stream " + streamId + " has issues: running=" +
+                                      (processor->isRunning() ? "yes" : "no") +
+                                      ", error=" + (processor->hasError() ? "yes" : "no"));
                     }
                 }
             }
