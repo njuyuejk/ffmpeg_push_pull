@@ -149,47 +149,82 @@ void Application::handleSignal(int signal) {
 
 // 清理应用
 void Application::cleanup() {
-    Logger::info("Cleaning up application...");
-    running_ = false;  // 首先确保主循环终止
+    Logger::info("Cleaning up application resources...");
+    running_ = false;  // 确保主循环终止
 
-    // 停止看门狗
-    if (watchdog_) {
+    // 记录清理开始时间（用于超时）
+    auto cleanupStart = std::chrono::steady_clock::now();
+    bool cleanupCompleted = false;
+
+    // 使用单独的线程执行清理，防止潜在的阻塞
+    std::thread cleanupThread([this, &cleanupCompleted]() {
         try {
-            watchdog_->stop();
-            // 停止看门狗后等待片刻，确保其线程有时间终止
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            watchdog_.reset();
-            Logger::info("Watchdog stopped and cleaned up");
+            // 停止看门狗
+            if (watchdog_) {
+                try {
+                    watchdog_->stop();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    watchdog_.reset();
+                    Logger::info("Watchdog stopped and cleaned up");
+                } catch (const std::exception& e) {
+                    Logger::error("Error stopping watchdog: " + std::string(e.what()));
+                } catch (...) {
+                    Logger::error("Unknown error stopping watchdog");
+                }
+            }
+
+            // 等待确保所有线程都注意到应用程序已停止
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            // 停止所有流
+            if (streamManager_) {
+                try {
+                    stopAllStreams();
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    streamManager_.reset();
+                    Logger::info("Stream manager cleaned up");
+                } catch (const std::exception& e) {
+                    Logger::error("Error cleaning up stream manager: " + std::string(e.what()));
+                } catch (...) {
+                    Logger::error("Unknown error cleaning up stream manager");
+                }
+            }
+
+            cleanupCompleted = true;
         } catch (const std::exception& e) {
-            Logger::error("Error stopping watchdog: " + std::string(e.what()));
+            Logger::error("Exception during cleanup process: " + std::string(e.what()));
         } catch (...) {
-            Logger::error("Unknown error stopping watchdog");
+            Logger::error("Unknown exception during cleanup process");
         }
+    });
+
+    // 带超时地等待清理完成
+    const int CLEANUP_TIMEOUT_SEC = 10;
+    auto waitEndTime = cleanupStart + std::chrono::seconds(CLEANUP_TIMEOUT_SEC);
+
+    while (!cleanupCompleted && std::chrono::steady_clock::now() < waitEndTime) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // 等待一小段时间确保所有线程都注意到应用程序已停止
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    // 处理清理超时
+    if (!cleanupCompleted) {
+        Logger::warning("Cleanup operation timed out, proceeding with forced exit");
 
-    // 停止所有流
-    if (streamManager_) {
-        try {
-            stopAllStreams();
-            // 在释放指针前等待片刻，确保所有后台操作完成
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            streamManager_.reset();
-            Logger::info("Stream manager cleaned up");
-        } catch (const std::exception& e) {
-            Logger::error("Error cleaning up stream manager: " + std::string(e.what()));
-        } catch (...) {
-            Logger::error("Unknown error cleaning up stream manager");
+        if (cleanupThread.joinable()) {
+            cleanupThread.detach();
+        }
+    } else {
+        if (cleanupThread.joinable()) {
+            cleanupThread.join();
         }
     }
 
     // 关闭日志系统
     try {
+        Logger::info("Application exit");
         Logger::shutdown();
     } catch (...) {
-        std::cerr << "Error shutting down logger" << std::endl;
+        std::cerr << "Error shutting down logger system" << std::endl;
     }
 }
 
@@ -212,7 +247,7 @@ void Application::listStreams() {
 
 // 监控流状态
 void Application::monitorStreams() {
-    // 显示当前状态
+// 显示当前状态
     listStreams();
 
     // 如果不需要自动重启流，则直接返回
@@ -223,6 +258,8 @@ void Application::monitorStreams() {
     static std::map<std::string, int> restartAttempts;  // 跟踪每个流的重启尝试次数
     static std::map<std::string, int64_t> lastRestartTime;  // 上次重启时间
     const int RESTART_RESET_TIME = 300;   // 5分钟无错误后重置重启计数器
+    const int MAX_RESTART_ATTEMPTS = 20;  // 最大重启尝试次数，超过后将采用更长的间隔
+    const int LONG_RETRY_INTERVAL = 60;   // 长重试间隔（秒）
 
     // 查找并重启出错的流
     std::vector<std::string> streams = streamManager_->listStreams();
@@ -241,7 +278,7 @@ void Application::monitorStreams() {
             continue; // 流正常运行，无需处理
         }
 
-        // 检查看门狗状态 (新增)
+        // 检查看门狗状态
         bool unhealthyInWatchdog = false;
         if (watchdog_ && !watchdog_->isTargetHealthy("stream_" + streamId)) {
             int failCount = watchdog_->getTargetFailCount("stream_" + streamId);
@@ -250,25 +287,46 @@ void Application::monitorStreams() {
             unhealthyInWatchdog = true;
         }
 
-        // 流出错、未运行或在看门狗中不健康，尝试重启
+        // 流有错误、未运行或在看门狗中不健康，尝试重启
         if (hasError || !isRunning || unhealthyInWatchdog) {
-            // 初始化重启计数器
+            // 初始化重启计数器（如果需要）
             if (restartAttempts.find(streamId) == restartAttempts.end()) {
                 restartAttempts[streamId] = 0;
             }
 
-            // 计算重启延迟（使用指数退避策略，但有上限）
-            int backoffSeconds = std::min(60, 1 << std::min(restartAttempts[streamId], 10));
+            // 如果超过最大尝试次数，使用更长的重试间隔
+            bool usingLongRetryInterval = (restartAttempts[streamId] >= MAX_RESTART_ATTEMPTS);
 
-            // 检查最后一次重启时间，确保不会太频繁重启
+            // 计算重启延迟（指数退避但有上限）
+            int backoffSeconds;
+            if (usingLongRetryInterval) {
+                // 尝试多次，使用较长的固定间隔
+                backoffSeconds = LONG_RETRY_INTERVAL;
+
+                // 仅在进入长重试模式时记录一次
+                if (restartAttempts[streamId] == MAX_RESTART_ATTEMPTS) {
+                    Logger::warning("Stream " + streamId + " entered long retry mode after " +
+                                    std::to_string(MAX_RESTART_ATTEMPTS) + " attempts");
+                }
+            } else {
+                // 标准指数退避，上限为60秒
+                backoffSeconds = std::min(60, 1 << std::min(restartAttempts[streamId], 10));
+            }
+
+            // 检查上次重启时间，避免过于频繁的重启
             int64_t currentTime = time(nullptr);
             if (lastRestartTime.find(streamId) != lastRestartTime.end() &&
                 currentTime - lastRestartTime[streamId] < backoffSeconds) {
                 continue; // 还没到重试时间
             }
 
-            Logger::warning("Attempting to reconnect stream: " + streamId + " (attempt "
-                            + std::to_string(restartAttempts[streamId] + 1) + ")");
+            // 记录重连尝试
+            if (usingLongRetryInterval) {
+                Logger::info("Periodic retry for stream: " + streamId + " (in long retry mode)");
+            } else {
+                Logger::warning("Attempting to reconnect stream: " + streamId + " (attempt "
+                                + std::to_string(restartAttempts[streamId] + 1) + ")");
+            }
 
             // 停止流
             streamManager_->stopStream(streamId);
@@ -276,7 +334,7 @@ void Application::monitorStreams() {
             // 等待指定的重启延迟
             std::this_thread::sleep_for(std::chrono::seconds(10));
 
-            // 获取配置并重新启动
+            // 获取配置并重启
             StreamConfig config = AppConfig::findStreamConfigById(streamId);
             if (config.id == streamId) {
                 try {
@@ -292,6 +350,46 @@ void Application::monitorStreams() {
             } else {
                 Logger::error("Could not find configuration for stream: " + streamId);
             }
+        }
+    }
+
+    // 处理所有流的周期性重连（包括失败的流）
+    if (periodicReconnectInterval_ > 0) {
+        int64_t currentTime = time(nullptr);
+        if (currentTime - lastPeriodicReconnectTime_ > periodicReconnectInterval_) {
+            Logger::info("Performing periodic reconnect check");
+
+            // 保存有错误的流
+            std::vector<std::string> errorStreams;
+            for (const auto& streamId : streams) {
+                if (streamManager_->hasStreamError(streamId)) {
+                    errorStreams.push_back(streamId);
+                }
+            }
+
+            // 重启每个失败的流
+            for (const auto& streamId : errorStreams) {
+                Logger::info("Periodic reconnect for stream with error: " + streamId);
+
+                // 停止流
+                streamManager_->stopStream(streamId);
+
+                // 短暂暂停
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+
+                // 重启流
+                StreamConfig config = AppConfig::findStreamConfigById(streamId);
+                if (config.id == streamId) {
+                    try {
+                        streamManager_->startStream(config);
+                        Logger::info("Periodic reconnect successful for stream: " + streamId);
+                    } catch (const FFmpegException& e) {
+                        Logger::error("Periodic reconnect failed for stream " + streamId + ": " + e.what());
+                    }
+                }
+            }
+
+            lastPeriodicReconnectTime_ = currentTime;
         }
     }
 }

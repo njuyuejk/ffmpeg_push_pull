@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <condition_variable>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -108,6 +109,10 @@ private:
     std::atomic<int64_t> lastFrameTime_;
     std::atomic<int64_t> noDataTimeout_;
     std::atomic<bool> isReconnecting_;
+
+    // 添加这些到类成员变量
+    std::mutex ffmpegMutex_;  // 保护FFmpeg上下文访问
+    bool isContextValid_ = false;  // 用于跟踪上下文是否有效的标志
 
     // 私有方法
     void initialize();

@@ -146,13 +146,16 @@ bool MultiStreamManager::stopStream(const std::string& streamId) {
     std::shared_ptr<StreamProcessor> processor;
     bool found = false;
 
-    // 首先从映射中获取流
+    // 首先从映射中获取流处理器
     {
         std::lock_guard<std::mutex> lock(streamsMutex_);
         auto it = streams_.find(streamId);
         if (it != streams_.end()) {
             processor = it->second;
             found = true;
+            // 立即从map中移除，防止其他线程访问
+            streams_.erase(it);
+            Logger::info("Removed stream " + streamId + " from manager");
         }
     }
 
@@ -161,35 +164,33 @@ bool MultiStreamManager::stopStream(const std::string& streamId) {
         return false;
     }
 
-    // 在做任何事情之前从看门狗注销
-    {
+    // 从看门狗注销（如果有）
+    try {
         std::lock_guard<std::mutex> lock(watchdogMutex_);
         if (watchdog_) {
             try {
-                // 使用try-catch块，确保注销失败不会影响后续操作
                 watchdog_->unregisterTarget("stream_" + streamId);
                 Logger::debug("Unregistered stream " + streamId + " from watchdog");
             } catch (const std::exception& e) {
                 Logger::warning("Failed to unregister stream " + streamId + " from watchdog: " + e.what());
             }
         }
+    } catch (...) {
+        Logger::error("Error accessing watchdog");
     }
 
-    // 停止流处理
+    // 安全地停止流处理器
     bool stopResult = false;
-    try {
-        processor->stop();
-        Logger::info("Stopped stream: " + streamId);
-        stopResult = true;
-    } catch (const std::exception& e) {
-        Logger::error("Error stopping stream " + streamId + ": " + e.what());
-        stopResult = false;
-    }
-
-    // 最后从映射中移除
-    {
-        std::lock_guard<std::mutex> lock(streamsMutex_);
-        streams_.erase(streamId);
+    if (processor) {
+        try {
+            // 直接调用停止方法，它现在有内部超时保护
+            processor->stop();
+            stopResult = true;
+        } catch (const std::exception& e) {
+            Logger::error("Error stopping stream " + streamId + ": " + e.what());
+        } catch (...) {
+            Logger::error("Unknown error stopping stream " + streamId);
+        }
     }
 
     return stopResult;
@@ -221,15 +222,61 @@ void MultiStreamManager::stopAll() {
         }
     }
 
-    // 停止所有流处理器
+    // 使用适当的超时处理停止所有流处理器
     int failureCount = 0;
+    std::vector<std::thread> stopThreads;
+    std::vector<std::atomic<bool>> stopCompleted(processorsToStop.size());
+
+    // 在单独的线程中启动所有停止操作
     for (size_t i = 0; i < processorsToStop.size(); i++) {
-        try {
-            Logger::info("Stopping stream: " + streamIds[i]);
-            processorsToStop[i]->stop();
-        } catch (const std::exception& e) {
+        stopCompleted[i] = false;
+        stopThreads.emplace_back([i, &processorsToStop, &streamIds, &stopCompleted]() {
+            try {
+                Logger::info("Stopping stream: " + streamIds[i]);
+                processorsToStop[i]->stop();
+                stopCompleted[i] = true;
+            } catch (const std::exception& e) {
+                Logger::error("Error stopping stream " + streamIds[i] + ": " + std::string(e.what()));
+            }
+        });
+    }
+
+    // 等待所有停止操作（带超时）
+    auto stopStartTime = std::chrono::steady_clock::now();
+    auto stopEndTime = stopStartTime + std::chrono::seconds(15);  // 总共15秒超时
+
+    for (size_t i = 0; i < stopThreads.size(); i++) {
+        if (!stopThreads[i].joinable()) continue;
+
+        auto currentTime = std::chrono::steady_clock::now();
+        if (currentTime >= stopEndTime) {
+            // 达到全局超时，分离剩余线程
+            Logger::warning("Global timeout reached while stopping streams");
+            stopThreads[i].detach();
             failureCount++;
-            Logger::error("Error stopping stream " + streamIds[i] + ": " + std::string(e.what()));
+            continue;
+        }
+
+        // 计算剩余超时时间
+        auto remainingTime = stopEndTime - currentTime;
+
+        // 使用剩余超时时间等待此线程
+        bool stoppedInTime = false;
+        {
+            std::mutex mtx;
+            std::unique_lock<std::mutex> lock(mtx);
+            std::condition_variable cv;
+            stoppedInTime = cv.wait_for(lock, remainingTime, [&stopCompleted, i]() { return stopCompleted[i].load(); });
+        }
+
+        if (!stoppedInTime) {
+            // 线程超时
+            Logger::warning("Timeout stopping stream " + streamIds[i]);
+            stopThreads[i].detach();
+            failureCount++;
+        } else {
+            // 线程成功完成
+            stopThreads[i].join();
         }
     }
 

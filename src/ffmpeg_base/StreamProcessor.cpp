@@ -76,16 +76,103 @@ void StreamProcessor::start() {
 }
 
 void StreamProcessor::stop() {
-    // 使用局部变量，避免多次设置原子变量
+    Logger::info("Request to stop stream: " + config_.id);
+
+    // 首先将运行标志设置为false，通知处理线程退出
     bool wasRunning = isRunning_.exchange(false);
 
-    if (wasRunning && processingThread_.joinable()) {
-        try {
-            processingThread_.join();
-            Logger::info("Processing thread joined for stream: " + config_.id);
-        } catch (const std::exception& e) {
-            Logger::error("Exception joining processing thread: " + std::string(e.what()));
-            // 不抛出异常，因为我们正在清理
+    // 如果之前不是运行状态，直接返回
+    if (!wasRunning) {
+        Logger::info("Stream " + config_.id + " already stopped, no action needed");
+        return;
+    }
+
+    // 检查处理线程是否存在和可加入
+    if (!processingThread_.joinable()) {
+        Logger::info("Processing thread for stream " + config_.id + " is not joinable");
+        return;
+    }
+
+    try {
+        // 设置线程分离标志
+        bool shouldDetach = false;
+
+        // 尝试温和地等待线程结束
+        {
+            Logger::debug("Waiting for processing thread to end for stream: " + config_.id);
+
+            // 使用单独的线程和超时来等待处理线程
+            std::atomic<bool> threadJoined{false};
+
+            // 创建用于等待的线程
+            std::thread joinThread([this, &threadJoined]() {
+                try {
+                    if (this->processingThread_.joinable()) {
+                        this->processingThread_.join();
+                        threadJoined = true;
+                    }
+                } catch (const std::exception& e) {
+                    Logger::error("Exception joining processing thread: " + std::string(e.what()));
+                } catch (...) {
+                    Logger::error("Unknown exception joining processing thread");
+                }
+            });
+
+            // 等待最多5秒
+            for (int i = 0; i < 10 && !threadJoined; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+
+            if (!threadJoined) {
+                Logger::warning("Timeout joining processing thread for stream: " + config_.id);
+                shouldDetach = true;
+            }
+
+            // 确保等待线程完成或分离
+            if (joinThread.joinable()) {
+                if (threadJoined) {
+                    joinThread.join();
+                } else {
+                    joinThread.detach();
+                }
+            }
+        }
+
+        // 如果需要，分离处理线程
+        if (shouldDetach && processingThread_.joinable()) {
+            try {
+                processingThread_.detach();
+                Logger::info("Detached processing thread for stream " + config_.id);
+            } catch (const std::exception& e) {
+                Logger::error("Exception detaching processing thread: " + std::string(e.what()));
+            }
+        }
+
+        // 确保进行完整的资源清理
+        cleanup();
+
+        Logger::info("Stream " + config_.id + " successfully stopped");
+    } catch (const std::exception& e) {
+        Logger::error("Exception stopping stream " + config_.id + ": " + std::string(e.what()));
+
+        // 最后的安全措施 - 尝试分离线程而不是让它挂起
+        if (processingThread_.joinable()) {
+            try {
+                processingThread_.detach();
+            } catch (...) {
+                Logger::error("Final attempt to detach processing thread failed");
+            }
+        }
+    } catch (...) {
+        Logger::error("Unknown exception stopping stream " + config_.id);
+
+        // 类似的最终安全措施
+        if (processingThread_.joinable()) {
+            try {
+                processingThread_.detach();
+            } catch (...) {
+                // 不再记录，因为日志系统也可能有问题
+            }
         }
     }
 }
@@ -979,197 +1066,244 @@ void StreamProcessor::setupAudioStream(AVStream* inputStream) {
 // 添加到processLoop方法中，增强调试信息输出
 
 void StreamProcessor::processLoop() {
-    AVPacket* packet = av_packet_alloc();
-    int64_t lastLogTime = 0;
-    int frameCount = 0;
-    int streamErrorCount = 0;
-    const int MAX_ERRORS_BEFORE_RECONNECT = 20; // 连续错误阈值减小，触发重连更敏感
-    bool reconnectInProgress = false;
-
-    // 记录开始处理时间
-    int64_t startTime = av_gettime() / 1000000;
-    lastFrameTime_ = av_gettime(); // 初始化最后一帧时间
-    Logger::info("Starting process loop for stream: " + config_.id);
-
-    // 输出更多的流信息
-    if (inputFormatContext_ && outputFormatContext_) {
-        Logger::debug("Input format: " + std::string(inputFormatContext_->iformat->name) +
-                      " (" + (inputFormatContext_->iformat->long_name ? inputFormatContext_->iformat->long_name : "Unknown") + ")");
-        Logger::debug("Output format: " + std::string(outputFormatContext_->oformat->name) +
-                      " (" + (outputFormatContext_->oformat->long_name ? outputFormatContext_->oformat->long_name : "Unknown") + ")");
-
-        if (!videoStreams_.empty()) {
-            Logger::debug("Video streams: " + std::to_string(videoStreams_.size()));
-            for (size_t i = 0; i < videoStreams_.size(); i++) {
-                const auto& vs = videoStreams_[i];
-                if (vs.encoderContext && vs.encoderContext->codec) {
-                    Logger::debug("  Video encoder #" + std::to_string(i) + ": " + vs.encoderContext->codec->name +
-                                  " (" + (vs.encoderContext->codec->long_name ? vs.encoderContext->codec->long_name : "Unknown") + ")");
-                    Logger::debug("    Resolution: " + std::to_string(vs.encoderContext->width) + "x" +
-                                  std::to_string(vs.encoderContext->height) + ", bitrate: " + std::to_string(vs.encoderContext->bit_rate) + " bps");
-                }
-            }
+    AVPacket* packet = nullptr;
+    try {
+        packet = av_packet_alloc();
+        if (!packet) {
+            Logger::error("Failed to allocate packet memory");
+            hasError_ = true;
+            return;
         }
 
-        if (!audioStreams_.empty()) {
-            Logger::debug("Audio streams: " + std::to_string(audioStreams_.size()));
-            for (size_t i = 0; i < audioStreams_.size(); i++) {
-                const auto& as = audioStreams_[i];
-                if (as.encoderContext && as.encoderContext->codec) {
-                    Logger::debug("  Audio encoder #" + std::to_string(i) + ": " + as.encoderContext->codec->name +
-                                  " (" + (as.encoderContext->codec->long_name ? as.encoderContext->codec->long_name : "Unknown") + ")");
-                    Logger::debug("    Sample rate: " + std::to_string(as.encoderContext->sample_rate) +
-                                  " Hz, channels: " + std::to_string(as.encoderContext->channels) +
-                                  ", bitrate: " + std::to_string(as.encoderContext->bit_rate) + " bps");
-                }
-            }
-        }
-    }
+        int64_t lastLogTime = 0;
+        int frameCount = 0;
+        int streamErrorCount = 0;
+        const int MAX_ERRORS_BEFORE_RECONNECT = 20;
+        bool reconnectInProgress = false;
 
-    while (isRunning_) {
-        try {
-            // 检查流是否停滞
-            if (isStreamStalled() && !reconnectInProgress) {
-                Logger::warning("Stream " + config_.id + " appears stalled (no data for "
-                                + std::to_string(noDataTimeout_ / 1000000) + " seconds)");
+        // 记录开始时间
+        int64_t startTime = av_gettime() / 1000000;
+        lastFrameTime_ = av_gettime();
+        Logger::info("Starting process loop for stream: " + config_.id);
 
-                reconnectInProgress = true;
-                if (!reconnect()) {
-                    // 重连失败，设置错误并退出循环
-                    hasError_ = true;
+        // 处理循环
+        while (isRunning_) {
+            try {
+                // 检查退出信号
+                if (!isRunning_) {
+                    Logger::info("Exit signal detected for stream: " + config_.id);
                     break;
                 }
-                reconnectInProgress = false;
-                streamErrorCount = 0;
-                // 重连后继续循环
-                continue;
-            }
 
-            // 读取输入包
-            int ret = av_read_frame(inputFormatContext_, packet);
-            if (ret < 0) {
-                if (ret == AVERROR_EOF) {
-                    // 输入流结束
-                    Logger::info("End of input stream: " + config_.id);
-                    break;
-                } else if (ret == AVERROR(EAGAIN)) {
-                    // 暂时没有更多数据，等待一下
-                    av_usleep(10000);  // 休眠10ms
-                    continue;
-                } else {
-                    streamErrorCount++;
-                    if (streamErrorCount > MAX_ERRORS_BEFORE_RECONNECT && !reconnectInProgress) {
-                        Logger::warning("Too many consecutive errors (" + std::to_string(streamErrorCount)
-                                        + "), attempting reconnection");
+                // 检查流是否停滞
+                if (isStreamStalled() && !reconnectInProgress) {
+                    Logger::warning("Stream " + config_.id + " appears stalled (no data for "
+                                    + std::to_string(noDataTimeout_ / 1000000) + " seconds)");
 
-                        reconnectInProgress = true;
-                        if (!reconnect()) {
-                            // 重连失败，设置错误并退出循环
-                            hasError_ = true;
-                            break;
-                        }
+                    reconnectInProgress = true;
+                    if (!reconnect()) {
+                        Logger::error("Failed to reconnect stream " + config_.id + ", entering wait mode");
+                        hasError_ = true;
+                        av_usleep(5000000); // 5秒
                         reconnectInProgress = false;
-                        streamErrorCount = 0;
-                        // 重连后继续循环
                         continue;
                     }
-
-                    Logger::warning("Error reading frame (attempt " + std::to_string(streamErrorCount) +
-                                    "/" + std::to_string(MAX_ERRORS_BEFORE_RECONNECT) + "): " +
-                                    std::to_string(ret));
-                    av_usleep(100000);  // 错误后休眠100ms
+                    reconnectInProgress = false;
+                    streamErrorCount = 0;
                     continue;
                 }
-            }
 
-            // 更新最后一帧时间
-            lastFrameTime_ = av_gettime();
-
-            // 重置错误计数
-            streamErrorCount = 0;
-
-            // 处理视频包
-            bool packetProcessed = false;
-            for (auto& streamCtx : videoStreams_) {
-                if (packet->stream_index == streamCtx.streamIndex) {
-                    processVideoPacket(packet, streamCtx);
-                    packetProcessed = true;
-                    frameCount++;
-                    break;
+                // 检查输入上下文是否有效
+                if (!inputFormatContext_) {
+                    Logger::error("Input context invalid for stream: " + config_.id);
+                    hasError_ = true;
+                    av_usleep(1000000); // 1秒
+                    continue;
                 }
-            }
 
-            // 处理音频包
-            if (!packetProcessed) {
-                for (auto& streamCtx : audioStreams_) {
+                // 读取输入包
+                int ret = av_read_frame(inputFormatContext_, packet);
+                // 读取输入包
+                if (ret < 0) {
+                    // 处理各种错误情况
+                    // ... (与之前相同的代码)
+                    if (ret == AVERROR_EOF) {
+                        Logger::info("End of input stream: " + config_.id);
+                        break;
+                    } else if (ret == AVERROR(EAGAIN)) {
+                        av_usleep(10000);  // 休眠10毫秒
+                        continue;
+                    } else {
+                        streamErrorCount++;
+                        if (streamErrorCount > MAX_ERRORS_BEFORE_RECONNECT && !reconnectInProgress) {
+                            Logger::warning("Too many consecutive errors (" + std::to_string(streamErrorCount)
+                                            + "), attempting reconnection");
+
+                            reconnectInProgress = true;
+                            if (!reconnect()) {
+                                Logger::error("Failed to reconnect stream " + config_.id + ", entering wait mode");
+                                hasError_ = true;
+                                av_usleep(5000000); // 5秒
+                                reconnectInProgress = false;
+                                continue;
+                            }
+                            reconnectInProgress = false;
+                            streamErrorCount = 0;
+                            continue;
+                        }
+
+                        Logger::warning("Error reading frame (attempt " + std::to_string(streamErrorCount) +
+                                        "/" + std::to_string(MAX_ERRORS_BEFORE_RECONNECT) + "): " +
+                                        std::to_string(ret));
+                        av_usleep(100000);  // 错误后休眠100毫秒
+                        continue;
+                    }
+                }
+
+                lastFrameTime_ = av_gettime();
+                streamErrorCount = 0;
+
+                // 处理视频流包
+                bool packetProcessed = false;
+                for (auto& streamCtx : videoStreams_) {
                     if (packet->stream_index == streamCtx.streamIndex) {
-                        processAudioPacket(packet, streamCtx);
-                        packetProcessed = true;
+                        // Wrap packet processing in try-catch to handle output write errors
+                        try {
+                            processVideoPacket(packet, streamCtx);
+                            packetProcessed = true;
+                            frameCount++;
+                        } catch (const FFmpegException& e) {
+                            Logger::error("Error processing video packet: " + std::string(e.what()));
+                            // If error is related to writing, attempt reconnection
+                            if (std::string(e.what()).find("Error writing encoded packet") != std::string::npos) {
+                                if (!reconnectInProgress) {
+                                    Logger::warning("Output error detected, attempting reconnection");
+                                    reconnectInProgress = true;
+                                    if (!reconnect()) {
+                                        // Just log and continue - don't exit the loop
+                                        Logger::error("Failed to reconnect stream " + config_.id + " after output error");
+                                        hasError_ = true;
+                                        av_usleep(5000000); // 5 seconds
+                                    }
+                                    reconnectInProgress = false;
+                                }
+                            }
+                        }
                         break;
                     }
                 }
-            }
 
-            // 每5秒记录一次状态
-            int64_t currentTime = av_gettime() / 1000000;
-            if (currentTime - lastLogTime >= 5) {
-                // 计算运行时间和平均帧率
-                int64_t runTime = currentTime - startTime;
-                double avgFps = runTime > 0 ? (double)frameCount / runTime : 0;
-
-                Logger::debug("Stream " + config_.id + " processed " +
-                              std::to_string(frameCount) + " frames, avg. " +
-                              std::to_string(avgFps) + " fps (running for " +
-                              std::to_string(runTime) + " seconds)");
-
-                lastLogTime = currentTime;
-            }
-
-            // 释放包
-            av_packet_unref(packet);
-
-        } catch (const FFmpegException& e) {
-            Logger::error("Stream processing error: " + std::string(e.what()));
-            av_packet_unref(packet);
-
-            if (!reconnectInProgress && isRunning_) {
-                // 尝试重连
-                Logger::warning("Stream error detected, attempting reconnection");
-                reconnectInProgress = true;
-                if (!reconnect()) {
-                    // 重连失败，设置错误并退出循环
-                    hasError_ = true;
-                    isRunning_ = false;
-                    break;
+                // Process audio packet with similar error handling
+                if (!packetProcessed) {
+                    for (auto& streamCtx : audioStreams_) {
+                        if (packet->stream_index == streamCtx.streamIndex) {
+                            try {
+                                processAudioPacket(packet, streamCtx);
+                                packetProcessed = true;
+                            } catch (const FFmpegException& e) {
+                                Logger::error("Error processing audio packet: " + std::string(e.what()));
+                                // Handle output errors similar to video
+                                if (std::string(e.what()).find("Error writing encoded packet") != std::string::npos) {
+                                    if (!reconnectInProgress) {
+                                        Logger::warning("Output error detected, attempting reconnection");
+                                        reconnectInProgress = true;
+                                        if (!reconnect()) {
+                                            Logger::error("Failed to reconnect stream " + config_.id + " after output error");
+                                            hasError_ = true;
+                                            av_usleep(5000000); // 5 seconds
+                                        }
+                                        reconnectInProgress = false;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
-                reconnectInProgress = false;
-                streamErrorCount = 0;
-            } else {
-                // 如果已经在重连中或流已停止，则退出
-                hasError_ = true;
-                isRunning_ = false;
-                break;
+
+                // 每5秒记录一次状态
+                int64_t currentTime = av_gettime() / 1000000;
+                if (currentTime - lastLogTime >= 5) {
+                    // 计算运行时间和平均帧率
+                    int64_t runTime = currentTime - startTime;
+                    double avgFps = runTime > 0 ? (double)frameCount / runTime : 0;
+
+                    Logger::debug("Stream " + config_.id + " processed " +
+                                  std::to_string(frameCount) + " frames, avg. " +
+                                  std::to_string(avgFps) + " fps (running for " +
+                                  std::to_string(runTime) + " seconds)");
+
+                    lastLogTime = currentTime;
+                }
+
+                // 释放包
+                av_packet_unref(packet);
+
+            } catch (const FFmpegException& e) {
+                // 安全地释放包
+                if (packet) {
+                    av_packet_unref(packet);
+                }
+
+                Logger::error("Stream processing error: " + std::string(e.what()));
+
+                if (!reconnectInProgress && isRunning_) {
+                    Logger::warning("Stream error detected, attempting reconnection");
+                    reconnectInProgress = true;
+                    if (!reconnect()) {
+                        Logger::error("Failed to reconnect stream " + config_.id + ", entering wait mode");
+                        hasError_ = true;
+                        av_usleep(5000000); // 5秒
+                        reconnectInProgress = false;
+                        continue;
+                    }
+                    reconnectInProgress = false;
+                    streamErrorCount = 0;
+                }
+            } catch (const std::exception& e) {
+                // 安全地释放包
+                if (packet) {
+                    av_packet_unref(packet);
+                }
+
+                Logger::error("Standard exception in stream " + config_.id + ": " + std::string(e.what()));
+                av_usleep(1000000); // 1秒
+            } catch (...) {
+                // 安全地释放包
+                if (packet) {
+                    av_packet_unref(packet);
+                }
+
+                Logger::error("Unknown exception in stream " + config_.id);
+                av_usleep(1000000); // 1秒
             }
         }
+
+        // 计算总处理时间和平均帧率
+        int64_t endTime = av_gettime() / 1000000;
+        int64_t totalTime = endTime - startTime;
+        double avgFps = totalTime > 0 ? (double)frameCount / totalTime : 0;
+
+        Logger::info("Exiting process loop for stream: " + config_.id + " after " +
+                     std::to_string(totalTime) + " seconds, processed " +
+                     std::to_string(frameCount) + " frames (avg. " +
+                     std::to_string(avgFps) + " fps)");
+
+    } catch (const std::exception& e) {
+        Logger::error("Critical exception in stream processing loop: " + std::string(e.what()));
+        hasError_ = true;
+    } catch (...) {
+        Logger::error("Unknown critical exception in stream processing loop");
+        hasError_ = true;
     }
 
-    // 清理
-    av_packet_free(&packet);
-
-    // 写入尾部
-    if (outputFormatContext_) {
-        av_write_trailer(outputFormatContext_);
+    // 最后确保释放包资源
+    if (packet) {
+        av_packet_free(&packet);
     }
 
-    // 计算总处理时间和平均帧率
-    int64_t endTime = av_gettime() / 1000000;
-    int64_t totalTime = endTime - startTime;
-    double avgFps = totalTime > 0 ? (double)frameCount / totalTime : 0;
-
-    Logger::info("Exiting process loop for stream: " + config_.id + " after " +
-                 std::to_string(totalTime) + " seconds, processed " +
-                 std::to_string(frameCount) + " frames (avg. " +
-                 std::to_string(avgFps) + " fps)");
+    // 确保在退出前设置状态
+    isRunning_ = false;
 }
 
 void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& streamCtx) {
@@ -1370,74 +1504,156 @@ void StreamProcessor::processAudioPacket(AVPacket* packet, StreamContext& stream
 }
 
 void StreamProcessor::cleanup() {
-    // 清理视频流
-    for (auto& streamCtx : videoStreams_) {
-        if (streamCtx.packet) {
-            av_packet_free(&streamCtx.packet);
+    try {
+        // 首先清理视频流资源
+        for (auto& streamCtx : videoStreams_) {
+            // 安全释放所有资源，使用独立的try-catch块
+            try {
+                if (streamCtx.packet) {
+                    av_packet_free(&streamCtx.packet);
+                    streamCtx.packet = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up video packet resources");
+            }
+
+            try {
+                if (streamCtx.frame) {
+                    av_frame_free(&streamCtx.frame);
+                    streamCtx.frame = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up video frame");
+            }
+
+            try {
+                if (streamCtx.hwFrame) {
+                    av_frame_free(&streamCtx.hwFrame);
+                    streamCtx.hwFrame = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up hardware frame");
+            }
+
+            try {
+                if (streamCtx.swsContext) {
+                    sws_freeContext(streamCtx.swsContext);
+                    streamCtx.swsContext = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up scaling context");
+            }
+
+            try {
+                if (streamCtx.decoderContext) {
+                    avcodec_free_context(&streamCtx.decoderContext);
+                    streamCtx.decoderContext = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up decoder context");
+            }
+
+            try {
+                if (streamCtx.encoderContext) {
+                    avcodec_free_context(&streamCtx.encoderContext);
+                    streamCtx.encoderContext = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up encoder context");
+            }
+
+            try {
+                if (streamCtx.hwDeviceContext) {
+                    av_buffer_unref(&streamCtx.hwDeviceContext);
+                    streamCtx.hwDeviceContext = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up hardware device context");
+            }
         }
 
-        if (streamCtx.frame) {
-            av_frame_free(&streamCtx.frame);
+        // 使用类似的错误处理清理音频流
+        for (auto& streamCtx : audioStreams_) {
+            try {
+                if (streamCtx.packet) {
+                    av_packet_free(&streamCtx.packet);
+                    streamCtx.packet = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up audio packet");
+            }
+
+            try {
+                if (streamCtx.frame) {
+                    av_frame_free(&streamCtx.frame);
+                    streamCtx.frame = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up audio frame");
+            }
+
+            try {
+                if (streamCtx.decoderContext) {
+                    avcodec_free_context(&streamCtx.decoderContext);
+                    streamCtx.decoderContext = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up audio decoder context");
+            }
+
+            try {
+                if (streamCtx.encoderContext) {
+                    avcodec_free_context(&streamCtx.encoderContext);
+                    streamCtx.encoderContext = nullptr;
+                }
+            } catch (...) {
+                Logger::error("Error cleaning up audio encoder context");
+            }
         }
 
-        if (streamCtx.hwFrame) {
-            av_frame_free(&streamCtx.hwFrame);
+        // 特别小心地清理输入和输出上下文
+        if (inputFormatContext_) {
+            try {
+                avformat_close_input(&inputFormatContext_);
+                inputFormatContext_ = nullptr;
+            } catch (...) {
+                Logger::error("Error closing input format context");
+                // 避免悬空指针
+                inputFormatContext_ = nullptr;
+            }
         }
 
-        if (streamCtx.swsContext) {
-            sws_freeContext(streamCtx.swsContext);
-            streamCtx.swsContext = nullptr;
+        // 清理输出上下文
+        if (outputFormatContext_) {
+            try {
+                if (!(outputFormatContext_->oformat->flags & AVFMT_NOFILE) &&
+                    outputFormatContext_->pb) {
+                    avio_closep(&outputFormatContext_->pb);
+                }
+            } catch (...) {
+                Logger::error("Error closing output I/O context");
+            }
+
+            try {
+                avformat_free_context(outputFormatContext_);
+                outputFormatContext_ = nullptr;
+            } catch (...) {
+                Logger::error("Error freeing output format context");
+                // 避免悬空指针
+                outputFormatContext_ = nullptr;
+            }
         }
 
-        if (streamCtx.decoderContext) {
-            avcodec_free_context(&streamCtx.decoderContext);
-        }
+        // 清空流列表
+        videoStreams_.clear();
+        audioStreams_.clear();
 
-        if (streamCtx.encoderContext) {
-            avcodec_free_context(&streamCtx.encoderContext);
-        }
-
-        if (streamCtx.hwDeviceContext) {
-            av_buffer_unref(&streamCtx.hwDeviceContext);
-        }
+        Logger::debug("Resources cleanup completed for stream " + config_.id);
+    } catch (const std::exception& e) {
+        Logger::error("Exception during resource cleanup: " + std::string(e.what()));
+    } catch (...) {
+        Logger::error("Unknown exception during resource cleanup");
     }
-
-    // 清理音频流
-    for (auto& streamCtx : audioStreams_) {
-        if (streamCtx.packet) {
-            av_packet_free(&streamCtx.packet);
-        }
-
-        if (streamCtx.frame) {
-            av_frame_free(&streamCtx.frame);
-        }
-
-        if (streamCtx.decoderContext) {
-            avcodec_free_context(&streamCtx.decoderContext);
-        }
-
-        if (streamCtx.encoderContext) {
-            avcodec_free_context(&streamCtx.encoderContext);
-        }
-    }
-
-    // 清理输入上下文
-    if (inputFormatContext_) {
-        avformat_close_input(&inputFormatContext_);
-    }
-
-    // 清理输出上下文
-    if (outputFormatContext_) {
-        if (!(outputFormatContext_->oformat->flags & AVFMT_NOFILE)) {
-            avio_closep(&outputFormatContext_->pb);
-        }
-        avformat_free_context(outputFormatContext_);
-        outputFormatContext_ = nullptr;
-    }
-
-    // 清空流列表
-    videoStreams_.clear();
-    audioStreams_.clear();
 }
 
 
@@ -1472,6 +1688,7 @@ bool StreamProcessor::isStreamStalled() const {
 
 // 添加重连方法
 bool StreamProcessor::reconnect() {
+    // 如果已达到最大重连次数，不要增加重连尝试次数
     if (reconnectAttempts_ >= maxReconnectAttempts_) {
         Logger::error("Stream " + config_.id + " exceeded maximum reconnection attempts ("
                       + std::to_string(maxReconnectAttempts_) + ")");
@@ -1485,12 +1702,11 @@ bool StreamProcessor::reconnect() {
     isReconnecting_ = true;
     reconnectAttempts_++;
 
-    // 计算重连延迟（使用指数退避策略）
-    // 1秒，2秒，4秒，8秒...
+    // 计算重连延迟（指数退避）
     int64_t reconnectDelay = 1000000 * (1 << (reconnectAttempts_ - 1));
     if (reconnectDelay > 30000000) reconnectDelay = 30000000; // 最大30秒
 
-    Logger::info("Waiting " + std::to_string(reconnectDelay / 1000000) + " seconds before reconnecting");
+    Logger::info("waitting " + std::to_string(reconnectDelay / 1000000) + " seconds before reconnecting");
     av_usleep(reconnectDelay);
 
     try {
@@ -1506,7 +1722,27 @@ bool StreamProcessor::reconnect() {
         return true;
     } catch (const FFmpegException& e) {
         Logger::error("Failed to reconnect stream " + config_.id + ": " + std::string(e.what()));
+
+        // 不要在这里设置hasError_ - 我们希望允许重试
+        // 只将isReconnecting_设置为false以允许新的重连尝试
+        isReconnecting_ = false;
+
+        // 如果我们还没有达到最大尝试次数，允许下一次尝试
+        if (reconnectAttempts_ < maxReconnectAttempts_) {
+            return false;
+        }
+
+        // 只有在达到最大尝试次数时才设置错误标志
         hasError_ = true;
+        return false;
+    } catch (const std::exception& e) {
+        // 也处理标准异常
+        Logger::error("Unexpected error during reconnection of stream " + config_.id + ": " + std::string(e.what()));
+        isReconnecting_ = false;
+        return false;
+    } catch (...) {
+        // 捕获任何其他错误
+        Logger::error("Unknown error during reconnection of stream " + config_.id);
         isReconnecting_ = false;
         return false;
     }

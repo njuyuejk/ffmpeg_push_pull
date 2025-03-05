@@ -1,5 +1,36 @@
 #include "app/Application.h"
 #include <iostream>
+#include <signal.h>
+#include <stdexcept>
+#include "logger/Logger.h"
+
+// 全局信号处理函数
+void globalSignalHandler(int signal) {
+    std::cerr << "Received signal: " << signal << std::endl;
+
+    try {
+        Logger::warning("Received signal: " + std::to_string(signal) + ", preparing for safe exit");
+
+        // 获取应用程序实例并请求停止
+        Application& app = Application::getInstance();
+        app.handleSignal(signal);
+
+        // 如果是严重信号，等待一段时间后退出
+        if (signal == SIGSEGV || signal == SIGABRT) {
+            Logger::error("Received critical signal, forcing exit");
+            std::cerr << "Critical error, forcing exit..." << std::endl;
+
+            // 短暂延迟确保日志写入
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            // 终止程序
+            std::_Exit(128 + signal);
+        }
+    } catch (...) {
+        std::cerr << "Error during signal handling" << std::endl;
+        std::_Exit(128 + signal);
+    }
+}
 
 /**
  * @brief 程序入口点
@@ -8,11 +39,17 @@
  * @return 程序返回代码
  */
 int main(int argc, char* argv[]) {
+    // 设置信号处理器
+    signal(SIGINT, globalSignalHandler);
+    signal(SIGTERM, globalSignalHandler);
+    signal(SIGSEGV, globalSignalHandler);  // 捕获段错误
+    signal(SIGABRT, globalSignalHandler);  // 捕获终止信号
+
     try {
         // 获取应用程序实例
         Application& app = Application::getInstance();
 
-        // 初始化应用程序（使用默认配置文件路径）
+        // 初始化应用程序
         if (!app.initialize("D:/project/C++/my/ffmpeg_push_pull/config.ini")) {
             return 1;
         }
@@ -26,6 +63,25 @@ int main(int argc, char* argv[]) {
         return result;
     } catch (const std::exception& e) {
         std::cerr << "Fatal error: " << e.what() << std::endl;
+
+        try {
+            Logger::fatal("Program fatal error: " + std::string(e.what()));
+            Logger::shutdown();
+        } catch (...) {
+            std::cerr << "Error logging fatal error" << std::endl;
+        }
+
+        return 1;
+    } catch (...) {
+        std::cerr << "Unknown fatal error" << std::endl;
+
+        try {
+            Logger::fatal("Program encountered unknown fatal error");
+            Logger::shutdown();
+        } catch (...) {
+            std::cerr << "Error logging fatal error" << std::endl;
+        }
+
         return 1;
     }
 }
