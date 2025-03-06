@@ -741,7 +741,8 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
             if (constraints->valid_hw_formats) {
                 int i = 0;
                 while (constraints->valid_hw_formats[i] != AV_PIX_FMT_NONE) {
-                    AVPixelFormat hwFormat = constraints->valid_hw_formats[i];
+//                    AVPixelFormat hwFormat = constraints->valid_hw_formats[i];
+                    AVPixelFormat hwFormat = AV_PIX_FMT_NV12;
 
                     // 对于某些编码器，特别检查它们支持的像素格式
                     if (isCodecSupported(encoder, hwFormat)) {
@@ -824,7 +825,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
         if (hwFramesContext) {
             AVHWFramesContext* framesCtx = (AVHWFramesContext*)hwFramesContext->data;
             framesCtx->format = streamCtx.encoderContext->pix_fmt;
-            framesCtx->sw_format = AV_PIX_FMT_YUV420P;
+            framesCtx->sw_format = AV_PIX_FMT_NV12;
             framesCtx->width = streamCtx.encoderContext->width;
             framesCtx->height = streamCtx.encoderContext->height;
 
