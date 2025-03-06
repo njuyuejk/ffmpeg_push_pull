@@ -396,7 +396,10 @@ AVBufferRef* StreamProcessor::createHardwareDevice() {
                 AV_HWDEVICE_TYPE_VDPAU,      // VDPAU (NVIDIA)
                 AV_HWDEVICE_TYPE_D3D11VA,    // DirectX 11 (Windows)
                 AV_HWDEVICE_TYPE_DXVA2,      // DirectX (Windows)
-                AV_HWDEVICE_TYPE_VIDEOTOOLBOX // Apple
+                AV_HWDEVICE_TYPE_VIDEOTOOLBOX, // Apple
+#if 0
+                AV_HWDEVICE_TYPE_RKMPP       // RK3588
+#endif
         };
 
         for (AVHWDeviceType hwType : hwTypes) {
@@ -472,6 +475,11 @@ const AVCodec* StreamProcessor::getEncoderByHardwareType(AVHWDeviceType hwType, 
             case AV_HWDEVICE_TYPE_DXVA2:
                 encoderCandidates = {"h264_amf", "h264_nvenc"};  // 尝试AMD和NVIDIA
                 break;
+#if 0
+            case AV_HWDEVICE_TYPE_RKMPP:
+                encoderCandidates = {"h264_rkmpp"};
+                break;
+#endif
             default:
                 // 如果是未知硬件类型，尝试所有可能的硬件编码器
                 encoderCandidates = {"h264_nvenc", "h264_qsv", "h264_vaapi", "h264_videotoolbox", "h264_amf", "h264_cuvid"};
@@ -496,6 +504,11 @@ const AVCodec* StreamProcessor::getEncoderByHardwareType(AVHWDeviceType hwType, 
             case AV_HWDEVICE_TYPE_DXVA2:
                 encoderCandidates = {"hevc_amf", "hevc_nvenc"};
                 break;
+#if 0
+            case AV_HWDEVICE_TYPE_RKMPP:
+                encoderCandidates = {"hevc_rkmpp"};
+                break;
+#endif
             default:
                 // 如果是未知硬件类型，尝试所有可能的硬件编码器
                 encoderCandidates = {"hevc_nvenc", "hevc_qsv", "hevc_vaapi", "hevc_videotoolbox", "hevc_amf", "hevc_cuvid"};
