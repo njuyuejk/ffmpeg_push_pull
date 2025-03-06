@@ -730,58 +730,52 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
         streamCtx.encoderContext->height = streamCtx.decoderContext->height;
     }
 
-    // 设置像素格式 - 修改为更兼容的方法
-    if (streamCtx.hwDeviceContext) {
-        AVHWFramesConstraints* constraints =
-                av_hwdevice_get_hwframe_constraints(streamCtx.hwDeviceContext, nullptr);
-
-        if (constraints) {
-            // 检查编码器是否支持硬件像素格式
-            bool foundCompatibleFormat = false;
-            if (constraints->valid_hw_formats) {
-                int i = 0;
-                while (constraints->valid_hw_formats[i] != AV_PIX_FMT_NONE) {
-                    AVPixelFormat hwFormat = constraints->valid_hw_formats[i];
-
-                    // 对于某些编码器，特别检查它们支持的像素格式
-                    if (isCodecSupported(encoder, hwFormat)) {
-                        streamCtx.encoderContext->pix_fmt = hwFormat;
-                        foundCompatibleFormat = true;
-                        break;
-                    }
-//                    if (encoder->pix_fmts) {
-//                        int j = 0;
-//                        while (encoder->pix_fmts[j] != AV_PIX_FMT_NONE) {
-//                            if (encoder->pix_fmts[j] == hwFormat) {
-//                                streamCtx.encoderContext->pix_fmt = hwFormat;
-//                                foundCompatibleFormat = true;
-//                                break;
-//                            }
-//                            j++;
-//                        }
-//                        if (foundCompatibleFormat) break;
-//                    }
-                    i++;
-                }
-            }
-
-            if (!foundCompatibleFormat) {
-                // 如果没有找到兼容的硬件格式，使用软件格式
-                streamCtx.encoderContext->pix_fmt = AV_PIX_FMT_YUV420P;
-                Logger::warning("No compatible hardware pixel format found, using software format");
-            }
-
-            av_hwframe_constraints_free(&constraints);
-        } else {
-            // 无法获取约束，使用默认软件格式
-            streamCtx.encoderContext->pix_fmt = AV_PIX_FMT_YUV420P;
+    // 检查配置中是否明确指定了像素格式
+    std::string pixFmtStr = "nv12";  // 默认使用NV12
+    for (const auto& [key, value] : config_.extraOptions) {
+        if (key == "hwaccel_pix_fmt") {
+            pixFmtStr = value;
+            std::transform(pixFmtStr.begin(), pixFmtStr.end(), pixFmtStr.begin(), ::tolower);
+            Logger::debug("User specified hardware pixel format: " + pixFmtStr);
         }
+    }
+
+    AVPixelFormat preferredFormat = AV_PIX_FMT_NV12;  // 默认
+    if (pixFmtStr == "yuv420p") preferredFormat = AV_PIX_FMT_YUV420P;
+    else if (pixFmtStr == "nv12") preferredFormat = AV_PIX_FMT_NV12;
+    else if (pixFmtStr == "p010le") preferredFormat = AV_PIX_FMT_P010LE;
+
+    if (streamCtx.hwDeviceContext) {
+        // 对于硬件编码，设置为首选格式
+        streamCtx.encoderContext->pix_fmt = preferredFormat;
+
+        // 对于NVIDIA NVENC，检查是否支持首选格式
+        if (std::string(encoder->name).find("nvenc") != std::string::npos) {
+            bool formatSupported = false;
+            int i = 0;
+            while (encoder->pix_fmts && encoder->pix_fmts[i] != AV_PIX_FMT_NONE) {
+                if (encoder->pix_fmts[i] == preferredFormat) {
+                    formatSupported = true;
+                    break;
+                }
+                i++;
+            }
+
+            if (!formatSupported && encoder->pix_fmts) {
+                Logger::warning(" not supported by encoder");
+                streamCtx.encoderContext->pix_fmt = encoder->pix_fmts[0];
+            }
+        }
+
+        Logger::info("Using hardware encoding with pixel format");
     } else {
-        // 使用编码器支持的第一个像素格式
+        // 对于软件编码，使用编码器支持的第一个格式
         if (encoder->pix_fmts) {
             streamCtx.encoderContext->pix_fmt = encoder->pix_fmts[0];
+            Logger::info("Using software encoding with pixel format");
         } else {
             streamCtx.encoderContext->pix_fmt = AV_PIX_FMT_YUV420P; // 默认
+            Logger::info("Using default pixel format: YUV420P");
         }
     }
 
@@ -824,9 +818,10 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
         if (hwFramesContext) {
             AVHWFramesContext* framesCtx = (AVHWFramesContext*)hwFramesContext->data;
             framesCtx->format = streamCtx.encoderContext->pix_fmt;
-            framesCtx->sw_format = AV_PIX_FMT_YUV420P;
+            framesCtx->sw_format = streamCtx.encoderContext->pix_fmt;  // 使用相同格式
             framesCtx->width = streamCtx.encoderContext->width;
             framesCtx->height = streamCtx.encoderContext->height;
+            framesCtx->initial_pool_size = 20;  // 预分配足够的帧池
 
             ret = av_hwframe_ctx_init(hwFramesContext);
             if (ret < 0) {
@@ -834,6 +829,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
                 Logger::warning("Failed to initialize hardware frames context, falling back to software");
             } else {
                 streamCtx.encoderContext->hw_frames_ctx = hwFramesContext;
+                Logger::info("Hardware frame context initialized with format");
             }
         }
     }
@@ -1352,8 +1348,10 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 streamCtx.frame->format == AV_PIX_FMT_VAAPI ||
                 streamCtx.frame->format == AV_PIX_FMT_QSV ||
                 streamCtx.frame->format == AV_PIX_FMT_D3D11 ||
-                streamCtx.frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
-
+                streamCtx.frame->format == AV_PIX_FMT_VIDEOTOOLBOX ||
+                streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME ||
+                streamCtx.frame->format == AV_PIX_FMT_NV12
+                ) {
                 // 如果需要，将硬件帧转换为软件帧
                 if (!streamCtx.encoderContext->hw_frames_ctx) {
                     ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
@@ -1362,27 +1360,82 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                     }
                     frameToEncode = streamCtx.hwFrame;
                     hwFrameUsed = true;
+
+                    // 处理可能的无效格式
+                    if (frameToEncode->format == AV_PIX_FMT_NONE ||
+                        frameToEncode->format == AV_PIX_FMT_DRM_PRIME) {
+                        // 转换为编码器期望的格式，通常是NV12或YUV420P
+                        frameToEncode->format = streamCtx.encoderContext->pix_fmt;
+                        Logger::debug("Corrected invalid pixel format");
+                    }
                 }
             }
 
-            // 如果需要缩放
-            if (streamCtx.encoderContext->width != frameToEncode->width ||
-                streamCtx.encoderContext->height != frameToEncode->height ||
-                streamCtx.encoderContext->pix_fmt != frameToEncode->format) {
+            // 确定是否需要缩放或格式转换
+            bool needsConversion = false;
 
+            // 如果分辨率不同，需要缩放
+            if (streamCtx.encoderContext->width != frameToEncode->width ||
+                streamCtx.encoderContext->height != frameToEncode->height) {
+                needsConversion = true;
+            }
+
+            // 如果格式不同，可能需要转换（除非都是硬件格式）
+            if (streamCtx.encoderContext->pix_fmt != frameToEncode->format) {
+                // 检查是否都是硬件格式
+                bool bothHardwareFormats =
+                        (frameToEncode->format >= AV_PIX_FMT_CUDA &&
+                         streamCtx.encoderContext->pix_fmt >= AV_PIX_FMT_CUDA);
+
+                if (!bothHardwareFormats) {
+                    needsConversion = true;
+                } else {
+                    // 硬件格式之间的转换由硬件处理
+                    Logger::debug("Both source and target are hardware formats, skipping software conversion");
+                    needsConversion = false;
+                }
+            }
+
+            // 如果使用硬件帧上下文，可以跳过转换
+            if (streamCtx.encoderContext->hw_frames_ctx && frameToEncode->format == AV_PIX_FMT_NV12) {
+                // 检查编码器是否支持NV12直接输入
+                bool directNV12Support = false;
+                if (std::string(avcodec_get_name(streamCtx.encoderContext->codec_id)).find("nvenc") != std::string::npos ||
+                    std::string(avcodec_get_name(streamCtx.encoderContext->codec_id)).find("qsv") != std::string::npos) {
+                    directNV12Support = true;
+                }
+
+                if (directNV12Support) {
+                    Logger::debug("Using direct NV12 input to hardware encoder, skipping conversion");
+                    needsConversion = false;
+                }
+            }
+
+            // 如果需要缩放或格式转换
+            if (needsConversion) {
                 // 如果需要，初始化缩放上下文
                 if (!streamCtx.swsContext) {
+                    // 确保源格式是有效的
+                    AVPixelFormat srcFormat = (AVPixelFormat)frameToEncode->format;
+                    if (srcFormat == AV_PIX_FMT_NONE || srcFormat == AV_PIX_FMT_DRM_PRIME) {
+                        srcFormat = AV_PIX_FMT_NV12;  // 默认假设NV12
+                        Logger::warning("Invalid source format, assuming NV12");
+                    }
+
                     streamCtx.swsContext = sws_getContext(
                             frameToEncode->width, frameToEncode->height,
-                            (AVPixelFormat)frameToEncode->format,
+                            srcFormat,
                             streamCtx.encoderContext->width, streamCtx.encoderContext->height,
                             streamCtx.encoderContext->pix_fmt,
                             SWS_BILINEAR, nullptr, nullptr, nullptr
                     );
 
                     if (!streamCtx.swsContext) {
+                        Logger::error("Failed to create scaling context: source format");
                         throw FFmpegException("Failed to create scaling context");
                     }
+
+                    Logger::info("Created scaling context");
                 }
 
                 // 为缩放输出分配帧缓冲区

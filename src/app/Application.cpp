@@ -27,7 +27,7 @@ Application& Application::getInstance() {
 // 构造函数
 Application::Application()
         : running_(false),
-          configFilePath_("D:/project/C++/my/ffmpeg-new-pull-push/config.ini"),
+          configFilePath_("D:/project/C++/my/ffmpeg-new-pull-push/config.json"),
           monitorIntervalSeconds_(30),
           autoRestartStreams_(true),
           useWatchdog_(true),
@@ -41,6 +41,14 @@ bool Application::initialize(const std::string& configFilePath) {
     // 设置配置文件路径
     configFilePath_ = configFilePath;
 
+    // 确定配置文件扩展名（支持.ini或.json）
+    std::string extension;
+    size_t lastDot = configFilePath_.find_last_of(".");
+    if (lastDot != std::string::npos) {
+        extension = configFilePath_.substr(lastDot);
+        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+    }
+
     // 加载配置
     if (!AppConfig::loadFromFile(configFilePath_)) {
         std::cerr << "Failed to load config file: " << configFilePath_ << std::endl;
@@ -49,6 +57,8 @@ bool Application::initialize(const std::string& configFilePath) {
         // 创建默认配置并保存
         StreamConfig defaultConfig = StreamConfig::createDefault();
         AppConfig::addStreamConfig(defaultConfig);
+
+        // 根据扩展名选择保存格式
         AppConfig::saveToFile(configFilePath_);
     }
 

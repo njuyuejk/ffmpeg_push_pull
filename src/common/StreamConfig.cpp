@@ -4,30 +4,12 @@
 #include <sstream>
 #include <utility>
 #include <algorithm>
-#include <cstdlib>
-#include <ctime>
 #include <random>
 
-// JSON解析库 (可以使用第三方库如nlohmann/json，这里为简化使用自定义解析)
+// 使用nlohmann/json库
+using json = nlohmann::json;
+
 namespace {
-    // 简单的字符串解析函数
-    std::pair<std::string, std::string> parseKeyValue(const std::string& line) {
-        size_t pos = line.find('=');
-        if (pos != std::string::npos) {
-            std::string key = line.substr(0, pos);
-            std::string value = line.substr(pos + 1);
-
-            // 去除前后空格
-            key.erase(0, key.find_first_not_of(" \t"));
-            key.erase(key.find_last_not_of(" \t") + 1);
-            value.erase(0, value.find_first_not_of(" \t"));
-            value.erase(value.find_last_not_of(" \t") + 1);
-
-            return {key, value};
-        }
-        return {"", ""};
-    }
-
     // 生成随机字符串作为ID
     std::string generateRandomId() {
         static const char alphanum[] =
@@ -87,59 +69,92 @@ StreamConfig StreamConfig::createDefault() {
     return config;
 }
 
-StreamConfig StreamConfig::fromString(const std::string& configStr) {
+StreamConfig StreamConfig::fromJson(const json& j) {
     StreamConfig config = createDefault();
 
-    std::istringstream ss(configStr);
-    std::string line;
+    // 基本配置
+    if (j.contains("id") && j["id"].is_string()) config.id = j["id"];
+    if (j.contains("inputUrl") && j["inputUrl"].is_string()) config.inputUrl = j["inputUrl"];
+    if (j.contains("outputUrl") && j["outputUrl"].is_string()) config.outputUrl = j["outputUrl"];
+    if (j.contains("outputFormat") && j["outputFormat"].is_string()) config.outputFormat = j["outputFormat"];
+    if (j.contains("videoCodec") && j["videoCodec"].is_string()) config.videoCodec = j["videoCodec"];
+    if (j.contains("audioCodec") && j["audioCodec"].is_string()) config.audioCodec = j["audioCodec"];
 
-    while (std::getline(ss, line)) {
-        // 跳过注释和空行
-        if (line.empty() || line[0] == '#' || line[0] == ';') {
-            continue;
-        }
+    // 数值配置
+    if (j.contains("videoBitrate") && j["videoBitrate"].is_number()) config.videoBitrate = j["videoBitrate"];
+    if (j.contains("audioBitrate") && j["audioBitrate"].is_number()) config.audioBitrate = j["audioBitrate"];
+    if (j.contains("keyframeInterval") && j["keyframeInterval"].is_number()) config.keyframeInterval = j["keyframeInterval"];
+    if (j.contains("bufferSize") && j["bufferSize"].is_number()) config.bufferSize = j["bufferSize"];
+    if (j.contains("width") && j["width"].is_number()) config.width = j["width"];
+    if (j.contains("height") && j["height"].is_number()) config.height = j["height"];
 
-        auto [key, value] = parseKeyValue(line);
-        if (key.empty()) continue;
+    // 布尔配置
+    if (j.contains("lowLatencyMode") && j["lowLatencyMode"].is_boolean()) config.lowLatencyMode = j["lowLatencyMode"];
+    if (j.contains("enableHardwareAccel") && j["enableHardwareAccel"].is_boolean()) config.enableHardwareAccel = j["enableHardwareAccel"];
 
-        if (key == "id") config.id = value;
-        else if (key == "inputUrl") config.inputUrl = value;
-        else if (key == "outputUrl") config.outputUrl = value;
-        else if (key == "outputFormat") config.outputFormat = value;
-        else if (key == "videoCodec") config.videoCodec = value;
-        else if (key == "audioCodec") config.audioCodec = value;
-        else if (key == "videoBitrate") config.videoBitrate = std::stoi(value);
-        else if (key == "audioBitrate") config.audioBitrate = std::stoi(value);
-        else if (key == "lowLatencyMode") config.lowLatencyMode = (value == "true" || value == "1");
-        else if (key == "keyframeInterval") config.keyframeInterval = std::stoi(value);
-        else if (key == "bufferSize") config.bufferSize = std::stoi(value);
-        else if (key == "enableHardwareAccel") config.enableHardwareAccel = (value == "true" || value == "1");
-        else if (key == "hwaccelType") config.hwaccelType = value;
-        else if (key == "width") config.width = std::stoi(value);
-        else if (key == "height") config.height = std::stoi(value);
-            // 处理重连相关的配置选项
-        else if (key == "maxReconnectAttempts" ||
-                 key == "noDataTimeout" ||
-                 key == "input_reconnect" ||
-                 key == "input_reconnect_streamed" ||
-                 key == "input_reconnect_delay_max") {
-            // 显式处理这些选项，确保它们被正确记录到日志
-            config.extraOptions[key] = value;
-            Logger::debug("Setting reconnection parameter: " + key + "=" + value);
-        }
-            // 处理看门狗相关的配置选项
-        else if (key == "watchdogEnabled" ||
-                 key == "watchdogFailThreshold") {
-            config.extraOptions[key] = value;
-            Logger::debug("Setting watchdog parameter: " + key + "=" + value);
-        }
-        else {
-            // 其他额外选项
-            config.extraOptions[key] = value;
+    // 硬件加速类型
+    if (j.contains("hwaccelType") && j["hwaccelType"].is_string()) config.hwaccelType = j["hwaccelType"];
+
+    // 解析额外选项
+    if (j.contains("extraOptions") && j["extraOptions"].is_object()) {
+        for (auto& [key, value] : j["extraOptions"].items()) {
+            if (value.is_string()) {
+                config.extraOptions[key] = value;
+            } else if (value.is_number_integer()) {
+                config.extraOptions[key] = std::to_string(value.get<int>());
+            } else if (value.is_boolean()) {
+                config.extraOptions[key] = value.get<bool>() ? "true" : "false";
+            }
         }
     }
 
     return config;
+}
+
+json StreamConfig::toJson() const {
+    json j;
+
+    // 基本配置
+    j["id"] = id;
+    j["inputUrl"] = inputUrl;
+    j["outputUrl"] = outputUrl;
+    j["outputFormat"] = outputFormat;
+    j["videoCodec"] = videoCodec;
+    j["audioCodec"] = audioCodec;
+    j["videoBitrate"] = videoBitrate;
+    j["audioBitrate"] = audioBitrate;
+    j["lowLatencyMode"] = lowLatencyMode;
+    j["keyframeInterval"] = keyframeInterval;
+    j["bufferSize"] = bufferSize;
+    j["enableHardwareAccel"] = enableHardwareAccel;
+    j["hwaccelType"] = hwaccelType;
+    j["width"] = width;
+    j["height"] = height;
+
+    // 额外选项
+    json extraOptionsJson;
+    for (const auto& [key, value] : extraOptions) {
+        // 尝试将数值字符串转换为实际数值
+        if (key == "maxReconnectAttempts" || key == "noDataTimeout" ||
+            key == "watchdogFailThreshold" || key.find("_") != std::string::npos) {
+            try {
+                extraOptionsJson[key] = std::stoi(value);
+                continue;
+            } catch (...) {
+                // 转换失败，按字符串处理
+            }
+        }
+
+        // 处理布尔值
+        if (value == "true" || value == "false") {
+            extraOptionsJson[key] = (value == "true");
+        } else {
+            extraOptionsJson[key] = value;
+        }
+    }
+    j["extraOptions"] = extraOptionsJson;
+
+    return j;
 }
 
 bool StreamConfig::validate() const {
@@ -189,57 +204,11 @@ bool StreamConfig::validate() const {
         }
     }
 
-    // 更多验证规则可以根据需要添加
-
     return true;
 }
 
 std::string StreamConfig::toString() const {
-    std::ostringstream ss;
-
-    ss << "id=" << id << "\n";
-    ss << "inputUrl=" << inputUrl << "\n";
-    ss << "outputUrl=" << outputUrl << "\n";
-    ss << "outputFormat=" << outputFormat << "\n";
-    ss << "videoCodec=" << videoCodec << "\n";
-    ss << "audioCodec=" << audioCodec << "\n";
-    ss << "videoBitrate=" << videoBitrate << "\n";
-    ss << "audioBitrate=" << audioBitrate << "\n";
-    ss << "lowLatencyMode=" << (lowLatencyMode ? "true" : "false") << "\n";
-    ss << "keyframeInterval=" << keyframeInterval << "\n";
-    ss << "bufferSize=" << bufferSize << "\n";
-    ss << "enableHardwareAccel=" << (enableHardwareAccel ? "true" : "false") << "\n";
-    ss << "hwaccelType=" << hwaccelType << "\n";
-    ss << "width=" << width << "\n";
-    ss << "height=" << height << "\n";
-
-    // 优先输出重要的参数，以便在配置文件中更容易找到
-    // 重连参数
-    if (extraOptions.find("maxReconnectAttempts") != extraOptions.end()) {
-        ss << "maxReconnectAttempts=" << extraOptions.at("maxReconnectAttempts") << "\n";
-    }
-    if (extraOptions.find("noDataTimeout") != extraOptions.end()) {
-        ss << "noDataTimeout=" << extraOptions.at("noDataTimeout") << "\n";
-    }
-
-    // 看门狗参数
-    if (extraOptions.find("watchdogEnabled") != extraOptions.end()) {
-        ss << "watchdogEnabled=" << extraOptions.at("watchdogEnabled") << "\n";
-    }
-    if (extraOptions.find("watchdogFailThreshold") != extraOptions.end()) {
-        ss << "watchdogFailThreshold=" << extraOptions.at("watchdogFailThreshold") << "\n";
-    }
-
-    // 其他所有额外选项
-    for (const auto& [key, value] : extraOptions) {
-        // 跳过已经输出的重要参数
-        if (key != "maxReconnectAttempts" && key != "noDataTimeout" &&
-            key != "watchdogEnabled" && key != "watchdogFailThreshold") {
-            ss << key << "=" << value << "\n";
-        }
-    }
-
-    return ss.str();
+    return toJson().dump(2); // 格式化的JSON输出，缩进2个空格
 }
 
 // AppConfig 相关方法
@@ -249,149 +218,165 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
         return false;
     }
 
-    // 清除现有配置
-    streamConfigs.clear();
-    extraOptions.clear();
+    try {
+        // 解析JSON
+        json configJson;
+        file >> configJson;
+        file.close();
 
-    std::string line;
-    std::string section;
-    std::ostringstream currentConfigStr;
+        // 清除现有配置
+        streamConfigs.clear();
+        extraOptions.clear();
 
-    bool inStreamSection = false;
+        // 加载常规设置
+        if (configJson.contains("general")) {
+            auto& general = configJson["general"];
 
-    while (std::getline(file, line)) {
-        // 去除前后空格
-        line.erase(0, line.find_first_not_of(" \t"));
-        line.erase(line.find_last_not_of(" \t") + 1);
+            if (general.contains("logToFile") && general["logToFile"].is_boolean())
+                logToFile = general["logToFile"];
 
-        // 跳过注释和空行
-        if (line.empty() || line[0] == '#' || line[0] == ';') {
-            continue;
+            if (general.contains("logFilePath") && general["logFilePath"].is_string())
+                logFilePath = general["logFilePath"];
+
+            if (general.contains("logLevel") && general["logLevel"].is_number_integer())
+                logLevel = general["logLevel"];
+
+            if (general.contains("threadPoolSize") && general["threadPoolSize"].is_number_integer())
+                threadPoolSize = general["threadPoolSize"];
+
+            if (general.contains("useWatchdog") && general["useWatchdog"].is_boolean())
+                useWatchdog = general["useWatchdog"];
+
+            if (general.contains("watchdogInterval") && general["watchdogInterval"].is_number_integer())
+                watchdogInterval = general["watchdogInterval"];
+
+            // 加载其他额外选项
+            if (general.contains("extraOptions") && general["extraOptions"].is_object()) {
+                for (auto& [key, value] : general["extraOptions"].items()) {
+                    if (value.is_string()) {
+                        extraOptions[key] = value;
+                    } else if (value.is_number_integer()) {
+                        extraOptions[key] = std::to_string(value.get<int>());
+                    } else if (value.is_boolean()) {
+                        extraOptions[key] = value.get<bool>() ? "true" : "false";
+                    }
+                }
+            }
         }
 
-        // 检查是否是节标题 [section]
-        if (line[0] == '[' && line[line.length() - 1] == ']') {
-            // 如果之前在流节中，保存当前配置
-            if (inStreamSection) {
-                StreamConfig config = StreamConfig::fromString(currentConfigStr.str());
+        // 加载流配置
+        if (configJson.contains("streams") && configJson["streams"].is_array()) {
+            for (auto& streamJson : configJson["streams"]) {
+                StreamConfig config = StreamConfig::fromJson(streamJson);
                 if (config.validate()) {
                     streamConfigs.push_back(config);
                 }
-                currentConfigStr.str("");
-                currentConfigStr.clear();
             }
-
-            section = line.substr(1, line.length() - 2);
-            inStreamSection = (section.find("stream") == 0);
-            continue;
         }
 
-        // 解析键值对
-        auto [key, value] = parseKeyValue(line);
-        if (key.empty()) continue;
+        // 输出加载信息
+        Logger::info("Loaded " + std::to_string(streamConfigs.size()) + " stream configurations");
+        Logger::info("Global watchdog settings: useWatchdog=" + std::string(useWatchdog ? "true" : "false") +
+                     ", interval=" + std::to_string(watchdogInterval) + "s");
 
-        if (section == "general") {
-            if (key == "logToFile") logToFile = (value == "true" || value == "1");
-            else if (key == "logFilePath") logFilePath = value;
-            else if (key == "logLevel") logLevel = std::stoi(value);
-            else if (key == "threadPoolSize") threadPoolSize = std::stoi(value);
-            else if (key == "useWatchdog") useWatchdog = (value == "true" || value == "1");
-            else if (key == "watchdogInterval") watchdogInterval = std::stoi(value);
-            else {
-                // 其他全局选项保存到额外选项中
-                extraOptions[key] = value;
+        for (const auto& config : streamConfigs) {
+            Logger::debug("Loaded stream: " + config.id + " (" + config.inputUrl + " -> " + config.outputUrl + ")");
+
+            // 记录重连和看门狗相关配置
+            if (config.extraOptions.find("maxReconnectAttempts") != config.extraOptions.end()) {
+                Logger::debug("  maxReconnectAttempts: " + config.extraOptions.at("maxReconnectAttempts"));
             }
-        } else if (inStreamSection) {
-            // 在流节中，收集配置行
-            currentConfigStr << line << "\n";
+            if (config.extraOptions.find("noDataTimeout") != config.extraOptions.end()) {
+                Logger::debug("  noDataTimeout: " + config.extraOptions.at("noDataTimeout") + " ms");
+            }
+            if (config.extraOptions.find("watchdogEnabled") != config.extraOptions.end()) {
+                Logger::debug("  watchdogEnabled: " + config.extraOptions.at("watchdogEnabled"));
+            }
+            if (config.extraOptions.find("watchdogFailThreshold") != config.extraOptions.end()) {
+                Logger::debug("  watchdogFailThreshold: " + config.extraOptions.at("watchdogFailThreshold"));
+            }
         }
+
+        return true;
     }
-
-    // 不要忘记处理最后一个流配置
-    if (inStreamSection) {
-        StreamConfig config = StreamConfig::fromString(currentConfigStr.str());
-        if (config.validate()) {
-            streamConfigs.push_back(config);
-        }
+    catch (const json::exception& e) {
+        Logger::error("JSON parsing error: " + std::string(e.what()));
+        return false;
     }
-
-    file.close();
-
-    // 输出加载信息
-    Logger::info("Loaded " + std::to_string(streamConfigs.size()) + " stream configurations");
-    Logger::info("Global watchdog settings: useWatchdog=" + std::string(useWatchdog ? "true" : "false") +
-                 ", interval=" + std::to_string(watchdogInterval) + "s");
-
-    for (const auto& config : streamConfigs) {
-        Logger::debug("Loaded stream: " + config.id + " (" + config.inputUrl + " -> " + config.outputUrl + ")");
-
-        // 记录重连和看门狗相关配置
-        if (config.extraOptions.find("maxReconnectAttempts") != config.extraOptions.end()) {
-            Logger::debug("  maxReconnectAttempts: " + config.extraOptions.at("maxReconnectAttempts"));
-        }
-        if (config.extraOptions.find("noDataTimeout") != config.extraOptions.end()) {
-            Logger::debug("  noDataTimeout: " + config.extraOptions.at("noDataTimeout") + " ms");
-        }
-        if (config.extraOptions.find("watchdogEnabled") != config.extraOptions.end()) {
-            Logger::debug("  watchdogEnabled: " + config.extraOptions.at("watchdogEnabled"));
-        }
-        if (config.extraOptions.find("watchdogFailThreshold") != config.extraOptions.end()) {
-            Logger::debug("  watchdogFailThreshold: " + config.extraOptions.at("watchdogFailThreshold"));
-        }
+    catch (const std::exception& e) {
+        Logger::error("Error loading config file: " + std::string(e.what()));
+        return false;
     }
-
-    return true;
 }
 
 bool AppConfig::saveToFile(const std::string& configFilePath) {
-    std::ofstream file(configFilePath);
-    if (!file.is_open()) {
+    try {
+        json configJson;
+
+        // 创建general部分
+        json general;
+        general["logToFile"] = logToFile;
+        general["logFilePath"] = logFilePath;
+        general["logLevel"] = logLevel;
+        general["threadPoolSize"] = threadPoolSize;
+        general["useWatchdog"] = useWatchdog;
+        general["watchdogInterval"] = watchdogInterval;
+
+        // 添加一些常见的应用设置
+        general["monitorInterval"] = 30;
+        general["autoRestartStreams"] = true;
+
+        // 添加额外选项
+        json extraOptionsJson;
+        for (const auto& [key, value] : extraOptions) {
+            // 尝试转换数字
+            try {
+                if (key == "monitorInterval" || key == "periodicReconnectInterval") {
+                    extraOptionsJson[key] = std::stoi(value);
+                    continue;
+                }
+            } catch (...) {}
+
+            // 处理布尔值
+            if (value == "true" || value == "false") {
+                extraOptionsJson[key] = (value == "true");
+            } else {
+                extraOptionsJson[key] = value;
+            }
+        }
+
+        if (!extraOptionsJson.empty()) {
+            general["extraOptions"] = extraOptionsJson;
+        }
+
+        configJson["general"] = general;
+
+        // 添加流配置
+        json streamsJson = json::array();
+        for (const auto& config : streamConfigs) {
+            streamsJson.push_back(config.toJson());
+        }
+        configJson["streams"] = streamsJson;
+
+        // 写入文件
+        std::ofstream file(configFilePath);
+        if (!file.is_open()) {
+            return false;
+        }
+
+        file << configJson.dump(2); // 缩进2个空格的格式化输出
+        file.close();
+
+        return true;
+    }
+    catch (const json::exception& e) {
+        Logger::error("JSON error while saving config: " + std::string(e.what()));
         return false;
     }
-
-    // 写入常规部分
-    file << "#===========================================================\n";
-    file << "# FFmpeg Stream Processor Configuration\n";
-    file << "#===========================================================\n\n";
-
-    file << "[general]\n";
-    file << "# 日志配置\n";
-    file << "logToFile=" << (logToFile ? "true" : "false") << "\n";
-    file << "logFilePath=" << logFilePath << "\n";
-    file << "logLevel=" << logLevel << "\n\n";
-
-    file << "# 线程池配置\n";
-    file << "threadPoolSize=" << threadPoolSize << "\n\n";
-
-    file << "# 应用程序设置\n";
-    file << "monitorInterval=30\n";  // 监控间隔（秒）
-    file << "autoRestartStreams=true\n\n";  // 是否自动重启出错的流
-
-    file << "# 看门狗配置\n";
-    file << "useWatchdog=" << (useWatchdog ? "true" : "false") << "\n";
-    file << "watchdogInterval=" << watchdogInterval << "  # 看门狗检查间隔（秒）\n\n";
-
-    // 写入其他全局选项
-    for (const auto& [key, value] : extraOptions) {
-        if (key != "monitorInterval" && key != "autoRestartStreams" &&
-            key != "useWatchdog" && key != "watchdogInterval") {
-            file << key << "=" << value << "\n";
-        }
+    catch (const std::exception& e) {
+        Logger::error("Error saving config file: " + std::string(e.what()));
+        return false;
     }
-
-    file << "\n";
-    file << "#===========================================================\n";
-    file << "# 流配置\n";
-    file << "#===========================================================\n\n";
-
-    // 写入每个流配置
-    for (size_t i = 0; i < streamConfigs.size(); ++i) {
-        file << "[stream" << i << "]\n";
-        file << streamConfigs[i].toString() << "\n";
-    }
-
-    file.close();
-    return true;
 }
 
 bool AppConfig::getLogToFile() {

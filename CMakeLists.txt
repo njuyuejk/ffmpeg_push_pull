@@ -39,10 +39,10 @@ set(app
 set(common
         src/common/ThreadPool.cpp
         include/common/ThreadPool.h
-        src/common/StreamConfig.cpp
-        include/common/StreamConfig.h
         src/common/Watchdog.cpp
         include/common/Watchdog.h
+        src/common/StreamConfig.cpp
+        include/common/StreamConfig.h
 )
 
 set(ffmpeg_base

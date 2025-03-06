@@ -4,7 +4,6 @@
 #include <string>
 #include <map>
 #include <vector>
-#include "nlohmann/json.hpp"  // 直接包含整个json.hpp
 
 /**
  * @brief 流处理配置结构体
@@ -50,17 +49,11 @@ struct StreamConfig {
     static StreamConfig createDefault();
 
     /**
-     * @brief 从JSON创建配置
-     * @param j JSON对象
+     * @brief 从配置字符串创建配置
+     * @param configStr JSON或INI格式的配置字符串
      * @return 配置实例
      */
-    static StreamConfig fromJson(const nlohmann::json& j);
-
-    /**
-     * @brief 将配置转换为JSON
-     * @return JSON对象
-     */
-    nlohmann::json toJson() const;
+    static StreamConfig fromString(const std::string& configStr);
 
     /**
      * @brief 验证配置有效性
@@ -70,7 +63,7 @@ struct StreamConfig {
 
     /**
      * @brief 将配置转换为字符串
-     * @return 配置的字符串表示（JSON格式）
+     * @return 配置的字符串表示
      */
     std::string toString() const;
 

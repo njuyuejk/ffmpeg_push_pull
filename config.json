@@ -1,0 +1,83 @@
+{
+  "general": {
+    "logToFile": false,
+    "logFilePath": "D:/project/C++/my/ffmpeg-new-pull-push/logs",
+    "logLevel": 1,
+    "threadPoolSize": 4,
+    "monitorInterval": 10,
+    "autoRestartStreams": true,
+    "useWatchdog": true,
+    "watchdogInterval": 5,
+    "extraOptions": {
+      "periodicReconnectInterval": 180
+    }
+  },
+  "streams": [
+    {
+      "id": "stream_rtsp1",
+      "inputUrl": "rtsp://suo58:swai12345@192.168.20.22:554/Streaming/Channels/101?transportmode=unicast&profile=Profile_1",
+      "outputUrl": "rtmp://127.0.0.1:10085/hls/DvbuYNtNR?sign=vvxuLNpNRz",
+      "outputFormat": "flv",
+      "videoBitrate": 4000000,
+      "audioBitrate": 128000,
+      "lowLatencyMode": true,
+      "keyframeInterval": 30,
+      "bufferSize": 1000000,
+      "enableHardwareAccel": false,
+      "hwaccelType": "cuda",
+      "width": 0,
+      "height": 0,
+      "extraOptions": {
+        "autoStart": true,
+        "maxReconnectAttempts": 5,
+        "noDataTimeout": 10000,
+        "input_rtsp_transport": "tcp",
+        "input_stimeout": 5000000,
+        "input_probesize": 5242880,
+        "input_analyzeduration": 5000000,
+        "input_fflags": "+genpts+igndts",
+        "input_reconnect": 1,
+        "input_reconnect_streamed": 1,
+        "input_reconnect_delay_max": 5,
+        "video_codec_id": "h264",
+        "encoder_zerolatency": 1,
+        "output_flush_packets": 1,
+        "output_fflags": "nobuffer",
+        "hwaccel_pix_fmt": "nv12"
+      }
+    },
+    {
+      "id": "stream_file1",
+      "inputUrl": "rtsp://suo58:swai12345@192.168.20.23:554/Streaming/Channels/101?transportmode=unicast&profile=Profile_1",
+      "outputUrl": "rtmp://127.0.0.1:10085/hls/orIMW55NR?sign=TrIaWccNRz",
+      "outputFormat": "flv",
+      "videoBitrate": 4000000,
+      "audioBitrate": 128000,
+      "lowLatencyMode": true,
+      "keyframeInterval": 30,
+      "bufferSize": 1000000,
+      "enableHardwareAccel": false,
+      "hwaccelType": "cuda",
+      "width": 0,
+      "height": 0,
+      "extraOptions": {
+        "autoStart": true,
+        "maxReconnectAttempts": 5,
+        "noDataTimeout": 10000,
+        "input_rtsp_transport": "tcp",
+        "input_stimeout": 5000000,
+        "input_probesize": 5242880,
+        "input_analyzeduration": 5000000,
+        "input_fflags": "+genpts+igndts",
+        "input_reconnect": 1,
+        "input_reconnect_streamed": 1,
+        "input_reconnect_delay_max": 5,
+        "video_codec_id": "h264",
+        "encoder_zerolatency": 1,
+        "output_flush_packets": 1,
+        "output_fflags": "nobuffer",
+        "hwaccel_pix_fmt": "nv12"
+      }
+    }
+  ]
+}
