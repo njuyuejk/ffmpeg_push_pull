@@ -52,11 +52,16 @@ set(ffmpeg_base
         include/ffmpeg_base/MultiStreamManager.h
         src/ffmpeg_base/FFmpegException.cpp
         include/ffmpeg_base/FFmpegException.h
+        src/ffmpeg_base/DecoderModule.cpp
+        include/ffmpeg_base/DecoderModule.h
+        src/ffmpeg_base/EncoderModule.cpp
+        include/ffmpeg_base/EncoderModule.h
 )
 
 set(logger
         src/logger/Logger.cpp
-        include/logger/Logger.h)
+        include/logger/Logger.h
+)
 
 add_executable(ffmpeg_pull_push main.cpp ${app} ${common} ${ffmpeg_base} ${logger})
 

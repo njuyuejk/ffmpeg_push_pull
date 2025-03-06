@@ -3,6 +3,8 @@
 
 #include "common/StreamConfig.h"
 #include "common/Watchdog.h"
+#include "ffmpeg_base/DecoderModule.h"
+#include "ffmpeg_base/EncoderModule.h"
 #include <atomic>
 #include <thread>
 #include <memory>
@@ -113,6 +115,10 @@ private:
     // 添加这些到类成员变量
     std::mutex ffmpegMutex_;  // 保护FFmpeg上下文访问
     bool isContextValid_ = false;  // 用于跟踪上下文是否有效的标志
+
+    // 新增: 编解码器模块
+    std::unique_ptr<DecoderModule> decoderModule_;
+    std::unique_ptr<EncoderModule> encoderModule_;
 
     // 私有方法
     void initialize();

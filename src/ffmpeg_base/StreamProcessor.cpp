@@ -12,7 +12,9 @@ StreamProcessor::StreamProcessor(const StreamConfig& config)
           reconnectAttempts_(0), maxReconnectAttempts_(5),
           lastFrameTime_(0), noDataTimeout_(10000000), // 10秒无数据视为停滞
           isReconnecting_(false), inputFormatContext_(nullptr),
-          outputFormatContext_(nullptr) {
+          outputFormatContext_(nullptr),
+          decoderModule_(std::make_unique<DecoderModule>(config)),
+          encoderModule_(std::make_unique<EncoderModule>(config)) {
 
     // 验证配置
     if (!config.validate()) {
@@ -205,250 +207,51 @@ bool StreamProcessor::updateConfig(const StreamConfig& config) {
 }
 
 void StreamProcessor::initialize() {
-    // 打开输入
-    openInput();
+    try {
+        // 打开输入
+        openInput();
 
-    // 打开输出
-    openOutput();
+        // 打开输出
+        openOutput();
 
-    // 为每个流设置编解码器
-    setupStreams();
+        // 为每个流设置编解码器
+        setupStreams();
 
-    // 写输出头
-    int ret = avformat_write_header(outputFormatContext_, nullptr);
-    if (ret < 0) {
-        throw FFmpegException("Failed to write output header", ret);
+        // 写输出头
+        int ret = avformat_write_header(outputFormatContext_, nullptr);
+        if (ret < 0) {
+            throw FFmpegException("Failed to write output header", ret);
+        }
+
+        isContextValid_ = true;
+    } catch (const FFmpegException& e) {
+        cleanup();
+        throw; // 清理后重新抛出异常
+    } catch (const std::exception& e) {
+        cleanup();
+        throw FFmpegException("Initialization error: " + std::string(e.what()));
     }
 }
 
 void StreamProcessor::openInput() {
-    int ret;
-
-    // 分配输入上下文
-    inputFormatContext_ = avformat_alloc_context();
+    // 使用DecoderModule打开输入
+    inputFormatContext_ = decoderModule_->openInput(config_.inputUrl);
     if (!inputFormatContext_) {
-        throw FFmpegException("Failed to allocate input format context");
+        throw FFmpegException("Failed to open input: " + config_.inputUrl);
     }
-
-    // 创建选项字典
-    AVDictionary* options = nullptr;
-
-    // 增加探测大小和分析持续时间，解决"not enough frames to estimate rate"问题
-    // 默认值 - 可以根据需要增大这些值
-    av_dict_set(&options, "probesize", "10485760", 0);     // 10MB (默认是5MB)
-    av_dict_set(&options, "analyzeduration", "5000000", 0); // 5秒 (默认是0.5秒)
-
-    // 设置低延迟选项
-    if (config_.lowLatencyMode) {
-        inputFormatContext_->flags |= AVFMT_FLAG_NOBUFFER | AVFMT_FLAG_FLUSH_PACKETS;
-
-        // 针对RTSP流增加额外选项
-        if (config_.inputUrl.find("rtsp://") == 0) {
-            // RTSP特定选项
-            av_dict_set(&options, "rtsp_transport", "tcp", 0);  // 使用TCP传输RTSP (比UDP更可靠)
-            av_dict_set(&options, "stimeout", "5000000", 0);    // Socket超时 5秒
-            av_dict_set(&options, "max_delay", "500000", 0);    // 最大延迟500毫秒
-        }
-    }
-
-    // 添加额外选项
-    for (const auto& [key, value] : config_.extraOptions) {
-        if (key.find("input_") == 0) {
-            std::string optionName = key.substr(6); // 去除"input_"前缀
-            av_dict_set(&options, optionName.c_str(), value.c_str(), 0);
-        }
-    }
-
-    // 打开输入
-    ret = avformat_open_input(&inputFormatContext_, config_.inputUrl.c_str(), nullptr, &options);
-
-    // 检查是否有未使用的选项
-    if (av_dict_count(options) > 0) {
-        char *unused = nullptr;
-        av_dict_get_string(options, &unused, '=', ',');
-        if (unused) {
-            Logger::warning("Unused input options: " + std::string(unused));
-            av_free(unused);
-        }
-    }
-
-    av_dict_free(&options);
-
-    if (ret < 0) {
-        throw FFmpegException("Failed to open input: " + config_.inputUrl, ret);
-    }
-
-    // 查找流信息 - 增加选项以更好地检测流
-    AVDictionary* streamInfoOptions = nullptr;
-    if (config_.inputUrl.find("rtsp://") == 0) {
-        // 对于RTSP流，可能需要更多帧来准确检测流信息
-        av_dict_set(&streamInfoOptions, "analyzeduration", "10000000", 0); // 10秒
-    }
-
-    ret = avformat_find_stream_info(inputFormatContext_, streamInfoOptions ? &streamInfoOptions : nullptr);
-    av_dict_free(&streamInfoOptions);
-
-    if (ret < 0) {
-        throw FFmpegException("Failed to find stream info", ret);
-    }
-
-    // 输出找到的流信息
-    Logger::debug("Input stream information:");
-    for (unsigned int i = 0; i < inputFormatContext_->nb_streams; i++) {
-        AVStream* stream = inputFormatContext_->streams[i];
-
-        // 获取解码器名称 - 使用avcodec_get_name而不是avcodec_string
-        const char* codecName = avcodec_get_name(stream->codecpar->codec_id);
-
-        std::string streamType;
-        switch(stream->codecpar->codec_type) {
-            case AVMEDIA_TYPE_VIDEO: streamType = "Video"; break;
-            case AVMEDIA_TYPE_AUDIO: streamType = "Audio"; break;
-            case AVMEDIA_TYPE_SUBTITLE: streamType = "Subtitle"; break;
-            default: streamType = "Other"; break;
-        }
-
-        Logger::debug("  Stream #" + std::to_string(i) + ": " + streamType + " - " + codecName);
-
-        // 如果是视频流，打印更多信息
-        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            Logger::debug("    Resolution: " + std::to_string(stream->codecpar->width) + "x" +
-                          std::to_string(stream->codecpar->height));
-
-            if (stream->r_frame_rate.num && stream->r_frame_rate.den) {
-                double fps = (double)stream->r_frame_rate.num / stream->r_frame_rate.den;
-                Logger::debug("    Frame rate: " + std::to_string(fps) + " fps");
-            } else {
-                Logger::warning("    Frame rate could not be determined");
-            }
-
-            // 获取视频编码器详细信息
-            const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
-            if (codec) {
-                Logger::debug("    Codec: " + std::string(codec->name) + " (" + codec->long_name + ")");
-            }
-        }
-
-        // 如果是音频流，打印更多信息
-        if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            Logger::debug("    Sample rate: " + std::to_string(stream->codecpar->sample_rate) + " Hz");
-            Logger::debug("    Channels: " + std::to_string(stream->codecpar->channels));
-
-            // 获取音频编码器详细信息
-            const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
-            if (codec) {
-                Logger::debug("    Codec: " + std::string(codec->name) + " (" + codec->long_name + ")");
-            }
-        }
-    }
-
-    Logger::info("Successfully opened input: " + config_.inputUrl);
 }
 
 void StreamProcessor::openOutput() {
-    int ret;
-
-    // 分配输出上下文
-    ret = avformat_alloc_output_context2(&outputFormatContext_, nullptr,
-                                         config_.outputFormat.c_str(),
-                                         config_.outputUrl.c_str());
-    if (ret < 0 || !outputFormatContext_) {
-        throw FFmpegException("Failed to allocate output context", ret);
+    // 使用EncoderModule打开输出
+    outputFormatContext_ = encoderModule_->openOutput(config_.outputUrl, config_.outputFormat);
+    if (!outputFormatContext_) {
+        throw FFmpegException("Failed to open output: " + config_.outputUrl);
     }
-
-    // 打开输出文件/URL
-    if (!(outputFormatContext_->oformat->flags & AVFMT_NOFILE)) {
-        // 设置额外输出选项
-        AVDictionary* options = nullptr;
-        for (const auto& [key, value] : config_.extraOptions) {
-            if (key.find("output_") == 0) {
-                std::string optionName = key.substr(7); // 去除"output_"前缀
-                av_dict_set(&options, optionName.c_str(), value.c_str(), 0);
-            }
-        }
-
-        ret = avio_open2(&outputFormatContext_->pb, config_.outputUrl.c_str(),
-                         AVIO_FLAG_WRITE, nullptr, &options);
-        av_dict_free(&options);
-
-        if (ret < 0) {
-            throw FFmpegException("Failed to open output URL: " + config_.outputUrl, ret);
-        }
-    }
-
-    Logger::info("Successfully prepared output: " + config_.outputUrl);
 }
 
 AVBufferRef* StreamProcessor::createHardwareDevice() {
-    if (!config_.enableHardwareAccel || config_.hwaccelType.empty() ||
-        config_.hwaccelType == "none") {
-        return nullptr;
-    }
-
-    Logger::debug("Attempting to create hardware device of type: " + config_.hwaccelType);
-
-    // 如果是"auto"，尝试不同的硬件加速类型
-    if (config_.hwaccelType == "auto") {
-        static const AVHWDeviceType hwTypes[] = {
-                AV_HWDEVICE_TYPE_CUDA,       // NVIDIA GPU
-                AV_HWDEVICE_TYPE_QSV,        // Intel Quick Sync
-                AV_HWDEVICE_TYPE_VAAPI,      // VA-API (Intel/AMD)
-                AV_HWDEVICE_TYPE_VDPAU,      // VDPAU (NVIDIA)
-                AV_HWDEVICE_TYPE_D3D11VA,    // DirectX 11 (Windows)
-                AV_HWDEVICE_TYPE_DXVA2,      // DirectX (Windows)
-                AV_HWDEVICE_TYPE_VIDEOTOOLBOX, // Apple
-#if 0
-                AV_HWDEVICE_TYPE_RKMPP       // RK3588
-#endif
-        };
-
-        for (AVHWDeviceType hwType : hwTypes) {
-            AVBufferRef* hwDeviceContext = nullptr;
-
-            // 跳过未知类型
-            if (hwType == AV_HWDEVICE_TYPE_NONE)
-                continue;
-
-            const char* typeName = av_hwdevice_get_type_name(hwType);
-            Logger::debug("Trying hardware type: " + std::string(typeName ? typeName : "Unknown"));
-
-            int ret = av_hwdevice_ctx_create(&hwDeviceContext, hwType, nullptr, nullptr, 0);
-            if (ret >= 0) {
-                const char* hwName = av_hwdevice_get_type_name(hwType);
-                Logger::info("Auto-detected hardware acceleration: " + std::string(hwName));
-                return hwDeviceContext;
-            } else {
-                char errBuf[AV_ERROR_MAX_STRING_SIZE] = {0};
-                av_strerror(ret, errBuf, AV_ERROR_MAX_STRING_SIZE);
-                Logger::debug("Failed to initialize " + std::string(typeName ? typeName : "Unknown") +
-                              " hardware: " + errBuf);
-            }
-        }
-
-        Logger::warning("No hardware acceleration device found, falling back to software");
-        return nullptr;
-    }
-
-    // 使用指定的硬件加速类型
-    AVBufferRef* hwDeviceContext = nullptr;
-    AVHWDeviceType hwType = av_hwdevice_find_type_by_name(config_.hwaccelType.c_str());
-
-    if (hwType == AV_HWDEVICE_TYPE_NONE) {
-        Logger::warning("Hardware acceleration type not found: " + config_.hwaccelType);
-        return nullptr;
-    }
-
-    int ret = av_hwdevice_ctx_create(&hwDeviceContext, hwType, nullptr, nullptr, 0);
-    if (ret < 0) {
-        char errBuf[AV_ERROR_MAX_STRING_SIZE] = {0};
-        av_strerror(ret, errBuf, AV_ERROR_MAX_STRING_SIZE);
-        Logger::warning("Failed to create hardware device context (" + config_.hwaccelType +
-                        "): " + errBuf);
-        return nullptr;
-    }
-
-    Logger::info("Created hardware acceleration context: " + config_.hwaccelType);
-    return hwDeviceContext;
+    // 使用EncoderModule创建硬件设备
+    return encoderModule_->createHardwareDevice();
 }
 
 // getEncoderByHardwareType方法修改 - 保证兼容性
@@ -591,75 +394,20 @@ void StreamProcessor::setupStreams() {
 }
 
 void StreamProcessor::setupVideoStream(AVStream* inputStream) {
-    int ret;
     StreamContext streamCtx;
     streamCtx.streamIndex = inputStream->index;
     streamCtx.inputStream = inputStream;
 
-    // 查找解码器
-    const AVCodec* decoder = avcodec_find_decoder(inputStream->codecpar->codec_id);
-    if (!decoder) {
-        Logger::warning("Unsupported video codec");
-        return;
-    }
-
-    // 分配解码器上下文
-    streamCtx.decoderContext = avcodec_alloc_context3(decoder);
-    if (!streamCtx.decoderContext) {
-        throw FFmpegException("Failed to allocate decoder context");
-    }
-
-    // 从输入流复制编解码器参数
-    ret = avcodec_parameters_to_context(streamCtx.decoderContext, inputStream->codecpar);
-    if (ret < 0) {
-        throw FFmpegException("Failed to copy decoder parameters", ret);
-    }
-
-    // 设置硬件加速（如果启用）
-    AVHWDeviceType hwType = AV_HWDEVICE_TYPE_NONE;
-    if (config_.enableHardwareAccel && !config_.hwaccelType.empty() &&
-        config_.hwaccelType != "none") {
-
+    // 如果启用了硬件加速，创建硬件设备上下文
+    if (config_.enableHardwareAccel && !config_.hwaccelType.empty() && config_.hwaccelType != "none") {
         streamCtx.hwDeviceContext = createHardwareDevice();
-
-        if (streamCtx.hwDeviceContext) {
-            // 确保解码上下文已经分配
-            if (streamCtx.decoderContext) {
-                streamCtx.decoderContext->hw_device_ctx = av_buffer_ref(streamCtx.hwDeviceContext);
-                hwType = ((AVHWDeviceContext*)streamCtx.hwDeviceContext->data)->type;
-            } else {
-                Logger::warning("Decoder context not initialized, cannot attach hardware device");
-            }
-        }
     }
 
-    // 打开解码器
-    AVDictionary* decoderOptions = nullptr;
-    // 设置解码器选项
-    for (const auto& [key, value] : config_.extraOptions) {
-        if (key.find("decoder_") == 0) {
-            std::string optionName = key.substr(8); // 去除"decoder_"前缀
-            av_dict_set(&decoderOptions, optionName.c_str(), value.c_str(), 0);
-        }
-    }
-
-    ret = avcodec_open2(streamCtx.decoderContext, decoder, &decoderOptions);
-    av_dict_free(&decoderOptions);
-    if (ret < 0) {
-        if (streamCtx.decoderContext->hw_device_ctx) {
-            // 如果硬件解码失败，尝试回退到软件解码
-            Logger::warning("Hardware-accelerated decoding failed, falling back to software decoding");
-            av_buffer_unref(&streamCtx.decoderContext->hw_device_ctx);
-            streamCtx.decoderContext->hw_device_ctx = nullptr;
-
-            // 重新打开解码器，这次不使用硬件加速
-            ret = avcodec_open2(streamCtx.decoderContext, decoder, nullptr);
-            if (ret < 0) {
-                throw FFmpegException("Failed to open video decoder even with software fallback", ret);
-            }
-        } else {
-            throw FFmpegException("Failed to open video decoder", ret);
-        }
+    // 初始化解码器
+    streamCtx.decoderContext = decoderModule_->initializeVideoDecoder(inputStream, streamCtx.hwDeviceContext);
+    if (!streamCtx.decoderContext) {
+        Logger::warning("Failed to initialize video decoder");
+        return;
     }
 
     // 创建输出流
@@ -670,198 +418,17 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
 
     streamCtx.outputStream = outputStream;
 
-    // 根据硬件加速类型自动选择适合的编码器
-    const AVCodec* encoder = nullptr;
-    AVCodecID codecId = AV_CODEC_ID_H264; // 默认H.264
+    // 初始化编码器
+    streamCtx.encoderContext = encoderModule_->initializeVideoEncoder(
+            streamCtx.decoderContext,
+            streamCtx.hwDeviceContext,
+            outputStream);
 
-    // 从配置中查找指定的编解码器ID
-    for (const auto& [key, value] : config_.extraOptions) {
-        if (key == "video_codec_id") {
-            if (value == "h264") {
-                codecId = AV_CODEC_ID_H264;
-            } else if (value == "hevc" || value == "h265") {
-                codecId = AV_CODEC_ID_HEVC;
-            }
-            break;
-        }
-    }
-
-    // 根据硬件类型获取适合的编码器
-    if (hwType != AV_HWDEVICE_TYPE_NONE) {
-        encoder = getEncoderByHardwareType(hwType, codecId);
-    }
-
-    // 如果没有找到硬件编码器，尝试软件编码器
-    if (!encoder) {
-        if (codecId == AV_CODEC_ID_H264) {
-            encoder = avcodec_find_encoder_by_name("libx264");
-        } else if (codecId == AV_CODEC_ID_HEVC) {
-            encoder = avcodec_find_encoder_by_name("libx265");
-        }
-
-        if (!encoder) {
-            // 最后尝试使用默认编码器
-            encoder = avcodec_find_encoder(codecId);
-        }
-    }
-
-    if (!encoder) {
-        throw FFmpegException("Failed to find suitable video encoder");
-    }
-
-    Logger::info("Using video encoder: " + std::string(encoder->name));
-
-    // 分配编码器上下文
-    streamCtx.encoderContext = avcodec_alloc_context3(encoder);
     if (!streamCtx.encoderContext) {
-        throw FFmpegException("Failed to allocate encoder context");
+        throw FFmpegException("Failed to initialize video encoder");
     }
 
-    // 设置编码参数
-    streamCtx.encoderContext->codec_id = encoder->id;
-    streamCtx.encoderContext->codec_type = AVMEDIA_TYPE_VIDEO;
-
-    // 设置分辨率
-    if (config_.width > 0 && config_.height > 0) {
-        streamCtx.encoderContext->width = config_.width;
-        streamCtx.encoderContext->height = config_.height;
-    } else {
-        streamCtx.encoderContext->width = streamCtx.decoderContext->width;
-        streamCtx.encoderContext->height = streamCtx.decoderContext->height;
-    }
-
-    // 设置像素格式 - 修改为更兼容的方法
-    if (streamCtx.hwDeviceContext) {
-        AVHWFramesConstraints* constraints =
-                av_hwdevice_get_hwframe_constraints(streamCtx.hwDeviceContext, nullptr);
-
-        if (constraints) {
-            // 检查编码器是否支持硬件像素格式
-            bool foundCompatibleFormat = false;
-            if (constraints->valid_hw_formats) {
-                int i = 0;
-                while (constraints->valid_hw_formats[i] != AV_PIX_FMT_NONE) {
-//                    AVPixelFormat hwFormat = constraints->valid_hw_formats[i];
-                    AVPixelFormat hwFormat = AV_PIX_FMT_NV12;
-
-                    // 对于某些编码器，特别检查它们支持的像素格式
-                    if (isCodecSupported(encoder, hwFormat)) {
-                        streamCtx.encoderContext->pix_fmt = hwFormat;
-                        foundCompatibleFormat = true;
-                        break;
-                    }
-//                    if (encoder->pix_fmts) {
-//                        int j = 0;
-//                        while (encoder->pix_fmts[j] != AV_PIX_FMT_NONE) {
-//                            if (encoder->pix_fmts[j] == hwFormat) {
-//                                streamCtx.encoderContext->pix_fmt = hwFormat;
-//                                foundCompatibleFormat = true;
-//                                break;
-//                            }
-//                            j++;
-//                        }
-//                        if (foundCompatibleFormat) break;
-//                    }
-                    i++;
-                }
-            }
-
-            if (!foundCompatibleFormat) {
-                // 如果没有找到兼容的硬件格式，使用软件格式
-                streamCtx.encoderContext->pix_fmt = AV_PIX_FMT_YUV420P;
-                Logger::warning("No compatible hardware pixel format found, using software format");
-            }
-
-            av_hwframe_constraints_free(&constraints);
-        } else {
-            // 无法获取约束，使用默认软件格式
-            streamCtx.encoderContext->pix_fmt = AV_PIX_FMT_YUV420P;
-        }
-    } else {
-        // 使用编码器支持的第一个像素格式
-        if (encoder->pix_fmts) {
-            streamCtx.encoderContext->pix_fmt = encoder->pix_fmts[0];
-        } else {
-            streamCtx.encoderContext->pix_fmt = AV_PIX_FMT_YUV420P; // 默认
-        }
-    }
-
-    // 设置码率
-    streamCtx.encoderContext->bit_rate = config_.videoBitrate;
-
-    // 设置时间基准
-    streamCtx.encoderContext->time_base = av_inv_q(inputStream->r_frame_rate);
-    outputStream->time_base = streamCtx.encoderContext->time_base;
-
-    // 设置GOP（关键帧间隔）
-    streamCtx.encoderContext->gop_size = config_.keyframeInterval;
-    streamCtx.encoderContext->max_b_frames = 1;
-
-    // 设置低延迟参数
-    if (config_.lowLatencyMode) {
-        streamCtx.encoderContext->flags |= AV_CODEC_FLAG_LOW_DELAY;
-
-        // 特定编码器的低延迟参数
-        if (encoder->id == AV_CODEC_ID_H264 || encoder->id == AV_CODEC_ID_HEVC) {
-            av_opt_set(streamCtx.encoderContext->priv_data, "preset", "ultrafast", 0);
-            av_opt_set(streamCtx.encoderContext->priv_data, "tune", "zerolatency", 0);
-            // 使用baseline profile提高兼容性
-            if (encoder->id == AV_CODEC_ID_H264) {
-                av_opt_set(streamCtx.encoderContext->priv_data, "profile", "baseline", 0);
-            }
-        } else if (encoder->id == AV_CODEC_ID_VP8 || encoder->id == AV_CODEC_ID_VP9) {
-            av_opt_set_int(streamCtx.encoderContext->priv_data, "lag-in-frames", 0, 0);
-            av_opt_set_int(streamCtx.encoderContext->priv_data, "deadline", 1, 0);  // 实时模式
-        }
-    }
-
-    // 设置缓冲区大小
-    streamCtx.encoderContext->rc_buffer_size = config_.bufferSize;
-    streamCtx.encoderContext->rc_max_rate = config_.videoBitrate * 2;
-
-    // 将硬件帧上下文连接到编码器（如果使用硬件加速）
-    if (streamCtx.hwDeviceContext) {
-        AVBufferRef* hwFramesContext = av_hwframe_ctx_alloc(streamCtx.hwDeviceContext);
-        if (hwFramesContext) {
-            AVHWFramesContext* framesCtx = (AVHWFramesContext*)hwFramesContext->data;
-            framesCtx->format = streamCtx.encoderContext->pix_fmt;
-            framesCtx->sw_format = AV_PIX_FMT_NV12;
-            framesCtx->width = streamCtx.encoderContext->width;
-            framesCtx->height = streamCtx.encoderContext->height;
-
-            ret = av_hwframe_ctx_init(hwFramesContext);
-            if (ret < 0) {
-                av_buffer_unref(&hwFramesContext);
-                Logger::warning("Failed to initialize hardware frames context, falling back to software");
-            } else {
-                streamCtx.encoderContext->hw_frames_ctx = hwFramesContext;
-            }
-        }
-    }
-
-    // 设置编码器选项
-    AVDictionary* encoderOptions = nullptr;
-    for (const auto& [key, value] : config_.extraOptions) {
-        if (key.find("encoder_") == 0) {
-            std::string optionName = key.substr(8); // 去除"encoder_"前缀
-            av_dict_set(&encoderOptions, optionName.c_str(), value.c_str(), 0);
-        }
-    }
-
-    // 打开编码器
-    ret = avcodec_open2(streamCtx.encoderContext, encoder, &encoderOptions);
-    av_dict_free(&encoderOptions);
-    if (ret < 0) {
-        throw FFmpegException("Failed to open video encoder", ret);
-    }
-
-    // 从编码器到输出流复制参数
-    ret = avcodec_parameters_from_context(outputStream->codecpar, streamCtx.encoderContext);
-    if (ret < 0) {
-        throw FFmpegException("Failed to copy encoder parameters to output stream", ret);
-    }
-
-    // 分配包和帧
+    // 分配数据包和帧
     streamCtx.packet = av_packet_alloc();
     streamCtx.frame = av_frame_alloc();
     streamCtx.hwFrame = av_frame_alloc();
@@ -873,49 +440,19 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
     // 添加到视频流列表
     videoStreams_.push_back(streamCtx);
     Logger::info("Set up video stream: input#" + std::to_string(inputStream->index) +
-                 " -> output#" + std::to_string(outputStream->index) +
-                 " (" + std::string(encoder->name) + ")");
+                 " -> output#" + std::to_string(outputStream->index));
 }
 
 void StreamProcessor::setupAudioStream(AVStream* inputStream) {
-    int ret;
     StreamContext streamCtx;
     streamCtx.streamIndex = inputStream->index;
     streamCtx.inputStream = inputStream;
 
-    // 查找解码器
-    const AVCodec* decoder = avcodec_find_decoder(inputStream->codecpar->codec_id);
-    if (!decoder) {
-        Logger::warning("Unsupported audio codec");
-        return;
-    }
-
-    // 分配解码器上下文
-    streamCtx.decoderContext = avcodec_alloc_context3(decoder);
+    // 初始化解码器
+    streamCtx.decoderContext = decoderModule_->initializeAudioDecoder(inputStream);
     if (!streamCtx.decoderContext) {
-        throw FFmpegException("Failed to allocate audio decoder context");
-    }
-
-    // 从输入流复制编解码器参数
-    ret = avcodec_parameters_to_context(streamCtx.decoderContext, inputStream->codecpar);
-    if (ret < 0) {
-        throw FFmpegException("Failed to copy audio decoder parameters", ret);
-    }
-
-    // 设置解码器选项
-    AVDictionary* decoderOptions = nullptr;
-    for (const auto& [key, value] : config_.extraOptions) {
-        if (key.find("audio_decoder_") == 0) {
-            std::string optionName = key.substr(14); // 去除"audio_decoder_"前缀
-            av_dict_set(&decoderOptions, optionName.c_str(), value.c_str(), 0);
-        }
-    }
-
-    // 打开解码器
-    ret = avcodec_open2(streamCtx.decoderContext, decoder, &decoderOptions);
-    av_dict_free(&decoderOptions);
-    if (ret < 0) {
-        throw FFmpegException("Failed to open audio decoder", ret);
+        Logger::warning("Failed to initialize audio decoder");
+        return;
     }
 
     // 创建输出流
@@ -926,143 +463,16 @@ void StreamProcessor::setupAudioStream(AVStream* inputStream) {
 
     streamCtx.outputStream = outputStream;
 
-    // 自动选择音频编码器
-    const AVCodec* encoder = nullptr;
-    AVCodecID audioCodecId = AV_CODEC_ID_AAC; // 默认AAC
+    // 初始化编码器
+    streamCtx.encoderContext = encoderModule_->initializeAudioEncoder(
+            streamCtx.decoderContext,
+            outputStream);
 
-    // 从配置中查找指定的编解码器ID
-    for (const auto& [key, value] : config_.extraOptions) {
-        if (key == "audio_codec_id") {
-            if (value == "aac") {
-                audioCodecId = AV_CODEC_ID_AAC;
-            } else if (value == "mp3") {
-                audioCodecId = AV_CODEC_ID_MP3;
-            } else if (value == "opus") {
-                audioCodecId = AV_CODEC_ID_OPUS;
-            }
-            break;
-        }
-    }
-
-    // 为特定格式选择合适的编码器
-    if (outputFormatContext_->oformat) {
-        if (outputFormatContext_->oformat->name &&
-            strcmp(outputFormatContext_->oformat->name, "flv") == 0) {
-            // FLV格式建议使用AAC
-            audioCodecId = AV_CODEC_ID_AAC;
-        } else if (outputFormatContext_->oformat->name &&
-                   strcmp(outputFormatContext_->oformat->name, "hls") == 0) {
-            // HLS也建议使用AAC
-            audioCodecId = AV_CODEC_ID_AAC;
-        }
-    }
-
-    // 尝试找到合适的编码器
-    if (audioCodecId == AV_CODEC_ID_AAC) {
-        // 按优先级尝试不同的AAC编码器
-        const char* aacEncoders[] = {"aac", "libfdk_aac", "libfaac"};
-        for (const char* encoderName : aacEncoders) {
-            encoder = avcodec_find_encoder_by_name(encoderName);
-            if (encoder) break;
-        }
-    }
-
-    // 如果未找到特定编码器，使用默认编码器
-    if (!encoder) {
-        encoder = avcodec_find_encoder(audioCodecId);
-    }
-
-    if (!encoder) {
-        // 最后尝试AAC
-        encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
-        if (!encoder) {
-            throw FFmpegException("Failed to find suitable audio encoder");
-        }
-    }
-
-    Logger::info("Using audio encoder: " + std::string(encoder->name));
-
-    // 分配编码器上下文
-    streamCtx.encoderContext = avcodec_alloc_context3(encoder);
     if (!streamCtx.encoderContext) {
-        throw FFmpegException("Failed to allocate audio encoder context");
+        throw FFmpegException("Failed to initialize audio encoder");
     }
 
-    // 设置编码参数
-    streamCtx.encoderContext->codec_id = encoder->id;
-    streamCtx.encoderContext->codec_type = AVMEDIA_TYPE_AUDIO;
-    streamCtx.encoderContext->sample_rate = streamCtx.decoderContext->sample_rate;
-
-    // 设置声道布局
-    if (encoder->channel_layouts) {
-        // 使用编码器支持的声道布局
-        uint64_t inputLayout = streamCtx.decoderContext->channel_layout ?
-                               streamCtx.decoderContext->channel_layout :
-                               av_get_default_channel_layout(streamCtx.decoderContext->channels);
-
-        streamCtx.encoderContext->channel_layout = inputLayout;
-
-        // 检查编码器是否支持此布局
-        int i = 0;
-        while (encoder->channel_layouts[i] != 0) {
-            if (encoder->channel_layouts[i] == inputLayout) {
-                break;
-            }
-            i++;
-        }
-
-        // 如果不支持，使用编码器支持的第一个布局
-        if (encoder->channel_layouts[i] == 0) {
-            streamCtx.encoderContext->channel_layout = encoder->channel_layouts[0];
-        }
-    } else {
-        // 使用输入的声道布局
-        streamCtx.encoderContext->channel_layout =
-                streamCtx.decoderContext->channel_layout ?
-                streamCtx.decoderContext->channel_layout :
-                av_get_default_channel_layout(streamCtx.decoderContext->channels);
-    }
-
-    streamCtx.encoderContext->channels = av_get_channel_layout_nb_channels(
-            streamCtx.encoderContext->channel_layout);
-
-    // 设置采样格式
-    if (encoder->sample_fmts) {
-        streamCtx.encoderContext->sample_fmt = encoder->sample_fmts[0];
-    } else {
-        streamCtx.encoderContext->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    }
-
-    // 设置码率
-    streamCtx.encoderContext->bit_rate = config_.audioBitrate;
-
-    // 设置时间基准
-    streamCtx.encoderContext->time_base = {1, streamCtx.encoderContext->sample_rate};
-    outputStream->time_base = streamCtx.encoderContext->time_base;
-
-    // 设置编码器选项
-    AVDictionary* encoderOptions = nullptr;
-    for (const auto& [key, value] : config_.extraOptions) {
-        if (key.find("audio_encoder_") == 0) {
-            std::string optionName = key.substr(14); // 去除"audio_encoder_"前缀
-            av_dict_set(&encoderOptions, optionName.c_str(), value.c_str(), 0);
-        }
-    }
-
-    // 打开编码器
-    ret = avcodec_open2(streamCtx.encoderContext, encoder, &encoderOptions);
-    av_dict_free(&encoderOptions);
-    if (ret < 0) {
-        throw FFmpegException("Failed to open audio encoder", ret);
-    }
-
-    // 从编码器到输出流复制参数
-    ret = avcodec_parameters_from_context(outputStream->codecpar, streamCtx.encoderContext);
-    if (ret < 0) {
-        throw FFmpegException("Failed to copy encoder parameters to output stream", ret);
-    }
-
-    // 分配包和帧
+    // 分配数据包和帧
     streamCtx.packet = av_packet_alloc();
     streamCtx.frame = av_frame_alloc();
 
@@ -1073,8 +483,7 @@ void StreamProcessor::setupAudioStream(AVStream* inputStream) {
     // 添加到音频流列表
     audioStreams_.push_back(streamCtx);
     Logger::info("Set up audio stream: input#" + std::to_string(inputStream->index) +
-                 " -> output#" + std::to_string(outputStream->index) +
-                 " (" + std::string(encoder->name) + ")");
+                 " -> output#" + std::to_string(outputStream->index));
 }
 
 // 添加到processLoop方法中，增强调试信息输出
