@@ -29,9 +29,9 @@ void calculateFrameBrightness(const std::string& streamId, const AVFrame* frame,
     double totalLuma = 0.0;
     int pixelCount = 0;
 
-//    // 打印结果
+    // 打印结果
 //    Logger::info("Stream " + streamId + " frame at " + std::to_string(pts) +
-//                 "ms, average brightness: " + std::to_string(frame->width));
+//                 "ms, average brightness: " + std::to_string(frame->format));
 
     // 只处理YUV格式的帧
     if (frame->format == AV_PIX_FMT_YUV420P ||
