@@ -78,6 +78,11 @@ private:
      */
     void monitorStreams();
 
+    /**
+ * @brief 设置自定义帧处理回调
+ */
+    void setupCustomFrameProcessing();
+
 private:
     // 成员变量
     bool running_;                           // 运行状态

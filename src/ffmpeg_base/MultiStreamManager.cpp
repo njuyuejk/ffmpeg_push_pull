@@ -579,3 +579,14 @@ void MultiStreamManager::asyncReconnectStream(const std::string& streamId) {
         this->reconnectStream(streamId);
     });
 }
+
+std::shared_ptr<StreamProcessor> MultiStreamManager::getStreamProcessor(const std::string& streamId) {
+    std::lock_guard<std::mutex> lock(streamsMutex_);
+
+    auto it = streams_.find(streamId);
+    if (it != streams_.end()) {
+        return it->second;
+    }
+
+    return nullptr;
+}

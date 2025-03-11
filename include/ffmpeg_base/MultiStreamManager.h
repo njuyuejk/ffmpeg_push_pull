@@ -100,6 +100,13 @@ public:
      */
     void asyncReconnectStream(const std::string& streamId);
 
+    /**
+ * @brief 获取流处理器指针
+ * @param streamId 流ID
+ * @return 流处理器的共享指针，如果未找到则返回nullptr
+ */
+    std::shared_ptr<StreamProcessor> getStreamProcessor(const std::string& streamId);
+
 private:
     int maxConcurrentStreams_;
     std::unique_ptr<ThreadPool> threadPool_;

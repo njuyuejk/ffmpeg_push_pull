@@ -20,6 +20,7 @@ struct StreamConfig {
     // 输出配置
     std::string outputUrl;
     std::string outputFormat;
+    bool pushEnabled = true;
 
     // 编码配置
     std::string videoCodec;

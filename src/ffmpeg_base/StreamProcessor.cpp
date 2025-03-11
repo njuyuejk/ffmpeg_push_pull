@@ -12,7 +12,8 @@ StreamProcessor::StreamProcessor(const StreamConfig& config)
           reconnectAttempts_(0), maxReconnectAttempts_(5),
           lastFrameTime_(0), noDataTimeout_(10000000), // 10秒无数据视为停滞
           isReconnecting_(false), inputFormatContext_(nullptr),
-          outputFormatContext_(nullptr) {
+          outputFormatContext_(nullptr),
+          videoFrameCallback_(nullptr), audioFrameCallback_(nullptr) {
 
     // 验证配置
     if (!config.validate()) {
@@ -208,16 +209,21 @@ void StreamProcessor::initialize() {
     // 打开输入
     openInput();
 
-    // 打开输出
-    openOutput();
+    if (config_.pushEnabled) {
+        // 打开输出
+        openOutput();
 
-    // 为每个流设置编解码器
-    setupStreams();
+        // 为每个流设置编解码器
+        setupStreams();
 
-    // 写输出头
-    int ret = avformat_write_header(outputFormatContext_, nullptr);
-    if (ret < 0) {
-        throw FFmpegException("Failed to write output header", ret);
+        // 写输出头
+        int ret = avformat_write_header(outputFormatContext_, nullptr);
+        if (ret < 0) {
+            throw FFmpegException("Failed to write output header", ret);
+        }
+    } else {
+        setupInputStreams();
+        Logger::info("Stream " + config_.id + " initialized in pull-only mode (no pushing)");
     }
 }
 
@@ -1072,8 +1078,176 @@ void StreamProcessor::setupAudioStream(AVStream* inputStream) {
                  " (" + std::string(encoder->name) + ")");
 }
 
-// 添加到processLoop方法中，增强调试信息输出
+void StreamProcessor::setupInputStreams() {
+    // 为输入中的每个流
+    for (unsigned int i = 0; i < inputFormatContext_->nb_streams; i++) {
+        AVStream* inputStream = inputFormatContext_->streams[i];
 
+        if (inputStream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            setupInputVideoStream(inputStream);
+        } else if (inputStream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            setupInputAudioStream(inputStream);
+        } else {
+            // 忽略其他类型的流（字幕等）
+            Logger::debug("Ignoring stream of type: " +
+                          std::to_string(inputStream->codecpar->codec_type));
+        }
+    }
+
+    if (videoStreams_.empty() && audioStreams_.empty()) {
+        throw FFmpegException("No supported streams found in input");
+    }
+}
+
+void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
+    int ret;
+    StreamContext streamCtx;
+    streamCtx.streamIndex = inputStream->index;
+    streamCtx.inputStream = inputStream;
+
+    // 查找解码器
+    const AVCodec* decoder = avcodec_find_decoder(inputStream->codecpar->codec_id);
+    if (!decoder) {
+        Logger::warning("Unsupported video codec");
+        return;
+    }
+
+    // 分配解码器上下文
+    streamCtx.decoderContext = avcodec_alloc_context3(decoder);
+    if (!streamCtx.decoderContext) {
+        throw FFmpegException("Failed to allocate decoder context");
+    }
+
+    // 从输入流复制参数
+    ret = avcodec_parameters_to_context(streamCtx.decoderContext, inputStream->codecpar);
+    if (ret < 0) {
+        throw FFmpegException("Failed to copy decoder parameters", ret);
+    }
+
+    // 设置硬件加速（如果启用）
+    AVHWDeviceType hwType = AV_HWDEVICE_TYPE_NONE;
+    if (config_.enableHardwareAccel && !config_.hwaccelType.empty() &&
+        config_.hwaccelType != "none") {
+
+        streamCtx.hwDeviceContext = createHardwareDevice();
+
+        if (streamCtx.hwDeviceContext) {
+            // 确保解码器上下文已分配
+            if (streamCtx.decoderContext) {
+                streamCtx.decoderContext->hw_device_ctx = av_buffer_ref(streamCtx.hwDeviceContext);
+                hwType = ((AVHWDeviceContext*)streamCtx.hwDeviceContext->data)->type;
+            } else {
+                Logger::warning("Decoder context not initialized, cannot attach hardware device");
+            }
+        }
+    }
+
+    // 使用选项打开解码器
+    AVDictionary* decoderOptions = nullptr;
+    // 设置解码器选项
+    for (const auto& [key, value] : config_.extraOptions) {
+        if (key.find("decoder_") == 0) {
+            std::string optionName = key.substr(8); // 移除 "decoder_" 前缀
+            av_dict_set(&decoderOptions, optionName.c_str(), value.c_str(), 0);
+        }
+    }
+
+    ret = avcodec_open2(streamCtx.decoderContext, decoder, &decoderOptions);
+    av_dict_free(&decoderOptions);
+    if (ret < 0) {
+        if (streamCtx.decoderContext->hw_device_ctx) {
+            // 如果硬件解码失败，尝试回退到软件解码
+            Logger::warning("Hardware-accelerated decoding failed, falling back to software decoding");
+            av_buffer_unref(&streamCtx.decoderContext->hw_device_ctx);
+            streamCtx.decoderContext->hw_device_ctx = nullptr;
+
+            // 不使用硬件加速重新打开解码器
+            ret = avcodec_open2(streamCtx.decoderContext, decoder, nullptr);
+            if (ret < 0) {
+                throw FFmpegException("Failed to open video decoder even with software fallback", ret);
+            }
+        } else {
+            throw FFmpegException("Failed to open video decoder", ret);
+        }
+    }
+
+    // 由于我们不推流，将输出流设为 nullptr
+    streamCtx.outputStream = nullptr;
+    streamCtx.encoderContext = nullptr;
+
+    // 分配包和帧
+    streamCtx.packet = av_packet_alloc();
+    streamCtx.frame = av_frame_alloc();
+    streamCtx.hwFrame = av_frame_alloc();
+
+    if (!streamCtx.packet || !streamCtx.frame || !streamCtx.hwFrame) {
+        throw FFmpegException("Failed to allocate packet or frame");
+    }
+
+    // 添加到视频流列表
+    videoStreams_.push_back(streamCtx);
+    Logger::info("Set up input-only video stream: input#" + std::to_string(inputStream->index));
+}
+
+void StreamProcessor::setupInputAudioStream(AVStream* inputStream) {
+    int ret;
+    StreamContext streamCtx;
+    streamCtx.streamIndex = inputStream->index;
+    streamCtx.inputStream = inputStream;
+
+    // 查找解码器
+    const AVCodec* decoder = avcodec_find_decoder(inputStream->codecpar->codec_id);
+    if (!decoder) {
+        Logger::warning("Unsupported audio codec");
+        return;
+    }
+
+    // 分配解码器上下文
+    streamCtx.decoderContext = avcodec_alloc_context3(decoder);
+    if (!streamCtx.decoderContext) {
+        throw FFmpegException("Failed to allocate audio decoder context");
+    }
+
+    // 从输入流复制参数
+    ret = avcodec_parameters_to_context(streamCtx.decoderContext, inputStream->codecpar);
+    if (ret < 0) {
+        throw FFmpegException("Failed to copy audio decoder parameters", ret);
+    }
+
+    // 设置解码器选项
+    AVDictionary* decoderOptions = nullptr;
+    for (const auto& [key, value] : config_.extraOptions) {
+        if (key.find("audio_decoder_") == 0) {
+            std::string optionName = key.substr(14); // 移除 "audio_decoder_" 前缀
+            av_dict_set(&decoderOptions, optionName.c_str(), value.c_str(), 0);
+        }
+    }
+
+    // 打开解码器
+    ret = avcodec_open2(streamCtx.decoderContext, decoder, &decoderOptions);
+    av_dict_free(&decoderOptions);
+    if (ret < 0) {
+        throw FFmpegException("Failed to open audio decoder", ret);
+    }
+
+    // 由于我们不推流，将输出流设为 nullptr
+    streamCtx.outputStream = nullptr;
+    streamCtx.encoderContext = nullptr;
+
+    // 分配包和帧
+    streamCtx.packet = av_packet_alloc();
+    streamCtx.frame = av_frame_alloc();
+
+    if (!streamCtx.packet || !streamCtx.frame) {
+        throw FFmpegException("Failed to allocate packet or frame");
+    }
+
+    // 添加到音频流列表
+    audioStreams_.push_back(streamCtx);
+    Logger::info("Set up input-only audio stream: input#" + std::to_string(inputStream->index));
+}
+
+// 添加到processLoop方法中，增强调试信息输出
 void StreamProcessor::processLoop() {
     AVPacket* packet = nullptr;
     try {
@@ -1341,6 +1515,34 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
             }
 
             frameAcquired = true;
+
+            // 更新最后一帧时间以防止重连
+            lastFrameTime_ = av_gettime();
+
+            // 仅拉流模式或正常模式都可以处理帧
+            int64_t pts = streamCtx.frame->pts;
+            if (streamCtx.inputStream) {
+                // 转换为毫秒时间戳
+                pts = av_rescale_q(pts, streamCtx.inputStream->time_base, {1, 1000});
+            }
+
+            // 调用帧处理函数
+            handleVideoFrame(streamCtx.frame, pts);
+
+            // 如果是仅拉流模式，我们不需要编码或写入帧
+            if (!config_.pushEnabled) {
+                // 释放帧
+                if (frameAcquired) {
+                    av_frame_unref(streamCtx.frame);
+                }
+
+                if (hwFrameUsed) {
+                    av_frame_unref(streamCtx.hwFrame);
+                }
+
+                continue;
+            }
+
             AVFrame* frameToEncode = streamCtx.frame;
 
             // 处理硬件加速帧
@@ -1554,6 +1756,26 @@ void StreamProcessor::processAudioPacket(AVPacket* packet, StreamContext& stream
             throw FFmpegException("Error receiving frame from audio decoder", ret);
         }
 
+        // 更新最后一帧时间
+        lastFrameTime_ = av_gettime();
+
+        // 处理音频帧
+        int64_t pts = streamCtx.frame->pts;
+        if (streamCtx.inputStream) {
+            // 转换为毫秒时间戳
+            pts = av_rescale_q(pts, streamCtx.inputStream->time_base, {1, 1000});
+        }
+
+        // 调用帧处理函数
+        handleAudioFrame(streamCtx.frame, pts);
+
+        // 如果是仅拉流模式，我们不需要编码或写入帧
+        if (!config_.pushEnabled) {
+            // 释放帧
+            av_frame_unref(streamCtx.frame);
+            continue;
+        }
+
         // 重新计算PTS
         streamCtx.frame->pts = av_rescale_q(
                 streamCtx.frame->pts,
@@ -1680,7 +1902,7 @@ void StreamProcessor::cleanup() {
         }
 
         // 清理格式上下文
-        if (outputFormatContext_) {
+        if (config_.pushEnabled && outputFormatContext_) {
             // 如果需要，写入尾部
             if (isContextValid_ && outputFormatContext_->pb) {
                 av_write_trailer(outputFormatContext_);
@@ -1799,5 +2021,47 @@ bool StreamProcessor::reconnect() {
         }
 
         return false;
+    }
+}
+
+// 设置视频帧回调函数
+void StreamProcessor::setVideoFrameCallback(VideoFrameCallback callback) {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    videoFrameCallback_ = callback;
+    Logger::info("Video frame callback set for stream: " + config_.id);
+}
+
+// 设置音频帧回调函数
+void StreamProcessor::setAudioFrameCallback(AudioFrameCallback callback) {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    audioFrameCallback_ = callback;
+    Logger::info("Audio frame callback set for stream: " + config_.id);
+}
+
+// 处理视频帧的方法
+void StreamProcessor::handleVideoFrame(const AVFrame* frame, int64_t pts) {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    if (videoFrameCallback_) {
+        try {
+            videoFrameCallback_(frame, pts);
+        } catch (const std::exception& e) {
+            Logger::error("Exception in video frame callback: " + std::string(e.what()));
+        } catch (...) {
+            Logger::error("Unknown exception in video frame callback");
+        }
+    }
+}
+
+// 处理音频帧的方法
+void StreamProcessor::handleAudioFrame(const AVFrame* frame, int64_t pts) {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    if (audioFrameCallback_) {
+        try {
+            audioFrameCallback_(frame, pts);
+        } catch (const std::exception& e) {
+            Logger::error("Exception in audio frame callback: " + std::string(e.what()));
+        } catch (...) {
+            Logger::error("Unknown exception in audio frame callback");
+        }
     }
 }

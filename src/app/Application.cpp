@@ -18,6 +18,52 @@ void signalHandlerWrapper(int signal) {
     }
 }
 
+// 示例：计算视频帧亮度并保存到文件
+void calculateFrameBrightness(const std::string& streamId, const AVFrame* frame, int64_t pts) {
+    // 检查帧是否有效
+    if (!frame || frame->width <= 0 || frame->height <= 0) {
+        return;
+    }
+
+    // 计算亮度（使用Y平面的平均值）
+    double totalLuma = 0.0;
+    int pixelCount = 0;
+
+//    // 打印结果
+//    Logger::info("Stream " + streamId + " frame at " + std::to_string(pts) +
+//                 "ms, average brightness: " + std::to_string(frame->width));
+
+    // 只处理YUV格式的帧
+    if (frame->format == AV_PIX_FMT_YUV420P ||
+        frame->format == AV_PIX_FMT_YUV422P ||
+        frame->format == AV_PIX_FMT_YUV444P ||
+        frame->format == AV_PIX_FMT_NV12) {
+
+        // Y平面是亮度
+        for (int y = 0; y < frame->height; y++) {
+            for (int x = 0; x < frame->width; x++) {
+                totalLuma += frame->data[0][y * frame->linesize[0] + x];
+                pixelCount++;
+            }
+        }
+    }
+
+    if (pixelCount > 0) {
+        double avgLuma = totalLuma / pixelCount;
+
+        // 打印结果
+        Logger::info("Stream " + streamId + " frame at " + std::to_string(pts) +
+                      "ms, average brightness: " + std::to_string(avgLuma));
+
+        // 将结果保存到文件（追加模式）
+        static std::ofstream outFile("brightness_" + streamId + ".csv", std::ios::app);
+        if (outFile.is_open()) {
+            outFile << pts << "," << avgLuma << std::endl;
+        }
+    }
+}
+
+
 // 单例实现
 Application& Application::getInstance() {
     static Application instance;
@@ -135,6 +181,9 @@ int Application::run() {
 
     // 启动所有配置的流
     startAllStreams();
+
+    // 设置自定义帧处理
+    setupCustomFrameProcessing();
 
     lastPeriodicReconnectTime_ = time(nullptr);
 
@@ -426,4 +475,29 @@ void Application::stopAllStreams() {
 
     streamManager_->stopAll();
     Logger::info("Stopped all streams");
+}
+
+void Application::setupCustomFrameProcessing() {
+    if (!streamManager_) return;
+
+    std::vector<std::string> streamIds = streamManager_->listStreams();
+
+    for (const auto& streamId : streamIds) {
+        // 获取流配置
+        StreamConfig config = streamManager_->getStreamConfig(streamId);
+
+        // 如果是仅拉流模式，设置自定义处理
+        if (!config.pushEnabled) {
+            // 获取StreamProcessor指针
+            auto processor = streamManager_->getStreamProcessor(streamId);
+            if (processor) {
+                // 设置视频帧回调
+                processor->setVideoFrameCallback([streamId](const AVFrame* frame, int64_t pts) {
+                    calculateFrameBrightness(streamId, frame, pts);
+                });
+
+                Logger::info("Custom video frame processing set up for stream: " + streamId);
+            }
+        }
+    }
 }

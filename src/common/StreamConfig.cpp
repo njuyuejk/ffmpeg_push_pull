@@ -46,6 +46,7 @@ StreamConfig StreamConfig::createDefault() {
     config.inputUrl = "rtsp://example.com/stream";
     config.outputUrl = "rtmp://example.com/live/stream";
     config.outputFormat = "flv";
+    config.pushEnabled = true;
     config.videoCodec = "libx264";
     config.audioCodec = "aac";
     config.lowLatencyMode = true;
@@ -77,6 +78,7 @@ StreamConfig StreamConfig::fromJson(const json& j) {
     if (j.contains("inputUrl") && j["inputUrl"].is_string()) config.inputUrl = j["inputUrl"];
     if (j.contains("outputUrl") && j["outputUrl"].is_string()) config.outputUrl = j["outputUrl"];
     if (j.contains("outputFormat") && j["outputFormat"].is_string()) config.outputFormat = j["outputFormat"];
+    if (j.contains("pushEnabled") && j["pushEnabled"].is_boolean()) config.pushEnabled = j["pushEnabled"];
     if (j.contains("videoCodec") && j["videoCodec"].is_string()) config.videoCodec = j["videoCodec"];
     if (j.contains("audioCodec") && j["audioCodec"].is_string()) config.audioCodec = j["audioCodec"];
 
@@ -119,6 +121,7 @@ json StreamConfig::toJson() const {
     j["inputUrl"] = inputUrl;
     j["outputUrl"] = outputUrl;
     j["outputFormat"] = outputFormat;
+    j["pushEnabled"] = pushEnabled;
     j["videoCodec"] = videoCodec;
     j["audioCodec"] = audioCodec;
     j["videoBitrate"] = videoBitrate;
@@ -158,9 +161,16 @@ json StreamConfig::toJson() const {
 }
 
 bool StreamConfig::validate() const {
-    // 基本验证
-    if (inputUrl.empty() || outputUrl.empty()) {
+    // 检查输入 URL 是否为空（必须提供）
+    if (inputUrl.empty()) {
         return false;
+    }
+
+    // 仅在推流启用时检查输出 URL 和格式
+    if (pushEnabled) {
+        if (outputUrl.empty() || outputFormat.empty()) {
+            return false;
+        }
     }
 
     // 验证重连相关参数

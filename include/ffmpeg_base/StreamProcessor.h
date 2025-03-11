@@ -24,6 +24,10 @@ extern "C" {
  */
 class StreamProcessor {
 public:
+    // 帧处理回调函数类型定义
+    using VideoFrameCallback = std::function<void(const AVFrame* frame, int64_t pts)>;
+    using AudioFrameCallback = std::function<void(const AVFrame* frame, int64_t pts)>;
+public:
     /**
      * @brief 构造函数
      * @param config 流配置
@@ -71,6 +75,19 @@ public:
      */
     bool updateConfig(const StreamConfig& config);
 
+    /**
+ * @brief 设置视频帧回调函数
+ * @param callback 回调函数
+ */
+    void setVideoFrameCallback(VideoFrameCallback callback);
+
+    /**
+     * @brief 设置音频帧回调函数
+     * @param callback 回调函数
+     */
+    void setAudioFrameCallback(AudioFrameCallback callback);
+
+
 private:
     // 流处理上下文结构体
     struct StreamContext {
@@ -95,6 +112,11 @@ private:
     std::atomic<bool> isRunning_;
     std::atomic<bool> hasError_;
     std::thread processingThread_;
+
+    // 帧处理回调函数
+    VideoFrameCallback videoFrameCallback_;
+    AudioFrameCallback audioFrameCallback_;
+    std::mutex callbackMutex_; // 保护回调函数的互斥锁
 
     // FFmpeg上下文
     AVFormatContext* inputFormatContext_ = nullptr;
@@ -146,6 +168,24 @@ private:
     bool reconnect();
     void resetErrorState();
     bool isStreamStalled() const;
+
+    void setupInputStreams();
+    void setupInputVideoStream(AVStream* inputStream);
+    void setupInputAudioStream(AVStream* inputStream);
+
+    /**
+ * @brief 处理视频帧
+ * @param frame 解码后的视频帧
+ * @param pts 时间戳
+ */
+    void handleVideoFrame(const AVFrame* frame, int64_t pts);
+
+    /**
+     * @brief 处理音频帧
+     * @param frame 解码后的音频帧
+     * @param pts 时间戳
+     */
+    void handleAudioFrame(const AVFrame* frame, int64_t pts);
 };
 
 #endif // STREAM_PROCESSOR_H

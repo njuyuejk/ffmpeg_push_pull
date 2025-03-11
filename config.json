@@ -27,6 +27,7 @@
       "hwaccelType": "cuda",
       "width": 0,
       "height": 0,
+      "pushEnabled": true,
       "extraOptions": {
         "autoStart": true,
         "maxReconnectAttempts": 5,
@@ -49,17 +50,18 @@
     {
       "id": "stream_file1",
       "inputUrl": "rtsp://suo58:swai12345@192.168.20.23:554/Streaming/Channels/101?transportmode=unicast&profile=Profile_1",
-      "outputUrl": "rtmp://127.0.0.1:10085/hls/orIMW55NR?sign=TrIaWccNRz",
-      "outputFormat": "flv",
-      "videoBitrate": 4000000,
-      "audioBitrate": 128000,
+      "outputUrl": "",
+      "outputFormat": "",
+      "videoBitrate": 0,
+      "audioBitrate": 0,
       "lowLatencyMode": true,
-      "keyframeInterval": 30,
+      "keyframeInterval": 0,
       "bufferSize": 1000000,
       "enableHardwareAccel": false,
       "hwaccelType": "cuda",
       "width": 0,
       "height": 0,
+      "pushEnabled": false,
       "extraOptions": {
         "autoStart": true,
         "maxReconnectAttempts": 5,
@@ -71,12 +73,7 @@
         "input_fflags": "+genpts+igndts",
         "input_reconnect": 1,
         "input_reconnect_streamed": 1,
-        "input_reconnect_delay_max": 5,
-        "video_codec_id": "h264",
-        "encoder_zerolatency": 1,
-        "output_flush_packets": 1,
-        "output_fflags": "nobuffer",
-        "hwaccel_pix_fmt": "nv12"
+        "input_reconnect_delay_max": 5
       }
     }
   ]
