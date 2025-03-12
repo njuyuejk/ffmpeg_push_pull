@@ -73,7 +73,7 @@ Application& Application::getInstance() {
 // 构造函数
 Application::Application()
         : running_(false),
-          configFilePath_("D:/project/C++/my/ffmpeg-new-pull-push/config.json"),
+          configFilePath_("./config.json"),
           monitorIntervalSeconds_(30),
           autoRestartStreams_(true),
           useWatchdog_(true),

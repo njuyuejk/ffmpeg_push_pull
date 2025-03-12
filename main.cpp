@@ -50,7 +50,7 @@ int main(int argc, char* argv[]) {
         Application& app = Application::getInstance();
 
         // 初始化应用程序
-        if (!app.initialize("D:/project/C++/my/ffmpeg_push_pull/config.json")) {
+        if (!app.initialize("./config.json")) {
             return 1;
         }
 
