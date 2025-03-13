@@ -32,6 +32,35 @@ foreach(lib ${FFMPEG_LIBS})
     list(APPEND FOUND_FFMPEG_LIBS ${${lib}_LIBRARY})
 endforeach()
 
+
+# 设置 opencv 的根目录
+set(OPENCV_ROOT "D:/AI/opencv/build/install")
+
+# 添加包含目录
+include_directories(include)
+include_directories("${FFMPEG_ROOT}/include")
+include_directories("${OPENCV_ROOT}/include")
+
+# 设置库目录
+link_directories("${OPENCV_ROOT}/x64/mingw/lib")
+
+# 要链接的 FFmpeg 库
+set(OPENCV_LIBS
+        opencv_world470
+        opencv_img_hash470
+)
+
+
+# 查找 FFmpeg 库
+foreach(lib ${OPENCV_LIBS})
+    find_library(${lib}_LIBRARY NAMES ${lib} PATHS "${OPENCV_ROOT}/x64/mingw/lib")
+    if(NOT ${lib}_LIBRARY)
+        message(FATAL_ERROR "FFmpeg library ${lib} not found in ${OPENCV_ROOT}/x64/mingw/lib")
+    endif()
+    list(APPEND FOUND_OPENCV_LIBS ${${lib}_LIBRARY})
+endforeach()
+
+
 set(app
         src/app/Application.cpp
         include/app/Application.h)
@@ -43,6 +72,8 @@ set(common
         include/common/Watchdog.h
         src/common/StreamConfig.cpp
         include/common/StreamConfig.h
+        include/common/opencv2avframe.h
+        src/common/opencv2avframe.cpp
 )
 
 set(ffmpeg_base
@@ -61,4 +92,4 @@ set(logger
 add_executable(ffmpeg_pull_push main.cpp ${app} ${common} ${ffmpeg_base} ${logger})
 
 # 链接 FFmpeg 库
-target_link_libraries(ffmpeg_pull_push PRIVATE ${FOUND_FFMPEG_LIBS} pthread)
+target_link_libraries(ffmpeg_pull_push PRIVATE ${FOUND_FFMPEG_LIBS} ${FOUND_OPENCV_LIBS} pthread)

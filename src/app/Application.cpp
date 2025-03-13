@@ -1,7 +1,8 @@
 #include "app/Application.h"
 #include "logger/Logger.h"
 #include "ffmpeg_base/FFmpegException.h"
-
+#include "opencv2/opencv.hpp"
+#include "common/opencv2avframe.h"
 #include <iostream>
 #include <fstream>
 #include <thread>
@@ -24,6 +25,12 @@ void calculateFrameBrightness(const std::string& streamId, const AVFrame* frame,
     if (!frame || frame->width <= 0 || frame->height <= 0) {
         return;
     }
+
+    cv::Mat dstMat = AVFrameToMat(frame);
+
+    Logger::info("cv mat status is: "+ std::to_string(dstMat.cols) + " height is: " + std::to_string(dstMat.rows));
+
+//    cv::imwrite("D:\\project\\C++\\my\\ffmpeg_push_pull\\cmake-build-debug/test.jpg", dstMat);
 
     // 计算亮度（使用Y平面的平均值）
     double totalLuma = 0.0;
