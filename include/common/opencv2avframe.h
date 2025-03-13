@@ -11,6 +11,7 @@ extern "C"
 #include <libswscale/swscale.h>
 };
 
+//AVFrame 转 cv::Mat
 cv::Mat AVFrameToMat(const AVFrame* frame);
 
 //cv::Mat 转 AVFrame
