@@ -149,7 +149,7 @@ std::string Logger::getCurrentLogFilePath() {
     strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", localtime(&now));
 
     // 日志文件格式：logs/log_YYYY-MM-DD.txt
-    return logDirectory + PATH_SEPARATOR + "log_" + std::string(dateStr) + ".txt";
+    return logDirectory + PATH_SEPARATOR + "log_" + std::string(dateStr) + ".log";
 }
 
 void Logger::cleanupOldLogs() {
