@@ -252,6 +252,8 @@ void StreamProcessor::openInput() {
         if (config_.inputUrl.find("rtsp://") == 0) {
             // RTSP特定选项
             av_dict_set(&options, "rtsp_transport", "tcp", 0);  // 使用TCP传输RTSP (比UDP更可靠)
+//            av_dict_set(&options, "rtsp_transport", "udp", 0);  // 使用TCP传输RTSP (比UDP更可靠)
+//            av_dict_set_int(&options, "reorder_queue_size", 1024, 0);
             av_dict_set(&options, "stimeout", "5000000", 0);    // Socket超时 5秒
             av_dict_set(&options, "max_delay", "500000", 0);    // 最大延迟500毫秒
         }
@@ -261,6 +263,11 @@ void StreamProcessor::openInput() {
     for (const auto& [key, value] : config_.extraOptions) {
         if (key.find("input_") == 0) {
             std::string optionName = key.substr(6); // 去除"input_"前缀
+            if (optionName == "rtsp_transport") {
+                if (value == "udp") {
+                    av_dict_set_int(&options, "reorder_queue_size", 1024, 0);
+                }
+            }
             av_dict_set(&options, optionName.c_str(), value.c_str(), 0);
         }
     }
