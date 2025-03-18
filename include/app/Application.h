@@ -85,6 +85,36 @@ private:
  */
     void setupCustomFrameProcessing();
 
+    /**
+     * @brief MQTT初始化和清理
+     * @return
+     */
+    bool initializeMQTTClients();
+    void cleanupMQTTClients();
+
+    /**
+     * @brief MQTT消息处理
+     * @param serverName
+     * @param topic
+     * @param payload
+     */
+    void handleMQTTMessage(const std::string& serverName, const std::string& topic, const std::string& payload);
+
+    /**
+     * @brief mqtt消息发布
+     * @param serverName
+     */
+    void publishSystemStatus(const std::string& serverName);
+
+    /**
+     * @brief 向所有MQTT服务端发送消息
+     * @param topic
+     * @param payload
+     * @param qos
+     * @return
+     */
+    bool publishToAllServers(const std::string& topic, const std::string& payload, int qos = 0);
+
 private:
     // 成员变量
     bool running_;                           // 运行状态
@@ -102,6 +132,10 @@ private:
     int64_t lastPeriodicReconnectTime_ = 0; // 上次周期性重连时间
 
     std::unique_ptr<httplib::Client> httpClient_;
+
+    // MQTT客户端
+    std::map<std::string, std::shared_ptr<MQTTClientWrapper>> mqttClients;
+
 };
 
 /**

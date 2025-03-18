@@ -184,6 +184,11 @@ bool Application::initialize(const std::string& configFilePath) {
         }
     }
 
+    // 初始化MQTT客户端
+    if (!initializeMQTTClients()) {
+        Logger::warning("Failed to initialize MQTT clients, continuing without MQTT support");
+    }
+
     running_ = true;
 
     Logger::info("Application initialized with config: " + configFilePath_);
@@ -230,6 +235,9 @@ void Application::cleanup() {
     // 记录清理开始时间（用于超时）
     auto cleanupStart = std::chrono::steady_clock::now();
     bool cleanupCompleted = false;
+
+    // 清理mqtt连接
+    cleanupMQTTClients();
 
     // 使用单独的线程执行清理，防止潜在的阻塞
     std::thread cleanupThread([this, &cleanupCompleted]() {
@@ -528,4 +536,273 @@ void Application::setupCustomFrameProcessing() {
             }
         }
     }
+}
+
+// MQTT客户端初始化
+bool Application::initializeMQTTClients() {
+    Logger::info("Initializing MQTT clients...");
+
+    // 获取MQTT服务器配置
+    const auto& mqttServers = AppConfig::getMQTTServers();
+
+    if (mqttServers.empty()) {
+        Logger::info("No MQTT servers configured, skipping MQTT initialization");
+        return true;
+    }
+
+    // 初始化每个MQTT客户端
+    for (const auto& serverConfig : mqttServers) {
+        try {
+            Logger::info("Initializing MQTT client for server: " + serverConfig.name);
+
+            if (serverConfig.name.empty() || serverConfig.brokerUrl.empty()) {
+                Logger::warning("MQTT server name or URL is empty, skipping");
+                continue;
+            }
+
+            // 如果未提供客户端ID，则生成一个
+            std::string clientId = serverConfig.clientId;
+            if (clientId.empty()) {
+                // 生成随机客户端ID
+                std::random_device rd;
+                std::mt19937 gen(rd());
+                std::uniform_int_distribution<> dis(1000, 9999);
+                clientId = "ffmpeg_" + std::to_string(dis(gen));
+                Logger::info("Generated random client ID: " + clientId);
+            }
+
+            // 创建MQTT客户端
+            auto client = std::make_shared<MQTTClientWrapper>(
+                    serverConfig.brokerUrl,
+                    clientId,
+                    serverConfig.username,
+                    serverConfig.password,
+                    serverConfig.cleanSession,
+                    serverConfig.keepAliveInterval
+            );
+
+            // 设置连接断开回调函数
+            client->setConnectionLostCallback([this, serverName = serverConfig.name](const std::string& cause) {
+                Logger::warning("MQTT connection lost for server " + serverName + ": " + cause);
+                // 自动重连由客户端处理
+            });
+
+            // 连接到代理服务器
+            if (!client->connect()) {
+                Logger::warning("Failed to connect to MQTT broker " + serverConfig.name +
+                                " at " + serverConfig.brokerUrl + ", will retry later");
+            }
+
+            // 订阅主题
+            for (const auto& sub : serverConfig.subscriptions) {
+                client->subscribe(sub.topic, sub.qos,
+                                  [this, serverName = serverConfig.name, handlerId = sub.handlerId]
+                                          (const std::string& topic, const std::string& payload) {
+                                      // 处理消息
+                                      handleMQTTMessage(serverName, topic, payload);
+                                  }
+                );
+                Logger::info("Subscribed to topic " + sub.topic + " on server " + serverConfig.name);
+            }
+
+            // 存储客户端
+            mqttClients[serverConfig.name] = client;
+            Logger::info("MQTT client for server " + serverConfig.name + " initialized");
+
+        } catch (const std::exception& e) {
+            Logger::error("Failed to initialize MQTT client for server " + serverConfig.name + ": " + e.what());
+            // Continue with other servers
+        }
+    }
+
+    return true;
+}
+
+void Application::handleMQTTMessage(const std::string& serverName, const std::string& topic, const std::string& payload) {
+    Logger::debug("Received MQTT message from server " + serverName + " on topic " + topic);
+
+    try {
+        // 尝试解析JSON消息（如果适用）
+        nlohmann::json message;
+        bool isJson = false;
+        try {
+            message = nlohmann::json::parse(payload);
+            isJson = true;
+        } catch (...) {
+            // 不是JSON，按纯文本处理
+        }
+
+        // 处理不同的主题
+        if (topic == "stream/control") {
+            // 处理流控制命令
+            if (isJson && message.contains("action") && message["action"].is_string()) {
+                std::string action = message["action"];
+
+                if (action == "start" && message.contains("stream_id")) {
+                    std::string streamId = message["stream_id"];
+                    Logger::info("Received command to start stream: " + streamId);
+
+                    // 查找流配置
+                    StreamConfig config = AppConfig::findStreamConfigById(streamId);
+                    if (config.id.empty()) {
+                        Logger::warning("Stream ID not found: " + streamId);
+                    } else if (streamManager_) {
+                        try {
+                            streamManager_->startStream(config);
+                            Logger::info("Stream started: " + streamId);
+                        } catch (const std::exception& e) {
+                            Logger::error("Failed to start stream: " + std::string(e.what()));
+                        }
+                    }
+                }
+                else if (action == "stop" && message.contains("stream_id")) {
+                    std::string streamId = message["stream_id"];
+                    Logger::info("Received command to stop stream: " + streamId);
+
+                    if (streamManager_) {
+                        if (streamManager_->stopStream(streamId)) {
+                            Logger::info("Stream stopped: " + streamId);
+                        } else {
+                            Logger::warning("Failed to stop stream: " + streamId);
+                        }
+                    }
+                }
+                else if (action == "restart" && message.contains("stream_id")) {
+                    std::string streamId = message["stream_id"];
+                    Logger::info("Received command to restart stream: " + streamId);
+
+                    if (streamManager_) {
+                        streamManager_->asyncReconnectStream(streamId);
+                        Logger::info("Stream restart initiated: " + streamId);
+                    }
+                }
+                else if (action == "list_streams") {
+                    Logger::info("Received command to list streams");
+
+                    // 发布流列表
+                    if (streamManager_) {
+                        nlohmann::json response;
+                        response["action"] = "stream_list";
+
+                        nlohmann::json streams = nlohmann::json::array();
+                        for (const auto& streamId : streamManager_->listStreams()) {
+                            nlohmann::json streamInfo;
+                            streamInfo["id"] = streamId;
+                            streamInfo["running"] = streamManager_->isStreamRunning(streamId);
+                            streamInfo["error"] = streamManager_->hasStreamError(streamId);
+
+                            StreamConfig config = streamManager_->getStreamConfig(streamId);
+                            streamInfo["input"] = config.inputUrl;
+                            streamInfo["output"] = config.outputUrl;
+
+                            streams.push_back(streamInfo);
+                        }
+
+                        response["streams"] = streams;
+
+                        // 查找客户端并发布
+                        auto it = mqttClients.find(serverName);
+                        if (it != mqttClients.end()) {
+                            it->second->publish("stream/status", response.dump(), 1);
+                            Logger::info("Published stream list to server " + serverName);
+                        }
+                    }
+                }
+                else {
+                    Logger::warning("Unknown action in stream control message: " + action);
+                }
+            }
+        }
+        else if (topic == "system/status") {
+            // 处理系统状态请求
+            Logger::info("Received system status request");
+            publishSystemStatus(serverName);
+        }
+        else {
+            // 处理其他主题或使用通用处理
+            Logger::debug("No specific handler for topic: " + topic);
+        }
+    } catch (const std::exception& e) {
+        Logger::error("Error handling MQTT message: " + std::string(e.what()));
+    }
+}
+
+void Application::publishSystemStatus(const std::string& serverName) {
+    // 查找客户端
+    auto it = mqttClients.find(serverName);
+    if (it == mqttClients.end()) {
+        Logger::error("Cannot publish system status: MQTT client not found for server " + serverName);
+        return;
+    }
+
+    try {
+        // 创建状态消息
+        nlohmann::json statusMsg;
+        statusMsg["timestamp"] = time(nullptr);
+        statusMsg["status"] = "running";
+
+        // 添加流信息
+        nlohmann::json streams = nlohmann::json::array();
+        if (streamManager_) {
+            for (const auto& streamId : streamManager_->listStreams()) {
+                nlohmann::json streamInfo;
+                streamInfo["id"] = streamId;
+                streamInfo["running"] = streamManager_->isStreamRunning(streamId);
+                streamInfo["error"] = streamManager_->hasStreamError(streamId);
+
+                StreamConfig config = streamManager_->getStreamConfig(streamId);
+                streamInfo["input"] = config.inputUrl;
+                streamInfo["output"] = config.outputUrl;
+
+                streams.push_back(streamInfo);
+            }
+        }
+        statusMsg["streams"] = streams;
+
+        // 发布状态
+        it->second->publish("system/status/response", statusMsg.dump(), 1);
+        Logger::info("Published system status to server " + serverName);
+
+    } catch (const std::exception& e) {
+        Logger::error("Error publishing system status: " + std::string(e.what()));
+    }
+}
+
+bool Application::publishToAllServers(const std::string& topic, const std::string& payload, int qos) {
+    bool success = true;
+
+    for (auto& [name, client] : mqttClients) {
+        try {
+            if (client->isConnected()) {
+                if (!client->publish(topic, payload, qos)) {
+                    Logger::error("Failed to publish message to server " + name);
+                    success = false;
+                }
+            } else {
+                Logger::warning("Cannot publish to server " + name + ": not connected");
+                success = false;
+            }
+        } catch (const std::exception& e) {
+            Logger::error("Error publishing to server " + name + ": " + std::string(e.what()));
+            success = false;
+        }
+    }
+
+    return success;
+}
+
+void Application::cleanupMQTTClients() {
+    Logger::info("Cleaning up MQTT clients...");
+
+    for (auto& [name, client] : mqttClients) {
+        try {
+            client->disconnect();
+            client->cleanup();
+            Logger::info("MQTT client " + name + " cleaned up");
+        } catch (const std::exception& e) {
+            Logger::error("Error cleaning up MQTT client " + name + ": " + e.what());
+        }
+    }
+
+    mqttClients.clear();
 }

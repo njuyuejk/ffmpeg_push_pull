@@ -40,6 +40,10 @@ std::map<std::string, std::string> AppConfig::extraOptions;
 bool AppConfig::useWatchdog = true;
 int AppConfig::watchdogInterval = 5;
 
+// 初始化静态成员
+std::vector<MQTTServerConfig> AppConfig::mqttServers;
+
+
 StreamConfig StreamConfig::createDefault() {
     StreamConfig config;
     config.id = generateRandomId();
@@ -284,6 +288,17 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
             }
         }
 
+        if (configJson.contains("mqtt_servers") && configJson["mqtt_servers"].is_array()) {
+            mqttServers.clear(); // 清除现有的MQTT服务器配置
+
+            for (auto& serverJson : configJson["mqtt_servers"]) {
+                MQTTServerConfig serverConfig = MQTTServerConfig::fromJson(serverJson);
+                mqttServers.push_back(serverConfig);
+            }
+
+            Logger::info("Loaded " + std::to_string(mqttServers.size()) + " MQTT server configurations");
+        }
+
         // 输出加载信息
         Logger::info("Loaded " + std::to_string(streamConfigs.size()) + " stream configurations");
         Logger::info("Global watchdog settings: useWatchdog=" + std::string(useWatchdog ? "true" : "false") +
@@ -464,4 +479,99 @@ bool AppConfig::removeStreamConfig(const std::string& id) {
     }
 
     return false;
+}
+
+// MQTT配置获取器
+const std::vector<MQTTServerConfig>& AppConfig::getMQTTServers() {
+    return mqttServers;
+}
+
+// MQTTSubscriptionConfig实现
+MQTTSubscriptionConfig MQTTSubscriptionConfig::fromJson(const nlohmann::json& j) {
+    MQTTSubscriptionConfig config;
+
+    if (j.contains("topic") && j["topic"].is_string())
+        config.topic = j["topic"];
+
+    if (j.contains("qos") && j["qos"].is_number_integer())
+        config.qos = j["qos"];
+
+    if (j.contains("handler_id") && j["handler_id"].is_string())
+        config.handlerId = j["handler_id"];
+
+    return config;
+}
+
+nlohmann::json MQTTSubscriptionConfig::toJson() const {
+    nlohmann::json j;
+    j["topic"] = topic;
+    j["qos"] = qos;
+
+    if (!handlerId.empty())
+        j["handler_id"] = handlerId;
+
+    return j;
+}
+
+// MQTTServerConfig实现
+MQTTServerConfig MQTTServerConfig::fromJson(const nlohmann::json& j) {
+    MQTTServerConfig config;
+
+    if (j.contains("name") && j["name"].is_string())
+        config.name = j["name"];
+
+    if (j.contains("broker_url") && j["broker_url"].is_string())
+        config.brokerUrl = j["broker_url"];
+
+    if (j.contains("client_id") && j["client_id"].is_string())
+        config.clientId = j["client_id"];
+
+    if (j.contains("username") && j["username"].is_string())
+        config.username = j["username"];
+
+    if (j.contains("password") && j["password"].is_string())
+        config.password = j["password"];
+
+    if (j.contains("clean_session") && j["clean_session"].is_boolean())
+        config.cleanSession = j["clean_session"];
+
+    if (j.contains("keep_alive_interval") && j["keep_alive_interval"].is_number_integer())
+        config.keepAliveInterval = j["keep_alive_interval"];
+
+    if (j.contains("auto_reconnect") && j["auto_reconnect"].is_boolean())
+        config.autoReconnect = j["auto_reconnect"];
+
+    if (j.contains("reconnect_interval") && j["reconnect_interval"].is_number_integer())
+        config.reconnectInterval = j["reconnect_interval"];
+
+    // 解析订阅配置
+    if (j.contains("subscriptions") && j["subscriptions"].is_array()) {
+        for (auto& subJson : j["subscriptions"]) {
+            config.subscriptions.push_back(MQTTSubscriptionConfig::fromJson(subJson));
+        }
+    }
+
+    return config;
+}
+
+nlohmann::json MQTTServerConfig::toJson() const {
+    nlohmann::json j;
+    j["name"] = name;
+    j["broker_url"] = brokerUrl;
+    j["client_id"] = clientId;
+    j["username"] = username;
+    j["password"] = password;
+    j["clean_session"] = cleanSession;
+    j["keep_alive_interval"] = keepAliveInterval;
+    j["auto_reconnect"] = autoReconnect;
+    j["reconnect_interval"] = reconnectInterval;
+
+    // 添加订阅配置
+    nlohmann::json subs = nlohmann::json::array();
+    for (const auto& sub : subscriptions) {
+        subs.push_back(sub.toJson());
+    }
+    j["subscriptions"] = subs;
+
+    return j;
 }

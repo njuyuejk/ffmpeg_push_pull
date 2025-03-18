@@ -145,6 +145,42 @@ struct StreamConfig {
 };
 
 /**
+ * @brief MQTT 订阅配置
+ */
+struct MQTTSubscriptionConfig {
+    std::string topic;
+    int qos;
+    std::string handlerId;
+
+    MQTTSubscriptionConfig() : qos(0) {}
+
+    static MQTTSubscriptionConfig fromJson(const nlohmann::json& j);
+    nlohmann::json toJson() const;
+};
+
+/**
+ * @brief MQTT 服务器配置
+ */
+struct MQTTServerConfig {
+    std::string name;
+    std::string brokerUrl;
+    std::string clientId;
+    std::string username;
+    std::string password;
+    bool cleanSession;
+    int keepAliveInterval;
+    std::vector<MQTTSubscriptionConfig> subscriptions;
+    bool autoReconnect;
+    int reconnectInterval;
+
+    MQTTServerConfig() : cleanSession(true), keepAliveInterval(60),
+                         autoReconnect(true), reconnectInterval(5) {}
+
+    static MQTTServerConfig fromJson(const nlohmann::json& j);
+    nlohmann::json toJson() const;
+};
+
+/**
  * @brief 应用配置类
  * 包含整个应用程序的配置
  */
@@ -219,6 +255,8 @@ public:
      */
     static bool removeStreamConfig(const std::string& id);
 
+    static const std::vector<MQTTServerConfig>& getMQTTServers(); // 获取所有MQTT服务器配置
+
 private:
     static std::vector<StreamConfig> streamConfigs;
     static bool logToFile;
@@ -228,6 +266,8 @@ private:
     static std::map<std::string, std::string> extraOptions;
     static bool useWatchdog;
     static int watchdogInterval;
+
+    static std::vector<MQTTServerConfig> mqttServers; // MQTT服务器配置列表
 };
 
 #endif // STREAM_CONFIG_H
