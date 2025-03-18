@@ -4,8 +4,19 @@
 #include "ffmpeg_base/MultiStreamManager.h"
 #include "common/StreamConfig.h"
 #include "common/Watchdog.h"
+#include "mqtt/mqtt_sync_client.h"
 #include <string>
 #include <memory>
+
+/**
+* @brief mqtt消息回调函数
+*/
+void onMqttMessageReceived(const std::string& topic, const std::string& payload);
+
+/**
+ * @brief mqtt链接丢失回调函数
+ */
+void onMqttConnectionLost(const std::string& cause);
 
 /**
  * @brief 应用程序类
@@ -82,6 +93,11 @@ private:
  * @brief 设置自定义帧处理回调
  */
     void setupCustomFrameProcessing();
+
+    /**
+     * @brief 接收mqtt订阅主题
+     */
+     void startSubscribeMqttTopic();
 
 private:
     // 成员变量
