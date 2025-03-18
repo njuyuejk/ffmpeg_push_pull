@@ -3,16 +3,21 @@
 #include <chrono>
 #include <thread>
 
-// 获取单例实例
-MQTTClientWrapper& MQTTClientWrapper::getInstance() {
-    static MQTTClientWrapper instance;
-    return instance;
-}
-
 // 构造函数
-MQTTClientWrapper::MQTTClientWrapper()
+MQTTClientWrapper::MQTTClientWrapper(const std::string& brokerUrl,
+                                     const std::string& clientId,
+                                     const std::string& username,
+                                     const std::string& password,
+                                     bool cleanSession,
+                                     int keepAliveInterval)
         : client(nullptr), connected(false), initialized(false),
-          cleanSession(true), keepAliveInterval(60) {
+          brokerUrl(brokerUrl), clientId(clientId),
+          username(username), password(password),
+          cleanSession(cleanSession), keepAliveInterval(keepAliveInterval) {
+
+    if (!brokerUrl.empty() && !clientId.empty()) {
+        initialize(brokerUrl, clientId, username, password, cleanSession, keepAliveInterval);
+    }
 }
 
 // 析构函数
@@ -72,7 +77,7 @@ bool MQTTClientWrapper::connect() {
     }
 
     if (connected) {
-        // 已经连接，无需重复连接
+        // 已经连接，无需重新连接
         return true;
     }
 
@@ -80,7 +85,7 @@ bool MQTTClientWrapper::connect() {
     conn_opts.keepAliveInterval = keepAliveInterval;
     conn_opts.cleansession = cleanSession;
 
-    // 设置用户名和密码（如果有）
+    // 设置用户名和密码（如果提供）
     if (!username.empty()) {
         conn_opts.username = username.c_str();
     }
@@ -112,7 +117,7 @@ void MQTTClientWrapper::disconnect() {
     if (connected && client != nullptr) {
         MQTTClient_disconnect(client, 1000);
         connected = false;
-        Logger::info("MQTT connection disconnected");
+        Logger::info("MQTT connection disconnected: " + clientId + " from " + brokerUrl);
     }
 }
 
@@ -140,7 +145,7 @@ bool MQTTClientWrapper::subscribe(const std::string& topic, int qos, MessageCall
             Logger::error("Failed to subscribe to topic " + topic + ", return code: " + std::to_string(rc));
             return false;
         }
-        Logger::info("Successfully subscribed to topic: " + topic);
+        Logger::info("Successfully subscribed to topic: " + topic + " (client: " + clientId + ")");
     }
 
     return true;
@@ -163,7 +168,7 @@ bool MQTTClientWrapper::unsubscribe(const std::string& topic) {
 
     // 移除回调函数
     topicCallbacks.erase(topic);
-    Logger::info("Successfully unsubscribed from topic: " + topic);
+    Logger::info("Successfully unsubscribed from topic: " + topic + " (client: " + clientId + ")");
 
     return true;
 }
@@ -258,10 +263,13 @@ void MQTTClientWrapper::staticconnectionLostCallback(void* context, char* cause)
     MQTTClientWrapper* instance = static_cast<MQTTClientWrapper*>(context);
 
     if (instance) {
-        instance->connected = false;
+        {
+            std::lock_guard<std::mutex> lock(instance->mutex);
+            instance->connected = false;
+        }
 
         std::string causeStr = (cause != nullptr) ? cause : "Unknown reason";
-        Logger::info("MQTT connection lost: " + causeStr);
+        Logger::info("MQTT connection lost: " + instance->clientId + " from " + instance->brokerUrl + " - " + causeStr);
 
         // 调用用户设置的回调函数
         if (instance->connectionLostCallback) {
@@ -280,7 +288,8 @@ bool MQTTClientWrapper::reconnect() {
     static const int RETRY_INTERVAL_MS = 3000;
 
     for (int i = 0; i < MAX_RETRY; i++) {
-        Logger::info("Attempting to reconnect to MQTT broker (" + std::to_string((i+1)) + "/" + std::to_string(MAX_RETRY) + ")...");
+        Logger::info("Attempting to reconnect to MQTT broker (" + std::to_string(i+1) + "/" +
+                     std::to_string(MAX_RETRY) + "): " + clientId + " to " + brokerUrl);
 
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -299,7 +308,7 @@ bool MQTTClientWrapper::reconnect() {
             int rc = MQTTClient_connect(client, &conn_opts);
             if (rc == MQTTCLIENT_SUCCESS) {
                 connected = true;
-                Logger::info("Successfully reconnected to MQTT broker");
+                Logger::info("Successfully reconnected to MQTT broker: " + brokerUrl);
 
                 // 重新订阅所有主题
                 for (const auto& pair : topicCallbacks) {
@@ -314,6 +323,110 @@ bool MQTTClientWrapper::reconnect() {
         std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_INTERVAL_MS));
     }
 
-    Logger::error("Failed to reconnect to MQTT broker after maximum retry attempts");
+    Logger::error("Failed to reconnect to MQTT broker after maximum retry attempts: " + clientId + " to " + brokerUrl);
     return false;
+}
+
+// MQTTClientManager实现
+
+// 获取单例实例
+MQTTClientManager& MQTTClientManager::getInstance() {
+    static MQTTClientManager instance;
+    return instance;
+}
+
+// 创建新的MQTT客户端
+bool MQTTClientManager::createClient(const std::string& clientName,
+                                     const std::string& brokerUrl,
+                                     const std::string& clientId,
+                                     const std::string& username,
+                                     const std::string& password,
+                                     bool cleanSession,
+                                     int keepAliveInterval) {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    // 检查客户端是否已存在
+    if (clients.find(clientName) != clients.end()) {
+        Logger::warning("MQTT client already exists with name: " + clientName);
+        return false;
+    }
+
+    // 创建新的客户端
+    auto client = std::make_shared<MQTTClientWrapper>(
+            brokerUrl, clientId, username, password, cleanSession, keepAliveInterval
+    );
+
+    // 初始化并连接客户端
+    if (!client->isConnected() && !client->connect()) {
+        Logger::warning("Failed to connect new MQTT client: " + clientName);
+        // 即使连接失败，我们仍然将客户端添加到映射中
+        // 它可以稍后连接
+    }
+
+    // 添加到映射中
+    clients[clientName] = client;
+    Logger::info("Created MQTT client: " + clientName + " for broker: " + brokerUrl);
+
+    return true;
+}
+
+// 获取MQTT客户端
+std::shared_ptr<MQTTClientWrapper> MQTTClientManager::getClient(const std::string& clientName) {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto it = clients.find(clientName);
+    if (it != clients.end()) {
+        return it->second;
+    }
+
+    return nullptr;
+}
+
+// 移除MQTT客户端
+bool MQTTClientManager::removeClient(const std::string& clientName) {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto it = clients.find(clientName);
+    if (it != clients.end()) {
+        // 断开连接并清理客户端
+        it->second->disconnect();
+        it->second->cleanup();
+
+        // 从映射中移除
+        clients.erase(it);
+        Logger::info("Removed MQTT client: " + clientName);
+        return true;
+    }
+
+    return false;
+}
+
+// 获取所有客户端名称
+std::vector<std::string> MQTTClientManager::listClients() {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    std::vector<std::string> clientNames;
+    for (const auto& pair : clients) {
+        clientNames.push_back(pair.first);
+    }
+
+    return clientNames;
+}
+
+// 清理所有客户端
+void MQTTClientManager::cleanup() {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    for (auto& pair : clients) {
+        pair.second->disconnect();
+        pair.second->cleanup();
+    }
+
+    clients.clear();
+    Logger::info("Cleaned up all MQTT clients");
+}
+
+// 析构函数
+MQTTClientManager::~MQTTClientManager() {
+    cleanup();
 }

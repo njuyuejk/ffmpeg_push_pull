@@ -5,18 +5,9 @@
 #include "common/StreamConfig.h"
 #include "common/Watchdog.h"
 #include "mqtt/mqtt_sync_client.h"
+#include "http/httplib.h"
 #include <string>
 #include <memory>
-
-/**
-* @brief mqtt消息回调函数
-*/
-void onMqttMessageReceived(const std::string& topic, const std::string& payload);
-
-/**
- * @brief mqtt链接丢失回调函数
- */
-void onMqttConnectionLost(const std::string& cause);
 
 /**
  * @brief 应用程序类
@@ -94,11 +85,6 @@ private:
  */
     void setupCustomFrameProcessing();
 
-    /**
-     * @brief 接收mqtt订阅主题
-     */
-     void startSubscribeMqttTopic();
-
 private:
     // 成员变量
     bool running_;                           // 运行状态
@@ -114,6 +100,8 @@ private:
 
     int periodicReconnectInterval_; // 周期性重连间隔（秒）
     int64_t lastPeriodicReconnectTime_ = 0; // 上次周期性重连时间
+
+    std::unique_ptr<httplib::Client> httpClient_;
 };
 
 /**

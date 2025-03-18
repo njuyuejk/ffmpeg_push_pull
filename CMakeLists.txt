@@ -143,6 +143,7 @@ set(common
         include/common/StreamConfig.h
         include/common/opencv2avframe.h
         src/common/opencv2avframe.cpp
+        include/http/httplib.h
 )
 
 set(ffmpeg_base
@@ -171,4 +172,4 @@ set(mqtt
 add_executable(ffmpeg_pull_push main.cpp ${app} ${common} ${ffmpeg_base} ${logger} ${mqtt})
 
 # 链接 FFmpeg 库
-target_link_libraries(ffmpeg_pull_push PRIVATE ${FOUND_FFMPEG_LIBS} ${FOUND_OPENCV_LIBS} ${FOUND_MQTT_LIBS} pthread)
+target_link_libraries(ffmpeg_pull_push PRIVATE ${FOUND_FFMPEG_LIBS} ${FOUND_OPENCV_LIBS} ${FOUND_MQTT_LIBS} ws2_32 pthread)

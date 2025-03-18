@@ -19,15 +19,6 @@ void signalHandlerWrapper(int signal) {
     }
 }
 
-// mqtt回调
-void onMqttMessageReceived(const std::string& topic, const std::string& payload) {
-    std::cout << "Message received - Topic: " << topic << ", Content: " << payload << std::endl;
-}
-
-void onMqttConnectionLost(const std::string& cause) {
-    std::cout << "MQTT connection lost callback: " << cause << std::endl;
-}
-
 // 示例：计算视频帧亮度并保存到文件
 void calculateFrameBrightness(const std::string& streamId, const AVFrame* frame, int64_t pts) {
     // 检查帧是否有效
@@ -141,21 +132,13 @@ bool Application::initialize(const std::string& configFilePath) {
     LogLevel logLevel = static_cast<LogLevel>(AppConfig::getLogLevel());
     Logger::init(AppConfig::getLogToFile(), AppConfig::getLogFilePath(), logLevel);
 
-    // 初始化mqtt配置
-    // Get MQTT client singleton
-    auto& mqttClient = MQTTClientWrapper::getInstance();
+    // 初始化http相关
+    httpClient_ = std::make_unique<httplib::Client>("127.0.0.1", 9000);
+    httpClient_->set_connection_timeout(5);
+    httpClient_->set_read_timeout(5);
 
-    // Initialize MQTT client
-    if (!mqttClient.initialize("mqtt://192.168.11.100:1883", "ClientMQTT", "", "", true, 60)) {
-        Logger::error("Failed to initialize MQTT client");
-    }
-
-    // Set connection lost callback
-    mqttClient.setConnectionLostCallback(onMqttConnectionLost);
-
-    // Connect to MQTT broker
-    if (!mqttClient.connect()) {
-        Logger::error("Failed to connect to MQTT broker");
+    if (!httpClient_->Head("/")) {
+        Logger::error("http server connect failed");
     }
 
     // 获取应用程序配置
@@ -212,9 +195,6 @@ int Application::run() {
     // 主循环 - 监控所有流
     Logger::info("Starting main loop, press Ctrl+C to exit");
 
-    // 订阅mqtt主题
-    startSubscribeMqttTopic();
-
     // 启动所有配置的流
     startAllStreams();
 
@@ -246,10 +226,6 @@ void Application::handleSignal(int signal) {
 void Application::cleanup() {
     Logger::info("Cleaning up application resources...");
     running_ = false;  // 确保主循环终止
-
-    auto& mqttClient = MQTTClientWrapper::getInstance();
-    mqttClient.unsubscribe("test/PTZ/#");
-    mqttClient.disconnect();
 
     // 记录清理开始时间（用于超时）
     auto cleanupStart = std::chrono::steady_clock::now();
@@ -350,6 +326,18 @@ void Application::listStreams() {
 void Application::monitorStreams() {
 // 显示当前状态
     listStreams();
+
+    if (!httpClient_->Head("/")) {
+        Logger::info("reconnect http server");
+        httpClient_ = std::make_unique<httplib::Client>("127.0.0.1", 9000);
+        httpClient_->set_connection_timeout(5);
+        httpClient_->set_read_timeout(5);
+        if (!httpClient_->Head("/")) {
+            Logger::error("reconnect http server failed");
+        } else {
+            Logger::info("reconnect http server success");
+        }
+    }
 
     // 如果不需要自动重启流，则直接返回
     if (!autoRestartStreams_) {
@@ -539,12 +527,5 @@ void Application::setupCustomFrameProcessing() {
                 Logger::info("Custom video frame processing set up for stream: " + streamId);
             }
         }
-    }
-}
-
-void Application::startSubscribeMqttTopic() {
-    auto& mqttClient = MQTTClientWrapper::getInstance();
-    if (!mqttClient.subscribe("test/PTZ/#", 2, onMqttMessageReceived)) {
-        Logger::error("subscribe mqtt topic failed");
     }
 }

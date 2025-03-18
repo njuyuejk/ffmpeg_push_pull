@@ -17,15 +17,30 @@
 
 
 /**
- * @brief MQTT客户端包装类，采用单例模式
+ * @brief MQTT客户端包装类
  */
 class MQTTClientWrapper {
 public:
     /**
-     * @brief 获取单例实例
-     * @return MQTTClientWrapper单例对象
+     * @brief 构造函数
+     * @param brokerUrl MQTT代理URL
+     * @param clientId 客户端ID
+     * @param username 用户名（可选）
+     * @param password 密码（可选）
+     * @param cleanSession 是否清除会话
+     * @param keepAliveInterval 保活间隔
      */
-    static MQTTClientWrapper& getInstance();
+    MQTTClientWrapper(const std::string& brokerUrl = "",
+                      const std::string& clientId = "",
+                      const std::string& username = "",
+                      const std::string& password = "",
+                      bool cleanSession = true,
+                      int keepAliveInterval = 60);
+
+    /**
+     * @brief 析构函数
+     */
+    ~MQTTClientWrapper();
 
     /**
      * @brief 初始化MQTT客户端
@@ -101,18 +116,18 @@ public:
     void cleanup();
 
     /**
-     * @brief 析构函数
+     * @brief 获取MQTT代理URL
+     * @return MQTT代理URL
      */
-    ~MQTTClientWrapper();
+    std::string getBrokerUrl() const { return brokerUrl; }
+
+    /**
+     * @brief 获取客户端ID
+     * @return 客户端ID
+     */
+    std::string getClientId() const { return clientId; }
 
 private:
-    // 私有构造函数，防止外部创建实例
-    MQTTClientWrapper();
-
-    // 禁止拷贝和赋值
-    MQTTClientWrapper(const MQTTClientWrapper&) = delete;
-    MQTTClientWrapper& operator=(const MQTTClientWrapper&) = delete;
-
     // MQTT客户端实例
     MQTTClient client;
 
@@ -147,6 +162,80 @@ private:
     bool reconnect();
 };
 
+/**
+ * @brief MQTT客户端管理器类
+ * 用于管理多个MQTT客户端连接
+ */
+class MQTTClientManager {
+public:
+    /**
+     * @brief 获取单例实例
+     * @return MQTTClientManager单例对象
+     */
+    static MQTTClientManager& getInstance();
 
+    /**
+     * @brief 创建新的MQTT客户端
+     * @param clientName 客户端名称（用于标识客户端）
+     * @param brokerUrl MQTT代理URL
+     * @param clientId MQTT客户端ID
+     * @param username 用户名（可选）
+     * @param password 密码（可选）
+     * @param cleanSession 是否清除会话
+     * @param keepAliveInterval 保活间隔
+     * @return 是否成功创建
+     */
+    bool createClient(const std::string& clientName,
+                      const std::string& brokerUrl,
+                      const std::string& clientId,
+                      const std::string& username = "",
+                      const std::string& password = "",
+                      bool cleanSession = true,
+                      int keepAliveInterval = 60);
+
+    /**
+     * @brief 获取MQTT客户端
+     * @param clientName 客户端名称
+     * @return MQTT客户端的共享指针，如果未找到则返回nullptr
+     */
+    std::shared_ptr<MQTTClientWrapper> getClient(const std::string& clientName);
+
+    /**
+     * @brief 删除MQTT客户端
+     * @param clientName 客户端名称
+     * @return 是否成功删除
+     */
+    bool removeClient(const std::string& clientName);
+
+    /**
+     * @brief 获取所有客户端名称
+     * @return 客户端名称列表
+     */
+    std::vector<std::string> listClients();
+
+    /**
+     * @brief 销毁所有客户端
+     */
+    void cleanup();
+
+    /**
+     * @brief 析构函数
+     */
+    ~MQTTClientManager();
+
+private:
+    // 私有构造函数
+    MQTTClientManager() = default;
+
+    // 禁止拷贝和赋值
+    MQTTClientManager(const MQTTClientManager&) = delete;
+    MQTTClientManager& operator=(const MQTTClientManager&) = delete;
+
+    // 锁用于保证线程安全
+    std::mutex mutex;
+
+    // MQTT客户端映射表
+    std::map<std::string, std::shared_ptr<MQTTClientWrapper>> clients;
+};
 
 #endif //FFMPEG_PULL_PUSH_MQTT_SYNC_CLIENT_H
