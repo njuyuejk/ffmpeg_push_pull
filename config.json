@@ -15,10 +15,10 @@
   "mqtt_servers": [
     {
       "name": "main_server",
-      "broker_url": "tcp://localhost:1883",
-      "client_id": "ffmpeg_stream_processor_main",
-      "username": "mqtt_user",
-      "password": "mqtt_password",
+      "broker_url": "mqtt://192.168.11.100:1883",
+      "client_id": "ffmpeg_test_main",
+      "username": "",
+      "password": "",
       "clean_session": true,
       "keep_alive_interval": 60,
       "auto_reconnect": true,
@@ -30,23 +30,6 @@
         },
         {
           "topic": "system/status",
-          "qos": 1
-        }
-      ]
-    },
-    {
-      "name": "cloud_server",
-      "broker_url": "tcp://mqtt.example.com:1883",
-      "client_id": "ffmpeg_stream_processor_cloud",
-      "username": "cloud_user",
-      "password": "cloud_password",
-      "clean_session": true,
-      "keep_alive_interval": 60,
-      "auto_reconnect": true,
-      "reconnect_interval": 5,
-      "subscriptions": [
-        {
-          "topic": "stream/+/command",
           "qos": 1
         }
       ]

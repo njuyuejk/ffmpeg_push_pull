@@ -133,8 +133,16 @@ private:
 
     std::unique_ptr<httplib::Client> httpClient_;
 
-    // MQTT客户端
-    std::map<std::string, std::shared_ptr<MQTTClientWrapper>> mqttClients;
+    // 使用 MQTTClientManager 替代直接映射
+    MQTTClientManager& mqttManager = MQTTClientManager::getInstance();
+
+    // 存储每个主题处理程序的映射
+    struct TopicHandler {
+        std::string serverName;
+        std::string topic;
+        std::function<void(const std::string&, const std::string&, const std::string&)> handler;
+    };
+    std::vector<TopicHandler> topicHandlers;
 
 };
 
