@@ -3,11 +3,13 @@
 #include "ffmpeg_base/FFmpegException.h"
 #include "opencv2/opencv.hpp"
 #include "common/opencv2avframe.h"
+#include "common/utils.h"
 #include <iostream>
 #include <fstream>
 #include <thread>
 #include <chrono>
 #include <csignal>
+#include <uuid/uuid.h>
 
 // 全局应用程序引用，用于信号处理
 Application* g_applicationInstance = nullptr;
@@ -18,58 +20,6 @@ void signalHandlerWrapper(int signal) {
         g_applicationInstance->handleSignal(signal);
     }
 }
-
-// 示例：计算视频帧亮度并保存到文件
-void calculateFrameBrightness(const std::string& streamId, const AVFrame* frame, int64_t pts) {
-    // 检查帧是否有效
-    if (!frame || frame->width <= 0 || frame->height <= 0) {
-        return;
-    }
-
-    cv::Mat dstMat = AVFrameToMat(frame);
-
-    Logger::info("cv mat status is: "+ std::to_string(dstMat.cols) + " height is: " + std::to_string(dstMat.rows));
-
-//    cv::imwrite("D:\\project\\C++\\my\\ffmpeg_push_pull\\cmake-build-debug/test.jpg", dstMat);
-
-    // 计算亮度（使用Y平面的平均值）
-    double totalLuma = 0.0;
-    int pixelCount = 0;
-
-    // 打印结果
-//    Logger::info("Stream " + streamId + " frame at " + std::to_string(pts) +
-//                 "ms, average brightness: " + std::to_string(frame->format));
-
-    // 只处理YUV格式的帧
-    if (frame->format == AV_PIX_FMT_YUV420P ||
-        frame->format == AV_PIX_FMT_YUV422P ||
-        frame->format == AV_PIX_FMT_YUV444P ||
-        frame->format == AV_PIX_FMT_NV12) {
-
-        // Y平面是亮度
-        for (int y = 0; y < frame->height; y++) {
-            for (int x = 0; x < frame->width; x++) {
-                totalLuma += frame->data[0][y * frame->linesize[0] + x];
-                pixelCount++;
-            }
-        }
-    }
-
-    if (pixelCount > 0) {
-        double avgLuma = totalLuma / pixelCount;
-
-        // 打印结果
-        Logger::info("Stream " + streamId + " frame at " + std::to_string(pts) +
-                      "ms, average brightness: " + std::to_string(avgLuma));
-
-        // 将结果保存到文件（追加模式）
-        static std::ofstream outFile("brightness_" + streamId + ".csv", std::ios::app);
-        if (outFile.is_open()) {
-            outFile << pts << "," << avgLuma << std::endl;
-        }
-    }
-}
-
 
 // 单例实现
 Application& Application::getInstance() {
@@ -132,14 +82,18 @@ bool Application::initialize(const std::string& configFilePath) {
     LogLevel logLevel = static_cast<LogLevel>(AppConfig::getLogLevel());
     Logger::init(AppConfig::getLogToFile(), AppConfig::getLogFilePath(), logLevel);
 
-    // 初始化http相关
-    httpClient_ = std::make_unique<httplib::Client>("127.0.0.1", 9000);
-    httpClient_->set_connection_timeout(5);
-    httpClient_->set_read_timeout(5);
+    const HTTPServerConfig& httpConfig = AppConfig::getHTTPServerConfig();
+    httpClient_ = std::make_unique<httplib::Client>(httpConfig.host, httpConfig.port);
+    httpClient_->set_connection_timeout(httpConfig.connectionTimeout);
+    isHttpConnect_ = true;
 
     if (!httpClient_->Head("/")) {
-        Logger::error("http server connect failed");
+        Logger::error("HTTP server connect failed: " + httpConfig.host + ":" +
+                      std::to_string(httpConfig.port));
+        isHttpConnect_ = false;
     }
+
+    Logger::info("HTTP server connect info: " + httpConfig.host + ":" + std::to_string(httpConfig.port));
 
     // 获取应用程序配置
     monitorIntervalSeconds_ = 30; // 默认30秒
@@ -239,6 +193,9 @@ void Application::cleanup() {
     // 清理mqtt连接
     cleanupMQTTClients();
 
+    modelPools_.clear();
+    std::vector<std::unique_ptr<ModelPoolEntry>>().swap(modelPools_);
+
     // 使用单独的线程执行清理，防止潜在的阻塞
     std::thread cleanupThread([this, &cleanupCompleted]() {
         try {
@@ -302,10 +259,22 @@ void Application::cleanup() {
         }
     }
 
+    singleModelPools_.clear();
+    std::vector<std::unique_ptr<SingleModelEntry>>().swap(singleModelPools_);
+
     // 关闭日志系统
     try {
-        Logger::info("Application exit");
-        Logger::shutdown();
+        // 第一阶段：准备关闭日志
+        Logger::prepareShutdown();
+
+        // 使用专门的关闭消息方法记录最后的日志
+        Logger::shutdownMessage("Application exit - cleanup completed");
+
+        // 短暂延迟
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // 第二阶段：完成日志关闭
+        Logger::finalizeShutdown();
     } catch (...) {
         std::cerr << "Error shutting down logger system" << std::endl;
     }
@@ -335,17 +304,29 @@ void Application::monitorStreams() {
 // 显示当前状态
     listStreams();
 
+//    publishSystemStatus("main_server");
+
     if (!httpClient_->Head("/")) {
+        isHttpConnect_ = false;
+    }
+
+    if (!isHttpConnect_) {
         Logger::info("reconnect http server");
-        httpClient_ = std::make_unique<httplib::Client>("127.0.0.1", 9000);
-        httpClient_->set_connection_timeout(5);
-        httpClient_->set_read_timeout(5);
+        const HTTPServerConfig& httpConfig = AppConfig::getHTTPServerConfig();
+        httpClient_ = std::make_unique<httplib::Client>(httpConfig.host, httpConfig.port);
+        httpClient_->set_connection_timeout(httpConfig.connectionTimeout);
         if (!httpClient_->Head("/")) {
-            Logger::error("reconnect http server failed");
+            Logger::error("reconnect http server failed: " + httpConfig.host + ":" +
+                          std::to_string(httpConfig.port));
         } else {
-            Logger::info("reconnect http server success");
+            Logger::info("reconnect http server success: " + httpConfig.host + ":" +
+                         std::to_string(httpConfig.port));
+            isHttpConnect_ = true;
         }
     }
+
+    // 监控MQTT连接
+    monitorMQTTConnections();
 
     // 如果不需要自动重启流，则直接返回
     if (!autoRestartStreams_) {
@@ -501,6 +482,8 @@ void Application::startAllStreams() {
         watchdog_->feedTarget("application");
     }
 
+//    test_model();
+
     Logger::info("Started " + std::to_string(successCount) + " of " +
                  std::to_string(configs.size()) + " streams");
 }
@@ -523,13 +506,35 @@ void Application::setupCustomFrameProcessing() {
         StreamConfig config = streamManager_->getStreamConfig(streamId);
 
         // 如果是仅拉流模式，设置自定义处理
-        if (!config.pushEnabled) {
+        if (!config.pushEnabled && config.aiEnabled) {
             // 获取StreamProcessor指针
             auto processor = streamManager_->getStreamProcessor(streamId);
+
+            // 模型池子，针对实时检测情况
+//            std::unique_ptr<ModelPoolEntry> aiPool = std::make_unique<ModelPoolEntry>();
+//            aiPool->pool_ = std::make_unique<ThreadPool>(6);
+//            aiPool->streamId = streamId;
+//            aiPool->first_ok = true;
+//            aiPool->count = 0;
+//            aiPool->rknnFlag = 0;
+//            aiPool->modelType = config.modelType;
+//            aiPool->rkpool = initModel(config.modelType);
+//            modelPools_.push_back(std::move(aiPool));
+
+            // 单个模型，针对不需要实时性
+            std::unique_ptr<SingleModelEntry> aiPool = std::make_unique<SingleModelEntry>();
+            aiPool->streamId = streamId;
+            aiPool->count = 0;
+            aiPool->modelType = config.modelType;
+            aiPool->isEnabled = true;
+            aiPool->singleRKModel = initSingleModel(config.modelType);
+            singleModelPools_.push_back(std::move(aiPool));
+
             if (processor) {
                 // 设置视频帧回调
-                processor->setVideoFrameCallback([streamId](const AVFrame* frame, int64_t pts) {
-                    calculateFrameBrightness(streamId, frame, pts);
+                processor->setVideoFrameCallback([this, streamId](const AVFrame* frame, int64_t pts, int fps) {
+                    processDelayFrameAI(streamId, frame, pts, fps);
+//                    processFrameAI(streamId, frame, pts);
                 });
 
                 Logger::info("Custom video frame processing set up for stream: " + streamId);
@@ -613,6 +618,10 @@ bool Application::initializeMQTTClients() {
                 // 订阅主题
                 if (client->subscribe(sub.topic, sub.qos, messageCallback)) {
                     Logger::info("Subscribed to topic " + sub.topic + " on server " + serverConfig.name);
+                    registerTopicHandler(serverConfig.name, sub.topic,
+                                         [this](const std::string& serverName, const std::string& topic, const std::string& payload) {
+                                             this->handlePTZControl(serverName, topic, payload);
+                                         });
                 }
                 else {
                     Logger::warning("Failed to subscribe to topic " + sub.topic + " on server " + serverConfig.name);
@@ -631,7 +640,45 @@ bool Application::initializeMQTTClients() {
     Logger::info("Initialized " + std::to_string(successCount) + " of " +
                  std::to_string(mqttServers.size()) + " MQTT clients");
 
+    configureMQTTMonitoring();
+
     return successCount > 0 || mqttServers.empty();
+}
+
+// 注册主题处理程序的辅助方法
+void Application::registerTopicHandler(const std::string& serverName, const std::string& topic,
+                                       std::function<void(const std::string&, const std::string&, const std::string&)> handler) {
+    topicHandlers.push_back({serverName, topic, handler});
+}
+
+void Application::registerTopicHandler(const std::string& serverName, const std::string& topic,
+                          std::function<void(const std::string&, const std::string&, MQTTClient_message&)> handler) {
+    topicMsgHandlers.push_back({serverName, topic, handler});
+}
+
+void Application::handleMQTTMessage(const std::string& serverName, const std::string& topic, MQTTClient_message& message) {
+    Logger::debug("Received MQTT message from server " + serverName + " on topic " + topic);
+
+    try {
+        // 查找此特定服务器和主题的处理程序
+        bool handlerFound = false;
+        for (const auto& handler : topicMsgHandlers) {
+            if (handler.serverName == serverName && handler.topic == topic) {
+                handler.handler(serverName, topic, message);
+                handlerFound = true;
+                break;
+            }
+        }
+
+        // 如果没有找到特定处理程序，进行通用处理
+        if (!handlerFound) {
+            // 根据需要添加更多通用处理
+            Logger::debug("No specific handler found for topic: " + topic);
+        }
+    }
+    catch (const std::exception& e) {
+        Logger::error("Error handling MQTT message: " + std::string(e.what()));
+    }
 }
 
 void Application::handleMQTTMessage(const std::string& serverName, const std::string& topic, const std::string& payload) {
@@ -659,7 +706,112 @@ void Application::handleMQTTMessage(const std::string& serverName, const std::st
     }
 }
 
-void Application::publishSystemStatus(const std::string& serverName) {
+void Application::handlePTZControl(const std::string& serverName, const std::string& topic, const std::string& payload) {
+    try {
+        Logger::info("start process ptz message");
+
+        // 模型启停控制
+        if (topic == "model/aiControl") {
+            for (auto &model : singleModelPools_) {
+                if (model->modelType == 1) {
+                    model->isEnabled = false;
+                }
+            }
+        }
+
+        if (topic == "test/airesult") {
+            AIDataResponse::aiDataResponse message;
+            message.ParseFromString(payload);
+
+
+
+            std::vector<uchar> imgData(message.data().begin(), message.data().end());
+            cv::Mat image = cv::imdecode(imgData, cv::IMREAD_COLOR);
+
+//            cv::Mat rgbImage;
+//            cv::cvtColor(image, rgbImage, cv::COLOR_RGB2BGR);
+
+            cv::imwrite("./test_ai.jpg", image);
+
+        }
+
+        // 解析 protobuf 消息
+//        PTZControl::PTZControl ptzControl;
+//        // 解析 JSON 消息
+//        nlohmann::json message;
+        try {
+//            message = nlohmann::json::parse(payload.c_str());
+//            ptzControl.ParseFromString(payload);
+//            PTZControl::PTZControl::Control commandValue = ptzControl.control();
+//            std::string type_name = PTZControl::PTZControl::Control_Name(commandValue);
+//            Logger::info("payload message ptz command is: " + std::to_string(ptzControl.control()) + " name is: " + type_name);
+//            std::string path = "/api/front-end/ptz/" + std::string("34020000001320000003") + "/" + std::string("34020000001320000002") +
+//                    "?command=" + type_name + "&horizonSpeed=" + std::to_string(ptzControl.horizonspeed()) +
+//                    "&verticalSpeed=" + std::to_string(ptzControl.verticalspeed()) + "&zoomSpeed=" + std::to_string(ptzControl.zoomspeed());
+//            std::string path = "/user/" + std::string(message["deviceId"]);
+
+            // 处理云台控制相关话题
+            std::string path;
+            if (topic == "wubarobot/terminal_to_logic_ptz_control") {
+                path = PTZControlHandler(payload);
+            } else if (topic == "wubarobot/terminal_to_logic_ptz_iris_control") {
+                path = IRISControlHandler(payload);
+            } else if (topic == "wubarobot/terminal_to_logic_ptz_focus_control") {
+                path = FocusControlHandler(payload);
+            }
+
+//            if (isHttpConnect_) {
+//                auto res = httpClient_->Get(path.c_str());
+//                if (res && res->status == 200) {
+//                    Logger::info("ptz control request success, response message is: " + res->body);
+//                } else {
+//                    Logger::info("ptz control request failed");
+//                    isHttpConnect_ = false;
+//                }
+//            }
+        }
+        catch (...) {
+            Logger::warning("Failed to parse JSON payload for stream control message");
+            return;
+        }
+
+    }
+    catch (const std::exception& e) {
+        Logger::error("Error processing PTZ control message: " + std::string(e.what()));
+    }
+}
+
+void Application::handlePTZControl(const std::string& serverName, const std::string& topic, MQTTClient_message& message) {
+    try {
+        Logger::info("start process ptz message");
+        // 解析 JSON 消息
+        PTZControl::PTZControl ptzControl;
+        try {
+            ptzControl.ParseFromArray(message.payload, message.payloadlen);
+            Logger::info("payload message is: " + std::to_string(ptzControl.horizonspeed()));
+//            std::string path = "/api/front-end/ptz/" + std::string(message["deviceId"]) + "/" + std::string(message["channelId"]) +
+//                               "?command=" + std::string(message["command"]) + "&horizonSpeed=" + std::string(message["horizonSpeed"]) +
+//                               "&verticalSpeed=" + std::string(message["verticalSpeed"]) + "&zoomSpeed=" + std::string(message["zoomSpeed"]);
+            std::string path = "/user/" + std::to_string(ptzControl.control());
+            auto res = httpClient_->Get(path.c_str());
+            if (res && res->status == 200 ) {
+                Logger::info("ptz control request success, response message is: " + res->body);
+            } else {
+                Logger::info("ptz control request failed");
+            }
+        }
+        catch (...) {
+            Logger::warning("Failed to parse JSON payload for stream control message");
+            return;
+        }
+
+    }
+    catch (const std::exception& e) {
+        Logger::error("Error processing PTZ control message: " + std::string(e.what()));
+    }
+}
+
+void Application::publishSystemStatus(const std::string& serverName, const std::string& payload) {
     auto client = mqttManager.getClient(serverName);
     if (!client) {
         Logger::error("Cannot publish system status: MQTT client not found for server " + serverName);
@@ -667,18 +819,40 @@ void Application::publishSystemStatus(const std::string& serverName) {
     }
 
     try {
-        // 创建状态消息
-        nlohmann::json statusMsg;
-        statusMsg["timestamp"] = time(nullptr);
-        statusMsg["status"] = "running";
-        statusMsg["version"] = "1.0.0"; // 替换为实际版本
+//        std::vector<uchar> jpgBuffer;
+//        std::vector<int> compression_params;
+//        compression_params.push_back(cv::IMWRITE_JPEG_QUALITY);
+//        compression_params.push_back(90); // JPEG质量(0-100)
+//
+//        cv::imencode(".jpg", data, jpgBuffer, compression_params);
+//
+//        AIDataResponse::aiDataResponse aiResult;
+//        aiResult.set_name("识别结果");
+//        aiResult.set_format("jpg");
+//        aiResult.set_data(jpgBuffer.data(), jpgBuffer.size());
+//        aiResult.set_airesult("皖B18060");
+//
+//        std::string serialized_message;
+//        if (!aiResult.SerializeToString(&serialized_message)) {
+//            Logger::error("序列化消息失败");
+//        }
 
-        // 添加系统指标
-        nlohmann::json metrics;
-        statusMsg["metrics"] = metrics;
+        // 创建状态消息
+//        nlohmann::json statusMsg;
+//        statusMsg["deviceId"] = "HikVision2";
+//        statusMsg["channelId"] = "2"; // 替换为实际版本
+//        statusMsg["command"] = "zoomin";
+//        statusMsg["horizonSpeed"] = 64;
+//        statusMsg["verticalSpeed"] = 64;
+//        statusMsg["zoomSpeed"] = 8;
+
+//        Logger::info("publish message is: " + statusMsg.dump());
 
         // 发布状态
-        client->publish("system/status/response", statusMsg.dump(), 1);
+//        client->publish("system/status/response", statusMsg.dump(), 1);
+//        client->publish("test/ptz", statusMsg.dump(), 2);
+//        client->publish("test/airesult", serialized_message, 2);
+        client->publish("wubarobot/inner/ai_event", payload, 2);
         Logger::info("Published system status to server " + serverName);
     }
     catch (const std::exception& e) {
@@ -717,5 +891,432 @@ bool Application::publishToAllServers(const std::string& topic, const std::strin
 
 void Application::cleanupMQTTClients() {
     Logger::info("Cleaning up MQTT clients...");
+
+    // 停止MQTT监控
+    if (mqttMonitoringEnabled_) {
+        mqttManager.stopPeriodicHealthCheck();
+    }
+
     mqttManager.cleanup();
+}
+
+void Application::configureMQTTMonitoring() {
+    // 获取MQTT健康检查参数（可以从配置文件中获取）
+    for (const auto& [key, value] : AppConfig::getExtraOptions()) {
+        if (key == "mqttHealthCheckInterval") {
+            try {
+                mqttHealthCheckInterval_ = std::stoi(value);
+                Logger::info("MQTT health check interval set to " + value + " seconds");
+            } catch (...) {
+                Logger::warning("Invalid MQTT health check interval: " + value + ", using default");
+            }
+        } else if (key == "mqttMonitoringEnabled") {
+            mqttMonitoringEnabled_ = (value == "true" || value == "1");
+            Logger::info("MQTT monitoring " + std::string(mqttMonitoringEnabled_ ? "enabled" : "disabled"));
+        }
+    }
+
+    // 配置MQTT客户端管理器
+    if (mqttMonitoringEnabled_) {
+        // 设置健康检查间隔
+        mqttManager.setHealthCheckInterval(mqttHealthCheckInterval_);
+
+        // 设置全局重连策略
+        // 启用自动重连, 最大尝试次数不限, 初始延迟2秒, 最大延迟2分钟
+        mqttManager.setGlobalReconnectPolicy(true, 0, 2000, 120000);
+
+        // 启动周期性健康检查
+        mqttManager.startPeriodicHealthCheck();
+
+        Logger::info("MQTT monitoring configured and started");
+    }
+}
+
+void Application::monitorMQTTConnections() {
+    if (!mqttMonitoringEnabled_) {
+        return;
+    }
+
+    int64_t currentTime = std::time(nullptr);
+
+    // 如果上次检查时间距离现在超过了检查间隔，执行一次检查
+    if (lastMQTTHealthCheckTime_ == 0 || (currentTime - lastMQTTHealthCheckTime_) >= mqttHealthCheckInterval_) {
+        // 获取所有MQTT客户端名称
+        auto clientNames = mqttManager.listClients();
+
+        // 统计断开连接的客户端
+        std::vector<std::string> disconnectedClients;
+
+        // 检查每个客户端的连接状态
+        for (const auto& name : clientNames) {
+            auto client = mqttManager.getClient(name);
+            if (client && !client->isConnected()) {
+                disconnectedClients.push_back(name);
+
+                // 获取断开状态持续时间
+                int64_t disconnectedTime = client->getStatusDuration();
+
+                // 如果断开时间过长，记录警告
+                if (disconnectedTime > 300) { // 5分钟
+                    Logger::warning("MQTT client " + name + " disconnected for " +
+                                    std::to_string(disconnectedTime) + " seconds");
+                }
+            }
+        }
+
+        // 如果有断开连接的客户端，尝试进行一次健康检查恢复
+        if (!disconnectedClients.empty()) {
+            Logger::info("Found " + std::to_string(disconnectedClients.size()) +
+                         " disconnected MQTT clients, attempting recovery");
+            mqttManager.checkAndRecoverClients();
+        }
+
+        // 更新最后检查时间
+        lastMQTTHealthCheckTime_ = currentTime;
+    }
+}
+
+std::vector<std::unique_ptr<rknn_lite>> Application::initModel(int modelType) {
+
+    char *model_name;
+
+    if (modelType == 1) {
+        model_name = "./model/yolov8-plate.rknn";
+    } else if (modelType == 3) {
+        model_name = "./model/yolov8n-fire-smoke.rknn";
+    } else if (modelType == 4) {
+        model_name = "./model/yolov8_relu_person_best.rknn";
+    } else if (modelType == 5) {
+        model_name = "./model/yolov8n-p2-uav.rknn";
+    }
+
+    Logger::info("init model :" + std::string(model_name));
+
+    std::vector<std::unique_ptr<rknn_lite>> rkpool;
+
+    for (int i = 0; i < 6; ++i) {
+        auto rknn_ptr = std::make_unique<rknn_lite>(model_name, i % 3, modelType);
+        rkpool.push_back(std::move(rknn_ptr));
+    }
+
+    return rkpool;
+}
+
+std::unique_ptr<rknn_lite> Application::initSingleModel(int modelType) {
+
+    char *model_name;
+
+    if (modelType == 1) {
+        model_name = "./model/yolov8-plate.rknn";
+    } else if (modelType == 3) {
+        model_name = "./model/yolov8n-fire-smoke.rknn";
+    } else if (modelType == 4) {
+        model_name = "./model/yolov8_relu_person_best.rknn";
+    } else if (modelType == 5) {
+        model_name = "./model/yolov8n-p2-uav.rknn";
+    } else if (modelType == 6) {
+        model_name = "./model/yolov8n-meter.rknn";
+    }
+
+    Logger::info("init single model :" + std::string(model_name));
+
+    std::unique_ptr<rknn_lite> rknn_ptr = std::make_unique<rknn_lite>(model_name, modelType % 3, modelType);
+
+    return rknn_ptr;
+}
+
+// 示例：计算视频帧亮度并保存到文件
+void Application::processFrameAI(const std::string& streamId, const AVFrame* frame, int64_t pts, int fps) {
+
+//    return;
+    // 检查帧是否有效
+    if (!frame || frame->width <= 0 || frame->height <= 0) {
+        return;
+    }
+
+    try {
+        cv::Mat srcMat = AVFrameToMat(frame);
+        cv::Mat dstMat;
+        bool warning = false;
+        std::string plateResult = "";
+        AIDataResponse::AIEvent aiEvent;
+
+        for (auto &modelPool : modelPools_) {
+            if (modelPool->streamId != streamId) {
+                continue;
+            }
+
+            if (modelPool->count % 3 != 0) {
+                modelPool->count++;
+                return;
+            }
+
+            if (modelPool->first_ok) {
+                modelPool->rkpool[modelPool->rknnFlag % 6]->ori_img = srcMat;
+                modelPool->futs.push(modelPool->pool_->enqueue(&rknn_lite::interf, &(*modelPool->rkpool[modelPool->rknnFlag % 6])));
+            } else {
+                modelPool->futs.pop();
+                dstMat = modelPool->rkpool[modelPool->rknnFlag % 6]->ori_img;
+                warning = modelPool->rkpool[modelPool->rknnFlag % 6]->warning;
+                plateResult = modelPool->rkpool[modelPool->rknnFlag % 6]->plateResult;
+                modelPool->rkpool[modelPool->rknnFlag % 6]->ori_img = srcMat;
+                modelPool->futs.push(modelPool->pool_->enqueue(&rknn_lite::interf, &(*modelPool->rkpool[modelPool->rknnFlag % 6])));
+
+                if (warning) {
+                    // 获取当前时间
+                    std::time_t now = std::time(nullptr);
+
+                    // 转换为本地时间结构
+                    std::tm* localTime = std::localtime(&now);
+
+                    // 创建用于存储格式化时间的字符数组
+                    char buffer[80], buffer_day[80];
+
+                    // 格式化时间字符串: 年-月-日 时:分:秒
+                    std::strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", localTime);
+                    std::strftime(buffer_day, sizeof(buffer_day), "%Y-%m-%d", localTime);
+
+//                    std::string dirPath = "/root/data/" + std::string(buffer_day);
+                    std::string dirPath = AppConfig::getDirPath();
+                    if (!dirExists(dirPath)) {
+                        Logger::info("目录不存在，正在创建...");
+                        if (createDirRecursive(dirPath)) {
+                            Logger::info("目录创建成功！");
+                        } else {
+                            Logger::error("目录创建失败！");
+                        }
+                    } else {
+                        Logger::debug("目录已存在！");
+                    }
+
+                    std::string fileName;
+                    if (modelPool->modelType == 1) {
+                        fileName = "/" + std::string(buffer_day) + "/plate_" + std::string(buffer) + ".jpg";
+                        aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Plate);
+                    } else if (modelPool->modelType == 3) {
+                        fileName = "/" + std::string(buffer_day) + "/fire_smoke_" + std::string(buffer) + ".jpg";
+                        aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Fire);
+                    } else if (modelPool->modelType == 4) {
+                        fileName = "/" + std::string(buffer_day) + "/person_" + std::string(buffer) + ".jpg";
+                        aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+                    } else if (modelPool->modelType == 5) {
+                        fileName = "/" + std::string(buffer_day) + "/uav_" + std::string(buffer) + ".jpg";
+                        aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_UAV);
+                    } else {
+                        fileName = "/" + std::string(buffer_day) + "/warning_" + std::string(buffer) + ".jpg";
+                        aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+                    }
+
+                    std::string filePath = dirPath + fileName;
+
+                    // Logger::info("filename is: "+ fileName);
+                    cv::imwrite(filePath, dstMat);
+
+                    uuid_t uuid;
+                    char uuid_str[37];
+
+                    uuid_generate(uuid);
+                    uuid_unparse_lower(uuid, uuid_str);
+
+                    aiEvent.set_event_id(uuid_str);
+                    aiEvent.set_image_path(fileName);
+                    AIDataResponse::PlateParam* plateParam = aiEvent.mutable_plate_param();
+                    plateParam->set_plate_number(plateResult);
+
+                    std::string serialized_message;
+                    if (!aiEvent.SerializeToString(&serialized_message)) {
+                        Logger::error("序列化消息失败");
+                    }
+
+                    publishSystemStatus("main_server", serialized_message);
+                }
+
+                Logger::info("AI识别处理结束，请做后续相关处理");
+//                publishSystemStatus("main_server", dstMat);
+//                    cv::imwrite("./test.jpg", dstMat);
+            }
+
+            modelPool->rknnFlag++;
+            modelPool->count++;
+            if (modelPool->rknnFlag >= 6) {
+                if (modelPool->first_ok) {
+                    modelPool->first_ok = false;
+                }
+                modelPool->rknnFlag = 0;
+            }
+
+            if (modelPool->count == 3) {
+                modelPool->count = 0;
+            }
+        }
+    } catch (const std::exception& e) {
+        Logger::error("ai service is failed, please check model..., error info: " + std::string(e.what()));
+    }
+//    cv::imwrite("D:\\project\\C++\\my\\ffmpeg_push_pull\\cmake-build-debug/test.jpg", dstMat);
+}
+
+void Application::processDelayFrameAI(const std::string &streamId, const AVFrame *frame, int64_t pts, int fps) {
+    //    return;
+    // 检查帧是否有效
+    if (!frame || frame->width <= 0 || frame->height <= 0) {
+        return;
+    }
+
+    try {
+        cv::Mat srcMat = AVFrameToMat(frame);
+        cv::Mat dstMat, segAddMask;
+        bool warning = false;
+        std::string plateResult = "";
+        AIDataResponse::AIEvent aiEvent;
+
+        for (auto &modelPool : singleModelPools_) {
+            if (modelPool->streamId != streamId) {
+                continue;
+            }
+
+            if (modelPool->count % fps != 0) {
+                modelPool->count++;
+                return;
+            }
+
+            modelPool->singleRKModel->ori_img = srcMat;
+            modelPool->singleRKModel->startValue = 0.0;
+            modelPool->singleRKModel->endValue = 1.6;
+            modelPool->singleRKModel->interf();
+            dstMat = modelPool->singleRKModel->ori_img;
+            warning = modelPool->singleRKModel->warning;
+            plateResult = modelPool->singleRKModel->plateResult;
+
+            if (modelPool->modelType == 7) {
+                segAddMask = modelPool->singleRKModel->SrcAddMask;
+            }
+
+            Logger::debug("各个状态结果: "+ std::to_string(warning) + " 时间次数: " + std::to_string(warningFlag) + " 时间数量: " + std::to_string(timeCount));
+
+            if (warning && !warningFlag) {
+
+                // 获取当前时间
+                std::time_t now = std::time(nullptr);
+
+                // 转换为本地时间结构
+                std::tm* localTime = std::localtime(&now);
+
+                // 创建用于存储格式化时间的字符数组
+                char buffer[80], buffer_day[80];
+
+                // 格式化时间字符串: 年-月-日 时:分:秒
+                std::strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", localTime);
+                std::strftime(buffer_day, sizeof(buffer_day), "%Y-%m-%d", localTime);
+
+//                    std::string dirPath = "/root/data/" + std::string(buffer_day);
+                std::string dirPath = AppConfig::getDirPath() + "/" + std::string(buffer_day);
+                std::string tempPath = AppConfig::getDirPath();
+                if (!dirExists(dirPath)) {
+                    Logger::info("目录不存在，正在创建...");
+                    if (createDirRecursive(dirPath)) {
+                        Logger::info("目录创建成功！");
+                    } else {
+                        Logger::error("目录创建失败！");
+                    }
+                } else {
+                    Logger::debug("目录已存在！");
+                }
+
+                std::string fileName;
+                if (modelPool->modelType == 1) {
+                    fileName = "/" + std::string(buffer_day) + "/plate_" + std::string(buffer) + ".jpg";
+                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Plate);
+                } else if (modelPool->modelType == 3) {
+                    fileName = "/" + std::string(buffer_day) + "/fire_smoke_" + std::string(buffer) + ".jpg";
+                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Fire);
+                } else if (modelPool->modelType == 4) {
+                    fileName = "/" + std::string(buffer_day) + "/person_" + std::string(buffer) + ".jpg";
+                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+                } else if (modelPool->modelType == 5) {
+                    fileName = "/" + std::string(buffer_day) + "/uav_" + std::string(buffer) + ".jpg";
+                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_UAV);
+                } else if (modelPool->modelType == 6) {
+                    fileName = "/" + std::string(buffer_day) + "/meter_" + std::string(buffer) + ".jpg";
+                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+                } else if (modelPool->modelType == 7) {
+                    fileName = "/" + std::string(buffer_day) + "/crack_" + std::string(buffer) + ".jpg";
+                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+                } else {
+                    fileName = "/" + std::string(buffer_day) + "/warning_" + std::string(buffer) + ".jpg";
+                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+                }
+
+                std::string filePath = tempPath + fileName;
+
+                // Logger::info("filename is: "+ fileName);
+
+                if (modelPool->modelType == 7) {
+                    cv::imwrite(filePath, segAddMask);
+                } else {
+                    cv::imwrite(filePath, dstMat);
+                }
+
+                uuid_t uuid;
+                char uuid_str[37];
+
+                uuid_generate(uuid);
+                uuid_unparse_lower(uuid, uuid_str);
+
+                aiEvent.set_event_id(uuid_str);
+                aiEvent.set_image_path(fileName);
+                AIDataResponse::PlateParam* plateParam = aiEvent.mutable_plate_param();
+                plateParam->set_plate_number(plateResult);
+
+                std::string serialized_message;
+                if (!aiEvent.SerializeToString(&serialized_message)) {
+                    Logger::error("序列化消息失败");
+                }
+
+                publishSystemStatus("main_server", serialized_message);
+
+                // 报警以后，间隔时长进行报警
+                warningFlag = true;
+                timeCount = 1;
+            } else if (warningFlag && warning) {
+
+                Logger::info("AI处理结束, 处于报警间隔期间...");
+
+                timeCount++;
+                if (timeCount > 5) {
+                    // 重置状态 - 根据需求可以选择是否重置
+                    warningFlag = false;
+                    timeCount = 0;
+                }
+
+            } else {
+                Logger::info("AI处理结束, 无报警发生...");
+            }
+
+            modelPool->count++;
+            if (modelPool->count == fps) {
+                modelPool->count = 0;
+            }
+
+            Logger::info("AI识别处理结束，请做后续相关处理");
+//            publishSystemStatus("main_server", dstMat);
+//            cv::imwrite("./test.jpg", dstMat);
+        }
+    } catch (const std::exception& e) {
+        Logger::error("ai service is failed, please check model..., error info: " + std::string(e.what()));
+    }
+//    cv::imwrite("D:\\project\\C++\\my\\ffmpeg_push_pull\\cmake-build-debug/test.jpg", dstMat);
+}
+
+void Application::test_model() {
+    cv::Mat srcMat = cv::imread("./test3.jpg", 1);
+    cv::Mat dstMat;
+
+    char *modelNmae = "./model/yolov8-plate.rknn";
+
+    auto rkmodel = std::make_unique<rknn_lite>(modelNmae, 0, 1);
+
+//    rknn_lite *rkmodel = new rknn_lite(modelNmae, 0, 1);
+
+    rkmodel->ori_img = srcMat;
+    rkmodel->interf();
 }

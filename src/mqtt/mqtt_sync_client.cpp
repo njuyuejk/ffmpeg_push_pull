@@ -151,6 +151,29 @@ bool MQTTClientWrapper::subscribe(const std::string& topic, int qos, MessageCall
     return true;
 }
 
+bool MQTTClientWrapper::subscribe(const std::string& topic, int qos, MessageCallback1 callback) {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (!initialized) {
+        Logger::error("MQTT client not initialized");
+        return false;
+    }
+
+    // 保存回调函数
+    topicMessageCallbacks[topic] = callback;
+
+    if (connected) {
+        int rc = MQTTClient_subscribe(client, topic.c_str(), qos);
+        if (rc != MQTTCLIENT_SUCCESS) {
+            Logger::error("Failed to subscribe to topic " + topic + ", return code: " + std::to_string(rc));
+            return false;
+        }
+        Logger::info("Successfully subscribed to topic: " + topic + " (client: " + clientId + ")");
+    }
+
+    return true;
+}
+
 // 取消订阅主题
 bool MQTTClientWrapper::unsubscribe(const std::string& topic) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -273,60 +296,167 @@ void MQTTClientWrapper::staticconnectionLostCallback(void* context, char* cause)
 
         // 调用用户设置的回调函数
         if (instance->connectionLostCallback) {
-            instance->connectionLostCallback(causeStr);
+            try {
+                instance->connectionLostCallback(causeStr);
+            } catch (const std::exception& e) {
+                Logger::error("Exception in connection lost callback: " + std::string(e.what()));
+            } catch (...) {
+                Logger::error("Unknown exception in connection lost callback");
+            }
         }
 
-        // 尝试重新连接
-        instance->reconnect();
+        // 如果启用了自动重连，尝试重新连接
+        if (instance->autoReconnect) {
+            instance->reconnect();
+        }
     }
+}
+
+// 检查客户端健康状态
+bool MQTTClientWrapper::checkHealth() {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (!initialized) {
+        return false;
+    }
+
+    if (connected) {
+        // 尝试发送PING来验证连接状态
+        // 注意：MQTTClient库会自动处理PING，但我们可以检查isConnected状态
+        bool actuallyConnected = MQTTClient_isConnected(client);
+        if (!actuallyConnected) {
+            Logger::warning("MQTT client " + clientId + " reports as connected but is actually disconnected");
+            connected = false;
+            lastDisconnectTime = std::time(nullptr);
+            return false;
+        }
+        return true;
+    } else {
+        // 如果断开连接时间超过重连时间，并且启用了自动重连，尝试重新连接
+        int64_t now = std::time(nullptr);
+        int reconnectDelaySeconds = calculateReconnectDelay() / 1000;
+
+        if (autoReconnect && lastDisconnectTime > 0 &&
+            (now - lastDisconnectTime) > reconnectDelaySeconds) {
+
+            Logger::info("Health check initiating reconnect for MQTT client: " + clientId);
+            return reconnect();
+        }
+        return false;
+    }
+}
+
+// 获取连接状态持续时间
+int64_t MQTTClientWrapper::getStatusDuration() const {
+    int64_t now = std::time(nullptr);
+
+    if (connected && connectionStartTime > 0) {
+        return now - connectionStartTime;
+    } else if (!connected && lastDisconnectTime > 0) {
+        return now - lastDisconnectTime;
+    }
+
+    return 0;
+}
+
+// 强制重连
+bool MQTTClientWrapper::forceReconnect() {
+    // 断开现有连接
+    disconnect();
+
+    // 重置重连计数
+    resetReconnectAttempts();
+
+    // 尝试重新连接
+    return reconnect();
+}
+
+// 设置自动重连策略
+void MQTTClientWrapper::setReconnectPolicy(bool enable, int maxAttempts, int initialDelayMs, int maxDelayMs) {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    autoReconnect = enable;
+    maxReconnectAttempts = maxAttempts;
+    initialReconnectDelayMs = initialDelayMs;
+    maxReconnectDelayMs = maxDelayMs;
+
+    Logger::info("Set reconnect policy for MQTT client " + clientId + ": enabled=" +
+                 (enable ? "true" : "false") + ", maxAttempts=" + std::to_string(maxAttempts) +
+                 ", initialDelay=" + std::to_string(initialDelayMs) + "ms, maxDelay=" +
+                 std::to_string(maxDelayMs) + "ms");
+}
+
+// 计算重连延迟（指数退避）
+int MQTTClientWrapper::calculateReconnectDelay() const {
+    int attempt = std::min(reconnectAttempts.load(), 10); // 限制指数增长
+    int delay = initialReconnectDelayMs * (1 << attempt);
+    return std::min(delay, maxReconnectDelayMs);
 }
 
 // 尝试重新连接
 bool MQTTClientWrapper::reconnect() {
-    // 在非锁定状态下尝试重连，避免死锁
-    static const int MAX_RETRY = 5;
-    static const int RETRY_INTERVAL_MS = 3000;
+    // 在非锁定状态下增加重连计数，减少锁的竞争
+    int attempts = ++reconnectAttempts;
 
-    for (int i = 0; i < MAX_RETRY; i++) {
-        Logger::info("Attempting to reconnect to MQTT broker (" + std::to_string(i+1) + "/" +
-                     std::to_string(MAX_RETRY) + "): " + clientId + " to " + brokerUrl);
-
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-
-            MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
-            conn_opts.keepAliveInterval = keepAliveInterval;
-            conn_opts.cleansession = cleanSession;
-
-            if (!username.empty()) {
-                conn_opts.username = username.c_str();
-            }
-            if (!password.empty()) {
-                conn_opts.password = password.c_str();
-            }
-
-            int rc = MQTTClient_connect(client, &conn_opts);
-            if (rc == MQTTCLIENT_SUCCESS) {
-                connected = true;
-                Logger::info("Successfully reconnected to MQTT broker: " + brokerUrl);
-
-                // 重新订阅所有主题
-                for (const auto& pair : topicCallbacks) {
-                    MQTTClient_subscribe(client, pair.first.c_str(), 1);
-                }
-
-                return true;
-            }
-        }
-
-        // 等待一段时间再重试
-        std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_INTERVAL_MS));
+    // 如果设置了最大重试次数并且已经达到，则不再尝试
+    if (maxReconnectAttempts > 0 && attempts > maxReconnectAttempts) {
+        Logger::error("MQTT client " + clientId + " exceeded maximum reconnect attempts (" +
+                      std::to_string(maxReconnectAttempts) + ")");
+        return false;
     }
 
-    Logger::error("Failed to reconnect to MQTT broker after maximum retry attempts: " + clientId + " to " + brokerUrl);
+    int reconnectDelay = calculateReconnectDelay();
+    int64_t now = std::time(nullptr);
+
+    // 如果上次重连时间太近，按照退避策略延迟重连
+    if (lastReconnectTime > 0 && (now - lastReconnectTime) * 1000 < reconnectDelay) {
+        return false;
+    }
+
+    Logger::info("Attempting to reconnect MQTT client " + clientId + " to " + brokerUrl +
+                 " (attempt " + std::to_string(attempts) + ", delay: " +
+                 std::to_string(reconnectDelay) + "ms)");
+
+    lastReconnectTime = now;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+        conn_opts.keepAliveInterval = keepAliveInterval;
+        conn_opts.cleansession = cleanSession;
+
+        if (!username.empty()) {
+            conn_opts.username = username.c_str();
+        }
+        if (!password.empty()) {
+            conn_opts.password = password.c_str();
+        }
+
+        int rc = MQTTClient_connect(client, &conn_opts);
+        if (rc == MQTTCLIENT_SUCCESS) {
+            connected = true;
+            connectionStartTime = now;
+            lastDisconnectTime = 0;
+            Logger::info("Successfully reconnected MQTT client: " + clientId + " to " + brokerUrl);
+
+            // 重新订阅所有主题
+            for (const auto& pair : topicCallbacks) {
+                MQTTClient_subscribe(client, pair.first.c_str(), 1);
+                Logger::debug("Resubscribed to topic: " + pair.first);
+            }
+
+            // 重置重连尝试计数
+            reconnectAttempts = 0;
+            return true;
+        } else {
+            Logger::warning("Failed to reconnect MQTT client " + clientId + ", error code: " +
+                            std::to_string(rc));
+        }
+    }
+
     return false;
 }
-
 // MQTTClientManager实现
 
 // 获取单例实例
@@ -425,6 +555,135 @@ void MQTTClientManager::cleanup() {
     clients.clear();
     Logger::info("Cleaned up all MQTT clients");
 }
+
+// 检查所有客户端的健康状态并尝试恢复
+int MQTTClientManager::checkAndRecoverClients() {
+    std::lock_guard<std::mutex> lock(mutex);
+    int healthyCount = 0;
+
+    Logger::debug("Checking health of " + std::to_string(clients.size()) + " MQTT clients");
+
+    for (auto& pair : clients) {
+        try {
+            const std::string& clientName = pair.first;
+            auto& client = pair.second;
+
+            bool healthy = client->checkHealth();
+
+            if (healthy) {
+                healthyCount++;
+            } else {
+                int64_t disconnectedTime = client->getStatusDuration();
+                Logger::warning("MQTT client " + clientName + " is unhealthy, disconnected for " +
+                                std::to_string(disconnectedTime) + " seconds");
+
+                // 对长时间断开连接的客户端进行强制重连
+                if (disconnectedTime > 300) { // 5分钟
+                    Logger::info("Forcing reconnect for long-disconnected client: " + clientName);
+                    if (client->forceReconnect()) {
+                        healthyCount++;
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger::error("Error checking MQTT client health: " + std::string(e.what()));
+        }
+    }
+
+    return healthyCount;
+}
+
+// 设置MQTT连接健康检查的间隔时间
+void MQTTClientManager::setHealthCheckInterval(int intervalSeconds) {
+    if (intervalSeconds < 1) {
+        Logger::warning("Invalid health check interval, must be at least 1 second");
+        intervalSeconds = 1;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    healthCheckIntervalSeconds = intervalSeconds;
+    Logger::info("Set MQTT health check interval to " + std::to_string(intervalSeconds) + " seconds");
+}
+
+// 启动周期性健康检查
+void MQTTClientManager::startPeriodicHealthCheck() {
+    // 先停止现有的检查
+    stopPeriodicHealthCheck();
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    // 启动新的健康检查线程
+    healthCheckRunning = true;
+    healthCheckThread = std::thread(&MQTTClientManager::healthCheckLoop, this);
+
+    Logger::info("Started periodic MQTT health check (interval: " +
+                 std::to_string(healthCheckIntervalSeconds) + " seconds)");
+}
+
+// 停止周期性健康检查
+void MQTTClientManager::stopPeriodicHealthCheck() {
+    bool wasRunning = false;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        wasRunning = healthCheckRunning;
+        healthCheckRunning = false;
+    }
+
+    if (wasRunning && healthCheckThread.joinable()) {
+        healthCheckThread.join();
+        Logger::info("Stopped periodic MQTT health check");
+    }
+}
+
+// 设置全局重连策略
+void MQTTClientManager::setGlobalReconnectPolicy(bool enable, int maxAttempts,
+                                                 int initialDelayMs, int maxDelayMs) {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    for (auto& pair : clients) {
+        try {
+            pair.second->setReconnectPolicy(enable, maxAttempts, initialDelayMs, maxDelayMs);
+        } catch (const std::exception& e) {
+            Logger::error("Error setting reconnect policy for MQTT client " + pair.first +
+                          ": " + e.what());
+        }
+    }
+
+    Logger::info("Set global MQTT reconnect policy: enabled=" + std::string((enable ? "true" : "false")) +
+                 ", maxAttempts=" + std::to_string(maxAttempts) + ", initialDelay=" +
+                 std::to_string(initialDelayMs) + "ms, maxDelay=" + std::to_string(maxDelayMs) + "ms");
+}
+
+// 健康检查线程函数
+void MQTTClientManager::healthCheckLoop() {
+    Logger::info("MQTT health check loop started");
+
+    while (healthCheckRunning) {
+        try {
+            int healthyCount = checkAndRecoverClients();
+            int totalCount = 0;
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                totalCount = clients.size();
+            }
+
+            Logger::debug("MQTT health check: " + std::to_string(healthyCount) + "/" +
+                          std::to_string(totalCount) + " clients healthy");
+        } catch (const std::exception& e) {
+            Logger::error("Error in MQTT health check loop: " + std::string(e.what()));
+        }
+
+        // 使用sleep_for的好处是可以更快地响应停止请求
+        for (int i = 0; i < healthCheckIntervalSeconds && healthCheckRunning; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    Logger::info("MQTT health check loop stopped");
+}
+
 
 // 析构函数
 MQTTClientManager::~MQTTClientManager() {

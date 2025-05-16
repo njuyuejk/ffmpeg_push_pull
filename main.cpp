@@ -39,6 +39,31 @@ void globalSignalHandler(int signal) {
  * @return 程序返回代码
  */
 int main(int argc, char* argv[]) {
+
+//    std::cout << "===============================================\n";
+//    std::cout << "         ███████╗ █████╗  █████╗ ██╗\n";
+//    std::cout << "         ██╔════╝██╔══██╗██╔══██╗██║\n";
+//    std::cout << "         ███████╗╚█████╔╝███████║██║\n";
+//    std::cout << "         ╚════██║██╔══██╗██╔══██║██║\n";
+//    std::cout << "         ███████║╚█████╔╝██║  ██║██║\n";
+//    std::cout << "         ╚══════╝ ╚════╝ ╚═╝  ╚═╝╚═╝\n";
+//    std::cout << "===============================================\n";
+//    std::cout << "\n";
+
+//    // 初始化日志系统
+//    LogLevel logLevel = static_cast<LogLevel>(1);
+//    Logger::init(true, "./logs", logLevel);
+
+    Logger::info("Starting 58AI Program... \n"
+                          "===============================================\n"
+                          "         ███████╗ █████╗  █████╗ ██╗\n"
+                          "         ██╔════╝██╔══██╗██╔══██╗██║\n"
+                          "         ███████╗╚█████╔╝███████║██║\n"
+                          "         ╚════██║██╔══██╗██╔══██║██║\n"
+                          "         ███████║╚█████╔╝██║  ██║██║\n"
+                          "         ╚══════╝ ╚════╝ ╚═╝  ╚═╝╚═╝\n"
+                          "===============================================\n");
+
     // 设置信号处理器
     signal(SIGINT, globalSignalHandler);
     signal(SIGTERM, globalSignalHandler);
@@ -53,14 +78,23 @@ int main(int argc, char* argv[]) {
         if (!app.initialize("./config.json")) {
             return 1;
         }
-
         // 运行应用程序
         int result = app.run();
+
+        std::cout << "program run result is: " << result << std::endl;
 
         // 清理资源
         app.cleanup();
 
-        return result;
+        // 添加超时强制退出机制
+        std::thread forceExitThread([]() {
+            std::this_thread::sleep_for(std::chrono::seconds(5)); // 5秒超时
+            std::cerr << "强制退出：程序清理超时" << std::endl;
+            std::_Exit(1); // 强制终止进程
+        });
+        forceExitThread.detach(); // 分离线程使其独立运行
+
+        return 0;
     } catch (const std::exception& e) {
         std::cerr << "Fatal error: " << e.what() << std::endl;
 

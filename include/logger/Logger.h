@@ -9,6 +9,7 @@
 #include <ctime>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <atomic>
 
 enum class LogLevel {
     DEBUG,
@@ -21,10 +22,19 @@ enum class LogLevel {
 class Logger {
 public:
     // 初始化日志系统
-    static void init(bool logToFile = true, const std::string& logDir = "logs", LogLevel minLevel = LogLevel::INFO);
+    static void init(bool logToFile = false, const std::string& logDir = "logs", LogLevel minLevel = LogLevel::INFO);
 
     // 关闭日志系统
     static void shutdown();
+
+    // 第一阶段：准备关闭
+    static void prepareShutdown();
+
+    // 第二阶段：最终关闭
+    static void finalizeShutdown();
+
+    // 关闭过程中的日志
+    static void shutdownMessage(const std::string& message);
 
     // 日志方法
     static void debug(const std::string& message);
@@ -54,6 +64,10 @@ private:
 
     // 获取目录中的所有文件
     static std::vector<std::string> getFilesInDirectory(const std::string& directory);
+
+    // 使用原子变量避免竞态条件
+    static std::atomic<bool> isShuttingDown;
+    static std::atomic<int> shutdownPhase; // 0=正常, 1=准备关闭, 2=最终关闭
 
     // 静态成员变量
     static std::mutex logMutex;

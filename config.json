@@ -8,8 +8,17 @@
     "autoRestartStreams": true,
     "useWatchdog": true,
     "watchdogInterval": 5,
+    "dirPath": "/root/data",
+    "http_server": {
+      "host": "127.0.0.1",
+      "port": 9000,
+      "connection_timeout": 5,
+      "read_timeout": 5
+    },
     "extraOptions": {
-      "periodicReconnectInterval": 180
+      "periodicReconnectInterval": 180,
+      "mqttMonitoringEnabled": true,
+      "mqttHealthCheckInterval": 30
     }
   },
   "mqtt_servers": [
@@ -85,6 +94,8 @@
       "width": 0,
       "height": 0,
       "pushEnabled": true,
+      "aiEnabled": true,
+      "modelType": 1,
       "extraOptions": {
         "autoStart": true,
         "maxReconnectAttempts": 5,

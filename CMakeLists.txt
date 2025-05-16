@@ -3,11 +3,26 @@ project(ffmpeg_pull_push)
 
 set(CMAKE_CXX_STANDARD 17)
 
+# GDB调试设置
+set(CMAKE_BUILD_TYPE Debug)
+add_definitions("-Wall -g")
+
 # 设置 FFmpeg 的根目录
 set(FFMPEG_ROOT "D:/project/C++/my/ffmpeg-multi/ffmpeg4")
 
 # 设置第三方库的根目录
 set(THIRD_PARTY_DIR "D:/project/C++/my/ffmpeg_push_pull/hkvision")
+
+include_directories("D:/project/C++/my/ffmpeg_push_pull/protobuf/include")
+
+# 添加Abseil
+include(FetchContent)
+FetchContent_Declare(
+        absl
+        GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+        GIT_TAG master  # 您可以使用特定版本，如20230125.3
+)
+FetchContent_MakeAvailable(absl)
 
 # 添加包含目录
 include_directories(include)
@@ -129,6 +144,23 @@ foreach(lib ${MQTT_LIBS})
 endforeach()
 
 
+# skip 3rd-party lib dependencies
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--allow-shlib-undefined")
+
+# rknn api
+#set(RKNN_API_PATH ${CMAKE_SOURCE_DIR}/RKNN/RK3588/${CMAKE_SYSTEM_NAME}/librknn_api)
+set(RKNN_API_PATH ${CMAKE_SOURCE_DIR}/RKNN/RK3588/Linux/librknn_api)
+set(LIB_ARCH aarch64)
+set(RKNN_RT_LIB "D:/project/C++/my/ffmpeg_push_pull/RKNN/RK3588/Linux/librknn_api/aarch64/librknnrt.so")
+include_directories("${RKNN_API_PATH}/include")
+include_directories("${CMAKE_SOURCE_DIR}/include/3rdparty")
+
+#rga
+set(RGA_PATH ${CMAKE_SOURCE_DIR}/include/3rdparty/rga/RK3588)
+set(LIB_ARCH aarch64)
+set(RGA_LIB ${RGA_PATH}/lib/Linux/${LIB_ARCH}/librga.so)
+include_directories( ${RGA_PATH}/include)
+set(CMAKE_INSTALL_RPATH "lib")
 
 set(app
         src/app/Application.cpp
@@ -144,6 +176,8 @@ set(common
         include/common/opencv2avframe.h
         src/common/opencv2avframe.cpp
         include/http/httplib.h
+        include/common/utils.h
+        src/common/utils.cpp
 )
 
 set(ffmpeg_base
@@ -167,9 +201,73 @@ set(logger
 set(mqtt
         src/mqtt/mqtt_sync_client.cpp
         include/mqtt/mqtt_sync_client.h
+        include/mqtt/PTZControl.pb.h
+        src/mqtt/PTZControl.pb.cc
+        include/mqtt/PTZControlHandler.h
+        src/mqtt/PTZControlHandler.cpp
+        include/mqtt/AIDataResponse.pb.h
+        src/mqtt/AIDataResponse.pb.cc
 )
 
-add_executable(ffmpeg_pull_push main.cpp ${app} ${common} ${ffmpeg_base} ${logger} ${mqtt})
+set(ai_service
+        include/AIService/postprocess.h
+        include/AIService/rknnPool.h
+        src/AIService/postprocess.cpp
+        src/AIService/rknnPool.cpp
+        include/AIService/preprocess.h
+        src/AIService/preprocess.cpp
+        include/AIService/lprnetPostprocess.h
+        src/AIService/lprnetPostprocess.cpp
+        src/AIService/lprnetPool.cpp
+        include/AIService/lprnetPool.h
+        include/AIService/lprnetPool.h
+        include/common/plateCorners.h
+        src/common/plateCorners.cpp
+        src/AIService/postprocess_p2.cpp
+        include/AIService/postprocess_p2.h
+        include/AIService/postprocess_pose.h
+        src/AIService/postprocess_pose.cpp
+        include/AIService/rknnPool_Pose.h
+        src/AIService/rknnPool_Pose.cpp
+        include/AIService/postprocess_seg.h
+        src/AIService/postprocess_seg.cpp
+        include/AIService/rknnPool_Seg.h
+        src/AIService/rknnPool_Seg.cpp
+)
+
+# 所有库源文件
+set(LIB_SOURCES
+        ${app}
+        ${common}
+        ${ffmpeg_base}
+        ${logger}
+        ${mqtt}
+        ${ai_service}
+)
+
+# 创建静态库 (可根据需要改为 SHARED 库)
+add_library(ffmpeg_processor SHARED ${LIB_SOURCES})
+
+# 为库设置属性
+set_target_properties(ffmpeg_processor PROPERTIES
+        VERSION 1.0.0
+        SOVERSION 1
+        PUBLIC_HEADER "include/app/Application.h;include/common/StreamConfig.h;include/ffmpeg_base/MultiStreamManager.h;include/AIService/lprnetPool.h"
+)
+
+# 链接库依赖
+target_link_libraries(ffmpeg_processor PRIVATE
+        ${FOUND_FFMPEG_LIBS}
+        ${FOUND_OPENCV_LIBS}
+        ${FOUND_MQTT_LIBS}
+        ${Protobuf_LIBRARIES}
+        ${RKNN_RT_LIB}
+        ${RGA_LIB}
+        ${ai_service}
+        pthread
+)
+
+add_executable(ffmpeg_pull_push main.cpp ${app} ${common} ${ffmpeg_base} ${logger} ${mqtt} ${ai_service})
 
 # 链接 FFmpeg 库
-target_link_libraries(ffmpeg_pull_push PRIVATE ${FOUND_FFMPEG_LIBS} ${FOUND_OPENCV_LIBS} ${FOUND_MQTT_LIBS} ws2_32 pthread)
+target_link_libraries(ffmpeg_pull_push PRIVATE ffmpeg_processor ${FOUND_FFMPEG_LIBS} ${FOUND_OPENCV_LIBS} ${FOUND_MQTT_LIBS} ${RKNN_RT_LIB} ${RGA_LIB} ws2_32 pthread)

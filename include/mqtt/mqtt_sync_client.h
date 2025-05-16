@@ -12,7 +12,9 @@
 #include <mutex>
 #include <functional>
 #include <memory>
-#include "mqttClient.h"
+#include <atomic>
+#include <thread>
+#include "MQTTClient.h"
 #include "logger/Logger.h"
 
 
@@ -78,6 +80,8 @@ public:
      */
     using MessageCallback = std::function<void(const std::string&, const std::string&)>;
 
+    using MessageCallback1 = std::function<void(const std::string&, MQTTClient_message&)>;
+
     /**
      * @brief 订阅主题
      * @param topic 主题名称
@@ -86,6 +90,8 @@ public:
      * @return 是否成功订阅
      */
     bool subscribe(const std::string& topic, int qos, MessageCallback callback);
+
+    bool subscribe(const std::string& topic, int qos, MessageCallback1 callback);
 
     /**
      * @brief 取消订阅主题
@@ -127,6 +133,57 @@ public:
      */
     std::string getClientId() const { return clientId; }
 
+    /**
+    * @brief 检查客户端健康状态
+    * @return 是否健康
+    */
+    bool checkHealth();
+
+    /**
+     * @brief 获取重连尝试次数
+     * @return 重连尝试次数
+     */
+    int getReconnectAttempts() const { return reconnectAttempts; }
+
+    /**
+     * @brief 获取上次重连时间
+     * @return 上次重连时间（秒，Unix时间戳）
+     */
+    int64_t getLastReconnectTime() const { return lastReconnectTime; }
+
+    /**
+     * @brief 获取上次连接断开时间
+     * @return 上次连接断开时间（秒，Unix时间戳）
+     */
+    int64_t getLastDisconnectTime() const { return lastDisconnectTime; }
+
+    /**
+     * @brief 获取连接状态持续时间（秒）
+     * @return 如果已连接，返回连接持续时间；如果断开，返回断开持续时间
+     */
+    int64_t getStatusDuration() const;
+
+    /**
+     * @brief 强制重连
+     * @return 是否重连成功
+     */
+    bool forceReconnect();
+
+    /**
+     * @brief 重置重连计数器
+     */
+    void resetReconnectAttempts() { reconnectAttempts = 0; }
+
+    /**
+     * @brief 设置自动重连策略
+     * @param enable 是否启用自动重连
+     * @param maxAttempts 最大重试次数，0表示无限制
+     * @param initialDelayMs 初始重连延迟（毫秒）
+     * @param maxDelayMs 最大重连延迟（毫秒）
+     */
+    void setReconnectPolicy(bool enable, int maxAttempts = 0,
+                            int initialDelayMs = 1000, int maxDelayMs = 30000);
+
 private:
     // MQTT客户端实例
     MQTTClient client;
@@ -150,9 +207,20 @@ private:
 
     // 订阅主题的回调函数映射
     std::map<std::string, MessageCallback> topicCallbacks;
+    std::map<std::string, MessageCallback1> topicMessageCallbacks;
 
     // 连接断开回调函数
     std::function<void(const std::string&)> connectionLostCallback;
+
+    // 重连相关参数
+    std::atomic<int> reconnectAttempts{0};
+    std::atomic<int64_t> lastReconnectTime{0};
+    std::atomic<int64_t> lastDisconnectTime{0};
+    std::atomic<int64_t> connectionStartTime{0};
+    std::atomic<bool> autoReconnect{true};
+    int maxReconnectAttempts{0};  // 0表示无限制
+    int initialReconnectDelayMs{1000};
+    int maxReconnectDelayMs{30000};
 
     // 静态回调函数，用于MQTT库回调
     static int messageArrivedCallback(void* context, char* topicName, int topicLen, MQTTClient_message* message);
@@ -160,6 +228,9 @@ private:
 
     // 尝试重新连接
     bool reconnect();
+
+    // 计算当前重连延迟（指数退避）
+    int calculateReconnectDelay() const;
 };
 
 /**
@@ -219,13 +290,52 @@ public:
     void cleanup();
 
     /**
+     * @brief 检查所有客户端的健康状态并尝试恢复
+     * @return 健康状态的客户端数量
+     */
+    int checkAndRecoverClients();
+
+    /**
+     * @brief 设置MQTT连接健康检查的间隔时间
+     * @param intervalSeconds 健康检查间隔（秒）
+     */
+    void setHealthCheckInterval(int intervalSeconds);
+
+    /**
+     * @brief 获取MQTT连接健康检查的间隔时间
+     * @return 健康检查间隔（秒）
+     */
+    int getHealthCheckInterval() const { return healthCheckIntervalSeconds; }
+
+    /**
+     * @brief 启动周期性健康检查
+     */
+    void startPeriodicHealthCheck();
+
+    /**
+     * @brief 停止周期性健康检查
+     */
+    void stopPeriodicHealthCheck();
+
+    /**
+     * @brief 设置全局重连策略
+     * @param enable 是否启用自动重连
+     * @param maxAttempts 最大重试次数，0表示无限制
+     * @param initialDelayMs 初始重连延迟（毫秒）
+     * @param maxDelayMs 最大重连延迟（毫秒）
+     */
+    void setGlobalReconnectPolicy(bool enable, int maxAttempts = 0,
+                                  int initialDelayMs = 1000, int maxDelayMs = 30000);
+
+    /**
      * @brief 析构函数
      */
     ~MQTTClientManager();
 
 private:
     // 私有构造函数
-    MQTTClientManager() = default;
+    MQTTClientManager() : healthCheckIntervalSeconds(30),
+                          healthCheckRunning(false) {}
 
     // 禁止拷贝和赋值
     MQTTClientManager(const MQTTClientManager&) = delete;
@@ -236,6 +346,14 @@ private:
 
     // MQTT客户端映射表
     std::map<std::string, std::shared_ptr<MQTTClientWrapper>> clients;
+
+    // 健康检查相关
+    int healthCheckIntervalSeconds;
+    std::atomic<bool> healthCheckRunning;
+    std::thread healthCheckThread;
+
+    // 健康检查线程函数
+    void healthCheckLoop();
 };
 
 #endif //FFMPEG_PULL_PUSH_MQTT_SYNC_CLIENT_H
