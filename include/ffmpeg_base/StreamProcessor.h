@@ -25,8 +25,8 @@ extern "C" {
 class StreamProcessor {
 public:
     // 帧处理回调函数类型定义
-    using VideoFrameCallback = std::function<void(const AVFrame* frame, int64_t pts)>;
-    using AudioFrameCallback = std::function<void(const AVFrame* frame, int64_t pts)>;
+    using VideoFrameCallback = std::function<void(const AVFrame* frame, int64_t pts, int fps)>;
+    using AudioFrameCallback = std::function<void(const AVFrame* frame, int64_t pts, int fps)>;
 public:
     /**
      * @brief 构造函数
@@ -178,14 +178,14 @@ private:
  * @param frame 解码后的视频帧
  * @param pts 时间戳
  */
-    void handleVideoFrame(const AVFrame* frame, int64_t pts);
+    void handleVideoFrame(const AVFrame* frame, int64_t pts, int fps);
 
     /**
      * @brief 处理音频帧
      * @param frame 解码后的音频帧
      * @param pts 时间戳
      */
-    void handleAudioFrame(const AVFrame* frame, int64_t pts);
+    void handleAudioFrame(const AVFrame* frame, int64_t pts, int fps);
 };
 
 #endif // STREAM_PROCESSOR_H

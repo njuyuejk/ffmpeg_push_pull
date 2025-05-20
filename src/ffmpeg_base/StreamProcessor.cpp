@@ -410,7 +410,7 @@ AVBufferRef* StreamProcessor::createHardwareDevice() {
                 AV_HWDEVICE_TYPE_D3D11VA,    // DirectX 11 (Windows)
                 AV_HWDEVICE_TYPE_DXVA2,      // DirectX (Windows)
                 AV_HWDEVICE_TYPE_VIDEOTOOLBOX, // Apple
-#if 0
+#if 1
                 AV_HWDEVICE_TYPE_RKMPP       // RK3588
 #endif
         };
@@ -488,7 +488,7 @@ const AVCodec* StreamProcessor::getEncoderByHardwareType(AVHWDeviceType hwType, 
             case AV_HWDEVICE_TYPE_DXVA2:
                 encoderCandidates = {"h264_amf", "h264_nvenc"};  // 尝试AMD和NVIDIA
                 break;
-#if 0
+#if 1
             case AV_HWDEVICE_TYPE_RKMPP:
                 encoderCandidates = {"h264_rkmpp"};
                 break;
@@ -517,7 +517,7 @@ const AVCodec* StreamProcessor::getEncoderByHardwareType(AVHWDeviceType hwType, 
             case AV_HWDEVICE_TYPE_DXVA2:
                 encoderCandidates = {"hevc_amf", "hevc_nvenc"};
                 break;
-#if 0
+#if 1
             case AV_HWDEVICE_TYPE_RKMPP:
                 encoderCandidates = {"hevc_rkmpp"};
                 break;
@@ -610,7 +610,18 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
     streamCtx.inputStream = inputStream;
 
     // 查找解码器
-    const AVCodec* decoder = avcodec_find_decoder(inputStream->codecpar->codec_id);
+//    const AVCodec* codec = avcodec_find_decoder(inputStream->codecpar->codec_id);
+
+    std::string base_name;
+    if (inputStream->codecpar->codec_id == AV_CODEC_ID_H264) {
+        base_name = "h264_rkmpp";
+    } else if (inputStream->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+        base_name = "hevc_rkmpp";
+    } else {
+        // 对其他编码直接软解
+        base_name =  std::string(avcodec_get_name(inputStream->codecpar->codec_id));
+    }
+    const AVCodec* decoder = avcodec_find_decoder_by_name(base_name.c_str());
     if (!decoder) {
         Logger::warning("Unsupported video codec");
         return;
@@ -648,6 +659,16 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
 
     // 打开解码器
     AVDictionary* decoderOptions = nullptr;
+
+    if (config_.hwaccelType == "rkmpp") {
+        av_dict_set(&decoderOptions, "output_format", "nv12", 0);
+        av_dict_set(&decoderOptions, "zero_copy_mode", "0", 0);  // Disable zero copy to avoid DRM_PRIME format
+
+        // Additional RKMPP specific options
+        av_dict_set(&decoderOptions, "use_direct_mode", "0", 0);
+        Logger::info("Set up RKMPP decoder to use NV12 output format");
+    }
+
     // 设置解码器选项
     for (const auto& [key, value] : config_.extraOptions) {
         if (key.find("decoder_") == 0) {
@@ -1111,9 +1132,21 @@ void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
     StreamContext streamCtx;
     streamCtx.streamIndex = inputStream->index;
     streamCtx.inputStream = inputStream;
+    streamCtx.inputStream = inputStream;
 
     // 查找解码器
-    const AVCodec* decoder = avcodec_find_decoder(inputStream->codecpar->codec_id);
+//    const AVCodec* codec = avcodec_find_decoder(inputStream->codecpar->codec_id);
+
+    std::string base_name;
+    if (inputStream->codecpar->codec_id == AV_CODEC_ID_H264) {
+        base_name = "h264_rkmpp";
+    } else if (inputStream->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+        base_name = "hevc_rkmpp";
+    } else {
+        // 对其他编码直接软解
+        base_name =  std::string(avcodec_get_name(inputStream->codecpar->codec_id));
+    }
+    const AVCodec* decoder = avcodec_find_decoder_by_name(base_name.c_str());
     if (!decoder) {
         Logger::warning("Unsupported video codec");
         return;
@@ -1151,6 +1184,16 @@ void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
 
     // 使用选项打开解码器
     AVDictionary* decoderOptions = nullptr;
+
+    if (config_.hwaccelType == "rkmpp") {
+        av_dict_set(&decoderOptions, "output_format", "nv12", 0);
+        av_dict_set(&decoderOptions, "zero_copy_mode", "0", 0);  // Disable zero copy to avoid DRM_PRIME format
+
+        // Additional RKMPP specific options
+        av_dict_set(&decoderOptions, "use_direct_mode", "0", 0);
+        Logger::info("Set up RKMPP decoder to use NV12 output format");
+    }
+
     // 设置解码器选项
     for (const auto& [key, value] : config_.extraOptions) {
         if (key.find("decoder_") == 0) {
@@ -1177,6 +1220,8 @@ void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
             throw FFmpegException("Failed to open video decoder", ret);
         }
     }
+
+    Logger::info("stream fps is: " + std::to_string(av_q2d(inputStream->avg_frame_rate)));
 
     // 由于我们不推流，将输出流设为 nullptr
     streamCtx.outputStream = nullptr;
@@ -1318,8 +1363,38 @@ void StreamProcessor::processLoop() {
                     // 处理各种错误情况
                     // ... (与之前相同的代码)
                     if (ret == AVERROR_EOF) {
-                        Logger::info("End of input stream: " + config_.id);
-                        break;
+
+                        if (config_.isLocalFile) {
+                            // 对于本地MP4文件，循环回到开始位置
+                            Logger::info("End of local file reached, seeking back to beginning: " + config_.id);
+
+                            // 定位到文件开始位置
+                            ret = av_seek_frame(inputFormatContext_, -1, 0, AVSEEK_FLAG_BACKWARD);
+                            if (ret < 0) {
+                                Logger::error("Failed to seek to the beginning of the file: " + config_.id);
+                                break;
+                            }
+
+                            // 刷新所有解码器以清除其内部状态
+                            for (auto& streamCtx : videoStreams_) {
+                                if (streamCtx.decoderContext) {
+                                    avcodec_flush_buffers(streamCtx.decoderContext);
+                                }
+                            }
+
+                            for (auto& streamCtx : audioStreams_) {
+                                if (streamCtx.decoderContext) {
+                                    avcodec_flush_buffers(streamCtx.decoderContext);
+                                }
+                            }
+
+                            // 更新时间戳以防止停滞检测
+                            lastFrameTime_ = av_gettime();
+                            continue;
+                        } else {
+                            Logger::info("End of input stream: " + config_.id);
+                            break;
+                        }
                     } else if (ret == AVERROR(EAGAIN)) {
                         av_usleep(10000);  // 休眠10毫秒
                         continue;
@@ -1516,6 +1591,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
             // 接收解码后的帧
             ret = avcodec_receive_frame(streamCtx.decoderContext, streamCtx.frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                Logger::debug("decoder frame is failed, errorCode is: " + std::to_string(ret));
                 break;
             } else if (ret < 0) {
                 throw FFmpegException("Error receiving frame from decoder", ret);
@@ -1533,8 +1609,62 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 pts = av_rescale_q(pts, streamCtx.inputStream->time_base, {1, 1000});
             }
 
+            Logger::debug("帧格式为: " + std::to_string(streamCtx.frame->format) + " 硬件帧格式为: " + std::to_string(streamCtx.hwFrame->format));
+
+            if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME) {
+                Logger::debug("Detected DRM_PRIME format (179), converting to NV12 for processing");
+
+                // Prepare the hw frame for NV12 format
+                streamCtx.hwFrame->width = streamCtx.frame->width;
+                streamCtx.hwFrame->height = streamCtx.frame->height;
+                streamCtx.hwFrame->format = AV_PIX_FMT_NV12;  // Force NV12 format
+
+                // Allocate frame buffer if needed
+                if (!streamCtx.hwFrame->data[0]) {
+                    ret = av_frame_get_buffer(streamCtx.hwFrame, 32);  // 32-byte alignment
+                    if (ret < 0) {
+                        throw FFmpegException("Failed to allocate buffer for NV12 frame conversion", ret);
+                    }
+                }
+
+                // Try standard hardware frame transfer
+                ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
+                if (ret < 0) {
+                    // If standard transfer fails, we need to handle this in a specialized way
+                    Logger::warning("Standard hardware frame transfer failed for DRM_PRIME, using fallback method");
+
+                    // RKMPP specific handling - If needed, implement custom mapping here
+                    // This is placeholder code - actual implementation depends on your SDK
+
+                    // Just to avoid throwing an exception in this example:
+                    if (streamCtx.swsContext == nullptr) {
+                        streamCtx.swsContext = sws_getContext(
+                                streamCtx.frame->width, streamCtx.frame->height,
+                                AV_PIX_FMT_YUV420P,  // Pretend it's YUV420P as an intermediate
+                                streamCtx.frame->width, streamCtx.frame->height,
+                                AV_PIX_FMT_NV12,
+                                SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
+                        );
+
+                        if (!streamCtx.swsContext) {
+                            throw FFmpegException("Failed to create scaling context for DRM_PRIME conversion");
+                        }
+                    }
+
+                    // This is a last resort fallback - it might not work correctly
+                    // depending on how RKMPP exposes the actual pixel data
+                    sws_scale(streamCtx.swsContext, streamCtx.frame->data,
+                              streamCtx.frame->linesize, 0, streamCtx.frame->height,
+                              streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
+                }
+
+                hwFrameUsed = true;
+
+                Logger::debug("DRM_PRIME frame converted to NV12 format");
+            }
+
             // 调用帧处理函数
-            handleVideoFrame(streamCtx.frame, pts);
+            handleVideoFrame(streamCtx.hwFrame, pts, (int)av_q2d(streamCtx.inputStream->avg_frame_rate));
 
             // 如果是仅拉流模式，我们不需要编码或写入帧
             if (!config_.pushEnabled) {
@@ -1774,7 +1904,7 @@ void StreamProcessor::processAudioPacket(AVPacket* packet, StreamContext& stream
         }
 
         // 调用帧处理函数
-        handleAudioFrame(streamCtx.frame, pts);
+        handleAudioFrame(streamCtx.frame, pts, (int)av_q2d(streamCtx.inputStream->avg_frame_rate));
 
         // 如果是仅拉流模式，我们不需要编码或写入帧
         if (!config_.pushEnabled) {
@@ -2046,11 +2176,11 @@ void StreamProcessor::setAudioFrameCallback(AudioFrameCallback callback) {
 }
 
 // 处理视频帧的方法
-void StreamProcessor::handleVideoFrame(const AVFrame* frame, int64_t pts) {
+void StreamProcessor::handleVideoFrame(const AVFrame* frame, int64_t pts, int fps) {
     std::lock_guard<std::mutex> lock(callbackMutex_);
     if (videoFrameCallback_) {
         try {
-            videoFrameCallback_(frame, pts);
+            videoFrameCallback_(frame, pts, fps);
         } catch (const std::exception& e) {
             Logger::error("Exception in video frame callback: " + std::string(e.what()));
         } catch (...) {
@@ -2060,11 +2190,11 @@ void StreamProcessor::handleVideoFrame(const AVFrame* frame, int64_t pts) {
 }
 
 // 处理音频帧的方法
-void StreamProcessor::handleAudioFrame(const AVFrame* frame, int64_t pts) {
+void StreamProcessor::handleAudioFrame(const AVFrame* frame, int64_t pts, int fps) {
     std::lock_guard<std::mutex> lock(callbackMutex_);
     if (audioFrameCallback_) {
         try {
-            audioFrameCallback_(frame, pts);
+            audioFrameCallback_(frame, pts, fps);
         } catch (const std::exception& e) {
             Logger::error("Exception in audio frame callback: " + std::string(e.what()));
         } catch (...) {

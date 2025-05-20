@@ -39,9 +39,11 @@ int AppConfig::threadPoolSize = 4;
 std::map<std::string, std::string> AppConfig::extraOptions;
 bool AppConfig::useWatchdog = true;
 int AppConfig::watchdogInterval = 5;
+std::string AppConfig::dirPath = "/root/data";
 
 // 初始化静态成员
 std::vector<MQTTServerConfig> AppConfig::mqttServers;
+HTTPServerConfig AppConfig::httpServerConfig;
 
 
 StreamConfig StreamConfig::createDefault() {
@@ -51,6 +53,9 @@ StreamConfig StreamConfig::createDefault() {
     config.outputUrl = "rtmp://example.com/live/stream";
     config.outputFormat = "flv";
     config.pushEnabled = true;
+    config.aiEnabled = false;
+    config.isLocalFile = false;
+    config.modelType = 1;
     config.videoCodec = "libx264";
     config.audioCodec = "aac";
     config.lowLatencyMode = true;
@@ -83,6 +88,9 @@ StreamConfig StreamConfig::fromJson(const json& j) {
     if (j.contains("outputUrl") && j["outputUrl"].is_string()) config.outputUrl = j["outputUrl"];
     if (j.contains("outputFormat") && j["outputFormat"].is_string()) config.outputFormat = j["outputFormat"];
     if (j.contains("pushEnabled") && j["pushEnabled"].is_boolean()) config.pushEnabled = j["pushEnabled"];
+    if (j.contains("aiEnabled") && j["aiEnabled"].is_boolean()) config.aiEnabled = j["aiEnabled"];
+    if (j.contains("isLocalFile") && j["isLocalFile"].is_boolean()) config.isLocalFile = j["isLocalFile"];
+    if (j.contains("modelType") && j["modelType"].is_number()) config.modelType = j["modelType"];
     if (j.contains("videoCodec") && j["videoCodec"].is_string()) config.videoCodec = j["videoCodec"];
     if (j.contains("audioCodec") && j["audioCodec"].is_string()) config.audioCodec = j["audioCodec"];
 
@@ -100,6 +108,34 @@ StreamConfig StreamConfig::fromJson(const json& j) {
 
     // 硬件加速类型
     if (j.contains("hwaccelType") && j["hwaccelType"].is_string()) config.hwaccelType = j["hwaccelType"];
+
+    // 处理模型配置
+    config.models.clear();
+
+    // 新格式: 模型配置数组
+    if (j.contains("models") && j["models"].is_array()) {
+        for (const auto& modelJson : j["models"]) {
+            config.models.push_back(ModelConfig::fromJson(modelJson));
+        }
+    }
+        // 旧格式兼容: 单一模型类型
+    else if (j.contains("modelType") && j["modelType"].is_number()) {
+        ModelConfig modelCfg;
+        modelCfg.modelType = j["modelType"];
+        modelCfg.enabled = true;
+        config.models.push_back(modelCfg);
+    }
+        // 旧格式兼容: 模型类型数组
+    else if (j.contains("modelTypes") && j["modelTypes"].is_array()) {
+        for (const auto& type : j["modelTypes"]) {
+            if (type.is_number()) {
+                ModelConfig modelCfg;
+                modelCfg.modelType = type.get<int>();
+                modelCfg.enabled = true;
+                config.models.push_back(modelCfg);
+            }
+        }
+    }
 
     // 解析额外选项
     if (j.contains("extraOptions") && j["extraOptions"].is_object()) {
@@ -126,6 +162,9 @@ json StreamConfig::toJson() const {
     j["outputUrl"] = outputUrl;
     j["outputFormat"] = outputFormat;
     j["pushEnabled"] = pushEnabled;
+    j["aiEnabled"] = aiEnabled;
+    j["isLocalFile"] = isLocalFile;
+    j["modelType"] = modelType;
     j["videoCodec"] = videoCodec;
     j["audioCodec"] = audioCodec;
     j["videoBitrate"] = videoBitrate;
@@ -137,6 +176,13 @@ json StreamConfig::toJson() const {
     j["hwaccelType"] = hwaccelType;
     j["width"] = width;
     j["height"] = height;
+
+    // 添加模型配置数组
+    nlohmann::json modelsArray = nlohmann::json::array();
+    for (const auto& model : models) {
+        modelsArray.push_back(model.toJson());
+    }
+    j["models"] = modelsArray;
 
     // 额外选项
     json extraOptionsJson;
@@ -225,6 +271,30 @@ std::string StreamConfig::toString() const {
     return toJson().dump(2); // 格式化的JSON输出，缩进2个空格
 }
 
+// HTTP Server Config implementation
+HTTPServerConfig HTTPServerConfig::fromJson(const nlohmann::json& j) {
+    HTTPServerConfig config;
+
+    if (j.contains("host") && j["host"].is_string())
+        config.host = j["host"];
+
+    if (j.contains("port") && j["port"].is_number_integer())
+        config.port = j["port"];
+
+    if (j.contains("connection_timeout") && j["connection_timeout"].is_number_integer())
+        config.connectionTimeout = j["connection_timeout"];
+
+    return config;
+}
+
+nlohmann::json HTTPServerConfig::toJson() const {
+    nlohmann::json j;
+    j["host"] = host;
+    j["port"] = port;
+    j["connection_timeout"] = connectionTimeout;
+    return j;
+}
+
 // AppConfig 相关方法
 bool AppConfig::loadFromFile(const std::string& configFilePath) {
     std::ifstream file(configFilePath);
@@ -263,6 +333,16 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
 
             if (general.contains("watchdogInterval") && general["watchdogInterval"].is_number_integer())
                 watchdogInterval = general["watchdogInterval"];
+
+            if (general.contains("dirPath") && general["dirPath"].is_string())
+                dirPath = general["dirPath"];
+
+            // 加载HTTP服务器配置
+            if (general.contains("http_server") && general["http_server"].is_object()) {
+                httpServerConfig = HTTPServerConfig::fromJson(general["http_server"]);
+                Logger::info("Loaded HTTP server configuration: " + httpServerConfig.host + ":" +
+                             std::to_string(httpServerConfig.port));
+            }
 
             // 加载其他额外选项
             if (general.contains("extraOptions") && general["extraOptions"].is_object()) {
@@ -346,6 +426,10 @@ bool AppConfig::saveToFile(const std::string& configFilePath) {
         general["threadPoolSize"] = threadPoolSize;
         general["useWatchdog"] = useWatchdog;
         general["watchdogInterval"] = watchdogInterval;
+        general["dirPath"] = dirPath;
+
+        // 添加HTTP服务器配置
+        general["http_server"] = httpServerConfig.toJson();
 
         // 添加一些常见的应用设置
         general["monitorInterval"] = 30;
@@ -436,6 +520,10 @@ int AppConfig::getWatchdogInterval() {
     return watchdogInterval;
 }
 
+std::string AppConfig::getDirPath() {
+    return dirPath;
+}
+
 void AppConfig::addStreamConfig(const StreamConfig& config) {
     streamConfigs.push_back(config);
 }
@@ -484,6 +572,11 @@ bool AppConfig::removeStreamConfig(const std::string& id) {
 // MQTT配置获取器
 const std::vector<MQTTServerConfig>& AppConfig::getMQTTServers() {
     return mqttServers;
+}
+
+// HTTP服务器配置获取器
+const HTTPServerConfig& AppConfig::getHTTPServerConfig() {
+    return httpServerConfig;
 }
 
 // MQTTSubscriptionConfig实现
@@ -572,6 +665,65 @@ nlohmann::json MQTTServerConfig::toJson() const {
         subs.push_back(sub.toJson());
     }
     j["subscriptions"] = subs;
+
+    return j;
+}
+
+ModelConfig ModelConfig::fromJson(const nlohmann::json& j) {
+    ModelConfig config;
+
+    if (j.contains("modelType") && j["modelType"].is_number()) {
+        config.modelType = j["modelType"];
+    }
+
+    if (j.contains("enabled") && j["enabled"].is_boolean()) {
+        config.enabled = j["enabled"];
+    }
+
+    // 解析模型特定参数
+    if (j.contains("params") && j["params"].is_object()) {
+        for (auto& [key, value] : j["params"].items()) {
+            if (value.is_string()) {
+                config.modelParams[key] = value.get<std::string>();
+            } else if (value.is_number()) {
+                config.modelParams[key] = std::to_string(value.get<double>());
+            } else if (value.is_boolean()) {
+                config.modelParams[key] = value.get<bool>() ? "true" : "false";
+            }
+        }
+    }
+
+    return config;
+}
+
+nlohmann::json ModelConfig::toJson() const {
+    nlohmann::json j;
+    j["modelType"] = modelType;
+    j["enabled"] = enabled;
+
+    // 添加模型特定参数
+    nlohmann::json params;
+    for (const auto& [key, value] : modelParams) {
+        // 尝试将字符串转换为其他类型
+        if (value == "true" || value == "false") {
+            params[key] = (value == "true");
+        } else {
+            try {
+                // 尝试转换为数字
+                double numValue = std::stod(value);
+                // 检查是否为整数
+                if (numValue == std::floor(numValue)) {
+                    params[key] = static_cast<int>(numValue);
+                } else {
+                    params[key] = numValue;
+                }
+            } catch (...) {
+                // 非数字，保持为字符串
+                params[key] = value;
+            }
+        }
+    }
+    j["params"] = params;
 
     return j;
 }

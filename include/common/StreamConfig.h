@@ -6,6 +6,17 @@
 #include <vector>
 #include "nlohmann/json.hpp"  // 直接包含整个json.hpp
 
+
+struct ModelConfig {
+    int modelType = 0;            // 模型类型
+    bool enabled = true;          // 是否启用该模型
+    std::map<std::string, std::string> modelParams;  // 模型特定参数
+
+    // JSON序列化/反序列化方法
+    static ModelConfig fromJson(const nlohmann::json& j);
+    nlohmann::json toJson() const;
+};
+
 /**
  * @brief 流处理配置结构体
  * 包含输入输出流的各种参数配置
@@ -21,6 +32,12 @@ struct StreamConfig {
     std::string outputUrl;
     std::string outputFormat;
     bool pushEnabled = true;
+    bool aiEnabled = false;
+    bool isLocalFile = false;
+
+    std::vector<ModelConfig> models;  // 多个模型配置
+
+    int modelType = 1;
 
     // 编码配置
     std::string videoCodec;
@@ -113,6 +130,22 @@ struct MQTTServerConfig {
 };
 
 /**
+ * @brief HTTP 服务器配置
+ */
+struct HTTPServerConfig {
+    std::string host;
+    int port;
+    int connectionTimeout;
+
+    HTTPServerConfig() : host("127.0.0.1"), port(9000),
+                         connectionTimeout(5) {}
+
+    static HTTPServerConfig fromJson(const nlohmann::json& j);
+    nlohmann::json toJson() const;
+};
+
+
+/**
  * @brief 应用配置类
  * 包含整个应用程序的配置
  */
@@ -154,6 +187,7 @@ public:
      */
     static bool getUseWatchdog();
     static int getWatchdogInterval();
+    static std::string getDirPath();
 
     /**
      * @brief 获取全部流配置
@@ -189,6 +223,12 @@ public:
 
     static const std::vector<MQTTServerConfig>& getMQTTServers(); // 获取所有MQTT服务器配置
 
+    /**
+ * @brief 获取HTTP服务器配置
+ * @return HTTP服务器配置
+ */
+    static const HTTPServerConfig& getHTTPServerConfig();
+
 private:
     static std::vector<StreamConfig> streamConfigs;
     static bool logToFile;
@@ -199,7 +239,10 @@ private:
     static bool useWatchdog;
     static int watchdogInterval;
 
+    static std::string dirPath;
+
     static std::vector<MQTTServerConfig> mqttServers; // MQTT服务器配置列表
+    static HTTPServerConfig httpServerConfig; // HTTP服务器配置
 };
 
 #endif // STREAM_CONFIG_H
