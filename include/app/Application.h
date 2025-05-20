@@ -29,6 +29,9 @@ struct SingleModelEntry{
     int count; // 抽帧计数
     int modelType; // 模型类型
     bool isEnabled; //模型可用
+    bool warningFlag = false;                 // 此模型的警告状态
+    int timeCount = 0;                        // 此模型的时间计数器
+    std::map<std::string, std::string> params; // 模型特定参数
 };
 
 /**
@@ -164,7 +167,7 @@ private:
      */
     std::vector<std::unique_ptr<rknn_lite>> initModel(int modelType);
 
-    std::unique_ptr<rknn_lite> initSingleModel(int modelType);
+    std::unique_ptr<rknn_lite> initSingleModel(int modelType,  const std::map<std::string, std::string>& params);
 
     /**
      * @brief 视频帧的AI实时处理
@@ -177,6 +180,8 @@ private:
     void processDelayFrameAI(const std::string& streamId, const AVFrame* frame, int64_t pts, int fps);
 
     void test_model();
+
+    void handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult);
 
 private:
     // 成员变量

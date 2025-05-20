@@ -522,13 +522,38 @@ void Application::setupCustomFrameProcessing() {
 //            modelPools_.push_back(std::move(aiPool));
 
             // 单个模型，针对不需要实时性
-            std::unique_ptr<SingleModelEntry> aiPool = std::make_unique<SingleModelEntry>();
-            aiPool->streamId = streamId;
-            aiPool->count = 0;
-            aiPool->modelType = config.modelType;
-            aiPool->isEnabled = true;
-            aiPool->singleRKModel = initSingleModel(config.modelType);
-            singleModelPools_.push_back(std::move(aiPool));
+//            std::unique_ptr<SingleModelEntry> aiPool = std::make_unique<SingleModelEntry>();
+//            aiPool->streamId = streamId;
+//            aiPool->count = 0;
+//            aiPool->modelType = config.modelType;
+//            aiPool->isEnabled = true;
+//            aiPool->singleRKModel = initSingleModel(config.modelType);
+//            singleModelPools_.push_back(std::move(aiPool));
+
+            // 为该流定义的每个模型配置
+            for (const auto& modelConfig : config.models) {
+                // 跳过禁用的模型
+                if (!modelConfig.enabled) {
+                    Logger::info("流 " + streamId + " 的模型类型 " +
+                                 std::to_string(modelConfig.modelType) + " 已禁用");
+                    continue;
+                }
+
+                // 为这个类型创建一个模型条目
+                std::unique_ptr<SingleModelEntry> aiModel = std::make_unique<SingleModelEntry>();
+                aiModel->streamId = streamId;
+                aiModel->count = 0;
+                aiModel->modelType = modelConfig.modelType;
+                aiModel->isEnabled = true;  // 已在上面检查，此时肯定是启用的
+                aiModel->warningFlag = false;
+                aiModel->timeCount = 0;
+                aiModel->params = modelConfig.modelParams;  // 复制模型特定参数
+                aiModel->singleRKModel = initSingleModel(modelConfig.modelType, modelConfig.modelParams);
+                singleModelPools_.push_back(std::move(aiModel));
+
+                Logger::info("为流 " + streamId + " 添加了已启用的模型类型 " +
+                             std::to_string(modelConfig.modelType));
+            }
 
             if (processor) {
                 // 设置视频帧回调
@@ -995,32 +1020,69 @@ std::vector<std::unique_ptr<rknn_lite>> Application::initModel(int modelType) {
     std::vector<std::unique_ptr<rknn_lite>> rkpool;
 
     for (int i = 0; i < 6; ++i) {
-        auto rknn_ptr = std::make_unique<rknn_lite>(model_name, i % 3, modelType);
+        auto rknn_ptr = std::make_unique<rknn_lite>(model_name, i % 3, modelType, 0.5);
         rkpool.push_back(std::move(rknn_ptr));
     }
 
     return rkpool;
 }
 
-std::unique_ptr<rknn_lite> Application::initSingleModel(int modelType) {
+std::unique_ptr<rknn_lite> Application::initSingleModel(int modelType, const std::map<std::string, std::string>& params) {
 
-    char *model_name;
+    char *model_name = nullptr;
 
-    if (modelType == 1) {
-        model_name = "./model/yolov8-plate.rknn";
-    } else if (modelType == 3) {
-        model_name = "./model/yolov8n-fire-smoke.rknn";
-    } else if (modelType == 4) {
-        model_name = "./model/yolov8_relu_person_best.rknn";
-    } else if (modelType == 5) {
-        model_name = "./model/yolov8n-p2-uav.rknn";
-    } else if (modelType == 6) {
-        model_name = "./model/yolov8n-meter.rknn";
+//    if (modelType == 1) {
+//        model_name = "./model/yolov8-plate.rknn";
+//    } else if (modelType == 3) {
+//        model_name = "./model/yolov8n-fire-smoke.rknn";
+//    } else if (modelType == 4) {
+//        model_name = "./model/yolov8_relu_person_best.rknn";
+//    } else if (modelType == 5) {
+//        model_name = "./model/yolov8n-p2-uav.rknn";
+//    } else if (modelType == 6) {
+//        model_name = "./model/yolov8n-meter.rknn";
+//    }
+
+    switch (modelType) {
+        case 1:
+            model_name = "./model/yolov8-plate.rknn";
+            break;
+        case 3:
+            model_name = "./model/yolov8n-fire-smoke.rknn";
+            break;
+        case 4:
+            model_name = "./model/yolov8_relu_person_best.rknn";
+            break;
+        case 5:
+            model_name = "./model/yolov8n-p2-uav.rknn";
+            break;
+        case 6:
+            model_name = "./model/yolov8n-meter.rknn";
+            break;
+        case 7:
+            model_name = "./model/yolov8n-crack.rknn";
+            break;
+        default:
+            model_name = "./model/yolov8n.rknn";
+            break;
+    }
+
+    // 检查自定义模型路径
+    auto it = params.find("model_path");
+    if (it != params.end() && !it->second.empty()) {
+        model_name = const_cast<char*>(it->second.c_str());
+        Logger::info("使用自定义模型路径：" + it->second);
+    }
+
+    float objectThresh = 0.5;
+    auto confidence_threshold = params.find("confidence_threshold");
+    if (confidence_threshold != params.end() && !confidence_threshold->second.empty()) {
+        objectThresh = std::stof(confidence_threshold->second);
     }
 
     Logger::info("init single model :" + std::string(model_name));
 
-    std::unique_ptr<rknn_lite> rknn_ptr = std::make_unique<rknn_lite>(model_name, modelType % 3, modelType);
+    std::unique_ptr<rknn_lite> rknn_ptr = std::make_unique<rknn_lite>(model_name, modelType % 3, modelType, objectThresh);
 
     return rknn_ptr;
 }
@@ -1163,148 +1225,246 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
     }
 
     try {
+        // 将AVFrame转换为cv::Mat（仅一次）
         cv::Mat srcMat = AVFrameToMat(frame);
-        cv::Mat dstMat, segAddMask;
-        bool warning = false;
-        std::string plateResult = "";
-        AIDataResponse::AIEvent aiEvent;
 
+        // 查找该流的所有模型 - 改用智能指针
+        std::vector<std::shared_ptr<SingleModelEntry>> streamModels;
         for (auto &modelPool : singleModelPools_) {
-            if (modelPool->streamId != streamId) {
+            // 只收集已启用的模型，并使用智能指针
+            if (modelPool->streamId == streamId && modelPool->isEnabled) {
+                // 创建一个共享指针，但不接管所有权（shared_ptr不会在析构时删除modelPool，因为它是unique_ptr管理的）
+                streamModels.push_back(std::shared_ptr<SingleModelEntry>(modelPool.get(), [](SingleModelEntry*) {}));
+            }
+        }
+
+        if (streamModels.empty()) {
+            return; // 该流没有启用的模型
+        }
+
+        // 创建线程池用于并行处理
+        ThreadPool modelThreadPool(std::min(8, static_cast<int>(streamModels.size()))); // 最多8个线程
+        std::vector<std::future<void>> futures;
+
+        // 并行处理每个模型 - 使用智能指针
+        for (auto &model : streamModels) {
+            // 跳过帧计数不匹配的模型
+            if (model->count % fps != 0) {
+                model->count++;
                 continue;
             }
 
-            if (modelPool->count % fps != 0) {
-                modelPool->count++;
-                return;
-            }
+            // 向线程池提交任务
+            futures.push_back(modelThreadPool.enqueue([this, model, srcMat, fps]() {
+                try {
+                    // 为此模型创建源图像的副本
+                    cv::Mat modelSrcMat = srcMat.clone();
 
-            modelPool->singleRKModel->ori_img = srcMat;
-            modelPool->singleRKModel->startValue = 0.0;
-            modelPool->singleRKModel->endValue = 1.6;
-            modelPool->singleRKModel->interf();
-            dstMat = modelPool->singleRKModel->ori_img;
-            warning = modelPool->singleRKModel->warning;
-            plateResult = modelPool->singleRKModel->plateResult;
+                    // 使用此模型处理
+                    model->singleRKModel->ori_img = modelSrcMat;
+                    model->singleRKModel->startValue = 0.0;
+                    model->singleRKModel->endValue = 1.6;
 
-            if (modelPool->modelType == 7) {
-                segAddMask = modelPool->singleRKModel->SrcAddMask;
-            }
-
-            Logger::debug("各个状态结果: "+ std::to_string(warning) + " 时间次数: " + std::to_string(warningFlag) + " 时间数量: " + std::to_string(timeCount));
-
-            if (warning && !warningFlag) {
-
-                // 获取当前时间
-                std::time_t now = std::time(nullptr);
-
-                // 转换为本地时间结构
-                std::tm* localTime = std::localtime(&now);
-
-                // 创建用于存储格式化时间的字符数组
-                char buffer[80], buffer_day[80];
-
-                // 格式化时间字符串: 年-月-日 时:分:秒
-                std::strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", localTime);
-                std::strftime(buffer_day, sizeof(buffer_day), "%Y-%m-%d", localTime);
-
-//                    std::string dirPath = "/root/data/" + std::string(buffer_day);
-                std::string dirPath = AppConfig::getDirPath() + "/" + std::string(buffer_day);
-                std::string tempPath = AppConfig::getDirPath();
-                if (!dirExists(dirPath)) {
-                    Logger::info("目录不存在，正在创建...");
-                    if (createDirRecursive(dirPath)) {
-                        Logger::info("目录创建成功！");
-                    } else {
-                        Logger::error("目录创建失败！");
+                    if (!model->singleRKModel->interf()) {
+                        Logger::error("模型 " + std::to_string(model->modelType) + " 推理时出错，检查输入内容...");
                     }
-                } else {
-                    Logger::debug("目录已存在！");
+
+                    // 获取结果
+                    cv::Mat dstMat = model->singleRKModel->ori_img;
+                    bool warning = model->singleRKModel->warning;
+                    std::string plateResult = model->singleRKModel->plateResult;
+
+                    Logger::debug("使用模型类型 " + std::to_string(model->modelType) +
+                                  " 处理帧，警告 = " + std::to_string(warning));
+
+                    // 如有需要处理警告 - 每个模型有自己的警告状态
+                    if (warning && !model->warningFlag) {
+                        handleModelWarning(model.get(), dstMat, plateResult);
+                        model->warningFlag = true;
+                        model->timeCount = 1;
+                    } else if (model->warningFlag && warning) {
+                        Logger::info("AI模型 " + std::to_string(model->modelType) +
+                                     " 仍处于警告间隔中 (" + std::to_string(model->timeCount) +
+                                     "/5)");
+                        model->timeCount++;
+                        if (model->timeCount > 5) {
+                            // 间隔后重置
+                            model->warningFlag = false;
+                            model->timeCount = 0;
+                        }
+                    } else if (model->warningFlag && !warning) {
+                        // 警告条件已清除
+                        Logger::info("模型 " +
+                                     std::to_string(model->modelType) + " 的警告条件已清除");
+                        model->warningFlag = false;
+                        model->timeCount = 0;
+                    } else {
+                        Logger::debug("AI任务处理结束, 模型 " + std::to_string(model->modelType) + " 无报警发生...");
+                    }
+                } catch (const std::exception& e) {
+                    Logger::error("处理模型 " + std::to_string(model->modelType) +
+                                  " 时出错：" + std::string(e.what()));
                 }
 
-                std::string fileName;
-                if (modelPool->modelType == 1) {
-                    fileName = "/" + std::string(buffer_day) + "/plate_" + std::string(buffer) + ".jpg";
-                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Plate);
-                } else if (modelPool->modelType == 3) {
-                    fileName = "/" + std::string(buffer_day) + "/fire_smoke_" + std::string(buffer) + ".jpg";
-                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Fire);
-                } else if (modelPool->modelType == 4) {
-                    fileName = "/" + std::string(buffer_day) + "/person_" + std::string(buffer) + ".jpg";
-                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
-                } else if (modelPool->modelType == 5) {
-                    fileName = "/" + std::string(buffer_day) + "/uav_" + std::string(buffer) + ".jpg";
-                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_UAV);
-                } else if (modelPool->modelType == 6) {
-                    fileName = "/" + std::string(buffer_day) + "/meter_" + std::string(buffer) + ".jpg";
-                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
-                } else if (modelPool->modelType == 7) {
-                    fileName = "/" + std::string(buffer_day) + "/crack_" + std::string(buffer) + ".jpg";
-                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
-                } else {
-                    fileName = "/" + std::string(buffer_day) + "/warning_" + std::string(buffer) + ".jpg";
-                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+                // 始终增加计数
+                model->count++;
+                if (model->count >= fps) {
+                    model->count = 0;
                 }
-
-                std::string filePath = tempPath + fileName;
-
-                // Logger::info("filename is: "+ fileName);
-
-                if (modelPool->modelType == 7) {
-                    cv::imwrite(filePath, segAddMask);
-                } else {
-                    cv::imwrite(filePath, dstMat);
-                }
-
-                uuid_t uuid;
-                char uuid_str[37];
-
-                uuid_generate(uuid);
-                uuid_unparse_lower(uuid, uuid_str);
-
-                aiEvent.set_event_id(uuid_str);
-                aiEvent.set_image_path(fileName);
-                AIDataResponse::PlateParam* plateParam = aiEvent.mutable_plate_param();
-                plateParam->set_plate_number(plateResult);
-
-                std::string serialized_message;
-                if (!aiEvent.SerializeToString(&serialized_message)) {
-                    Logger::error("序列化消息失败");
-                }
-
-                publishSystemStatus("main_server", serialized_message);
-
-                // 报警以后，间隔时长进行报警
-                warningFlag = true;
-                timeCount = 1;
-            } else if (warningFlag && warning) {
-
-                Logger::info("AI处理结束, 处于报警间隔期间...");
-
-                timeCount++;
-                if (timeCount > 5) {
-                    // 重置状态 - 根据需求可以选择是否重置
-                    warningFlag = false;
-                    timeCount = 0;
-                }
-
-            } else {
-                Logger::info("AI处理结束, 无报警发生...");
-            }
-
-            modelPool->count++;
-            if (modelPool->count == fps) {
-                modelPool->count = 0;
-            }
-
-            Logger::info("AI识别处理结束，请做后续相关处理");
-//            publishSystemStatus("main_server", dstMat);
-//            cv::imwrite("./test.jpg", dstMat);
+            }));
         }
+
+        // 等待所有模型处理完成
+        for (auto &future : futures) {
+            future.get();
+        }
+
     } catch (const std::exception& e) {
-        Logger::error("ai service is failed, please check model..., error info: " + std::string(e.what()));
+        Logger::error("AI服务失败，请检查模型。错误：" + std::string(e.what()));
     }
-//    cv::imwrite("D:\\project\\C++\\my\\ffmpeg_push_pull\\cmake-build-debug/test.jpg", dstMat);
+
+//    try {
+//        cv::Mat srcMat = AVFrameToMat(frame);
+//        cv::Mat dstMat, segAddMask;
+//        bool warning = false;
+//        std::string plateResult = "";
+//        AIDataResponse::AIEvent aiEvent;
+//
+//        for (auto &modelPool : singleModelPools_) {
+//            if (modelPool->streamId != streamId) {
+//                continue;
+//            }
+//
+//            if (modelPool->count % fps != 0) {
+//                modelPool->count++;
+//                return;
+//            }
+//
+//            modelPool->singleRKModel->ori_img = srcMat;
+//            modelPool->singleRKModel->startValue = 0.0;
+//            modelPool->singleRKModel->endValue = 1.6;
+//            modelPool->singleRKModel->interf();
+//            dstMat = modelPool->singleRKModel->ori_img;
+//            warning = modelPool->singleRKModel->warning;
+//            plateResult = modelPool->singleRKModel->plateResult;
+//
+//            if (modelPool->modelType == 7) {
+//                segAddMask = modelPool->singleRKModel->SrcAddMask;
+//            }
+//
+//            Logger::debug("各个状态结果: "+ std::to_string(warning) + " 时间次数: " + std::to_string(warningFlag) + " 时间数量: " + std::to_string(timeCount));
+//
+//            if (warning && !warningFlag) {
+//
+//                // 获取当前时间
+//                std::time_t now = std::time(nullptr);
+//
+//                // 转换为本地时间结构
+//                std::tm* localTime = std::localtime(&now);
+//
+//                // 创建用于存储格式化时间的字符数组
+//                char buffer[80], buffer_day[80];
+//
+//                // 格式化时间字符串: 年-月-日 时:分:秒
+//                std::strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", localTime);
+//                std::strftime(buffer_day, sizeof(buffer_day), "%Y-%m-%d", localTime);
+//
+////                    std::string dirPath = "/root/data/" + std::string(buffer_day);
+//                std::string dirPath = AppConfig::getDirPath() + "/" + std::string(buffer_day);
+//                std::string tempPath = AppConfig::getDirPath();
+//                if (!dirExists(dirPath)) {
+//                    Logger::info("目录不存在，正在创建...");
+//                    if (createDirRecursive(dirPath)) {
+//                        Logger::info("目录创建成功！");
+//                    } else {
+//                        Logger::error("目录创建失败！");
+//                    }
+//                } else {
+//                    Logger::debug("目录已存在！");
+//                }
+//
+//                std::string fileName;
+//                if (modelPool->modelType == 1) {
+//                    fileName = "/" + std::string(buffer_day) + "/plate_" + std::string(buffer) + ".jpg";
+//                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Plate);
+//                } else if (modelPool->modelType == 3) {
+//                    fileName = "/" + std::string(buffer_day) + "/fire_smoke_" + std::string(buffer) + ".jpg";
+//                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Fire);
+//                } else if (modelPool->modelType == 4) {
+//                    fileName = "/" + std::string(buffer_day) + "/person_" + std::string(buffer) + ".jpg";
+//                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+//                } else if (modelPool->modelType == 5) {
+//                    fileName = "/" + std::string(buffer_day) + "/uav_" + std::string(buffer) + ".jpg";
+//                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_UAV);
+//                } else if (modelPool->modelType == 6) {
+//                    fileName = "/" + std::string(buffer_day) + "/meter_" + std::string(buffer) + ".jpg";
+//                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+//                } else if (modelPool->modelType == 7) {
+//                    fileName = "/" + std::string(buffer_day) + "/crack_" + std::string(buffer) + ".jpg";
+//                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+//                } else {
+//                    fileName = "/" + std::string(buffer_day) + "/warning_" + std::string(buffer) + ".jpg";
+//                    aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+//                }
+//
+//                std::string filePath = tempPath + fileName;
+//
+//                // Logger::info("filename is: "+ fileName);
+//
+//                if (modelPool->modelType == 7) {
+//                    cv::imwrite(filePath, segAddMask);
+//                } else {
+//                    cv::imwrite(filePath, dstMat);
+//                }
+//
+//                uuid_t uuid;
+//                char uuid_str[37];
+//
+//                uuid_generate(uuid);
+//                uuid_unparse_lower(uuid, uuid_str);
+//
+//                aiEvent.set_event_id(uuid_str);
+//                aiEvent.set_image_path(fileName);
+//                AIDataResponse::PlateParam* plateParam = aiEvent.mutable_plate_param();
+//                plateParam->set_plate_number(plateResult);
+//
+//                std::string serialized_message;
+//                if (!aiEvent.SerializeToString(&serialized_message)) {
+//                    Logger::error("序列化消息失败");
+//                }
+//
+//                publishSystemStatus("main_server", serialized_message);
+//
+//                // 报警以后，间隔时长进行报警
+//                warningFlag = true;
+//                timeCount = 1;
+//            } else if (warningFlag && warning) {
+//
+//                Logger::info("AI处理结束, 处于报警间隔期间...");
+//
+//                timeCount++;
+//                if (timeCount > 5) {
+//                    // 重置状态 - 根据需求可以选择是否重置
+//                    warningFlag = false;
+//                    timeCount = 0;
+//                }
+//
+//            } else {
+//                Logger::info("AI处理结束, 无报警发生...");
+//            }
+//
+//            modelPool->count++;
+//            if (modelPool->count == fps) {
+//                modelPool->count = 0;
+//            }
+//
+//            Logger::info("AI识别处理结束，请做后续相关处理");
+////            publishSystemStatus("main_server", dstMat);
+////            cv::imwrite("./test.jpg", dstMat);
+//        }
+//    } catch (const std::exception& e) {
+//        Logger::error("ai service is failed, please check model..., error info: " + std::string(e.what()));
+//    }
 }
 
 void Application::test_model() {
@@ -1313,10 +1473,97 @@ void Application::test_model() {
 
     char *modelNmae = "./model/yolov8-plate.rknn";
 
-    auto rkmodel = std::make_unique<rknn_lite>(modelNmae, 0, 1);
+    auto rkmodel = std::make_unique<rknn_lite>(modelNmae, 0, 1, 0.5);
 
 //    rknn_lite *rkmodel = new rknn_lite(modelNmae, 0, 1);
 
     rkmodel->ori_img = srcMat;
     rkmodel->interf();
+}
+
+void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult) {
+    // 获取当前时间
+    std::time_t now = std::time(nullptr);
+    std::tm* localTime = std::localtime(&now);
+
+    char buffer[80], buffer_day[80];
+    std::strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", localTime);
+    std::strftime(buffer_day, sizeof(buffer_day), "%Y-%m-%d", localTime);
+
+    std::string dirPath = AppConfig::getDirPath() + "/" + std::string(buffer_day);
+    std::string tempPath = AppConfig::getDirPath();
+
+    // 确保目录存在
+    if (!dirExists(dirPath)) {
+        Logger::info("目录不存在，正在创建...");
+        if (createDirRecursive(dirPath)) {
+            Logger::info("目录创建成功！");
+        } else {
+            Logger::error("创建目录失败！");
+            return;
+        }
+    }
+
+    // 根据模型类型生成适当的文件名
+    std::string fileName;
+    AIDataResponse::AIEvent aiEvent;
+
+    switch (model->modelType) {
+        case 1:
+            fileName = "/" + std::string(buffer_day) + "/plate_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Plate);
+            break;
+        case 3:
+            fileName = "/" + std::string(buffer_day) + "/fire_smoke_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Fire);
+            break;
+        case 4:
+            fileName = "/" + std::string(buffer_day) + "/person_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+            break;
+        case 5:
+            fileName = "/" + std::string(buffer_day) + "/uav_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_UAV);
+            break;
+        case 6:
+            fileName = "/" + std::string(buffer_day) + "/meter_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+            break;
+        case 7:
+            fileName = "/" + std::string(buffer_day) + "/crack_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+            break;
+        default:
+            fileName = "/" + std::string(buffer_day) + "/warning_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+            break;
+    }
+
+    std::string filePath = tempPath + fileName;
+
+    // 保存图像
+    cv::imwrite(filePath, dstMat);
+
+
+    // 为事件生成UUID
+    uuid_t uuid;
+    char uuid_str[37];
+    uuid_generate(uuid);
+    uuid_unparse_lower(uuid, uuid_str);
+
+    // 设置事件数据
+    aiEvent.set_event_id(uuid_str);
+    aiEvent.set_image_path(fileName);
+    AIDataResponse::PlateParam* plateParam = aiEvent.mutable_plate_param();
+    plateParam->set_plate_number(plateResult);
+
+    // 序列化并发布事件
+    std::string serialized_message;
+    if (!aiEvent.SerializeToString(&serialized_message)) {
+        Logger::error("模型类型 " + std::to_string(model->modelType) + " 的消息序列化失败");
+        return;
+    }
+
+    publishSystemStatus("main_server", serialized_message);
+    Logger::info("已为模型类型 " + std::to_string(model->modelType) + " 发布AI事件");
 }

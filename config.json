@@ -4,8 +4,6 @@
     "logFilePath": "./logs",
     "logLevel": 1,
     "threadPoolSize": 4,
-    "monitorInterval": 10,
-    "autoRestartStreams": true,
     "useWatchdog": true,
     "watchdogInterval": 5,
     "dirPath": "/root/data",
@@ -18,7 +16,9 @@
     "extraOptions": {
       "periodicReconnectInterval": 180,
       "mqttMonitoringEnabled": true,
-      "mqttHealthCheckInterval": 30
+      "mqttHealthCheckInterval": 30,
+      "monitorInterval": 10,
+      "autoRestartStreams": true
     }
   },
   "mqtt_servers": [
@@ -95,7 +95,31 @@
       "height": 0,
       "pushEnabled": true,
       "aiEnabled": true,
-      "modelType": 1,
+      "models": [
+        {
+          "modelType": 1,
+          "enabled": true,
+          "params": {
+            "confidence_threshold": "0.5",
+            "nms_threshold": "0.45",
+            "processor_id": "0"
+          }
+        },
+        {
+          "modelType": 3,
+          "enabled": false,
+          "params": {
+            "confidence_threshold": "0.5"
+          }
+        },
+        {
+          "modelType": 4,
+          "enabled": true,
+          "params": {
+            "confidence_threshold": "0.5"
+          }
+        }
+      ],
       "extraOptions": {
         "autoStart": true,
         "maxReconnectAttempts": 5,
