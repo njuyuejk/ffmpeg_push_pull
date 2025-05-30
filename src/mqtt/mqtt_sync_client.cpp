@@ -48,7 +48,7 @@ bool MQTTClientWrapper::initialize(const std::string& brokerUrl, const std::stri
     int rc = MQTTClient_create(&client, brokerUrl.c_str(), clientId.c_str(),
                                MQTTCLIENT_PERSISTENCE_NONE, NULL);
     if (rc != MQTTCLIENT_SUCCESS) {
-        Logger::error("Failed to create MQTT client, return code: " + std::to_string(rc));
+        LOGGER_ERROR("Failed to create MQTT client, return code: " + std::to_string(rc));
         return false;
     }
 
@@ -58,7 +58,7 @@ bool MQTTClientWrapper::initialize(const std::string& brokerUrl, const std::stri
                                  (MQTTClient_messageArrived*)&MQTTClientWrapper::messageArrivedCallback,
                                  NULL);
     if (rc != MQTTCLIENT_SUCCESS) {
-        Logger::error("Failed to set MQTT callbacks, return code: " + std::to_string(rc));
+        LOGGER_ERROR("Failed to set MQTT callbacks, return code: " + std::to_string(rc));
         MQTTClient_destroy(&client);
         return false;
     }
@@ -72,7 +72,7 @@ bool MQTTClientWrapper::connect() {
     std::lock_guard<std::mutex> lock(mutex);
 
     if (!initialized) {
-        Logger::error("MQTT client not initialized");
+        LOGGER_ERROR("MQTT client not initialized");
         return false;
     }
 
@@ -95,12 +95,12 @@ bool MQTTClientWrapper::connect() {
 
     int rc = MQTTClient_connect(client, &conn_opts);
     if (rc != MQTTCLIENT_SUCCESS) {
-        Logger::error("Failed to connect to MQTT broker, return code: " + std::to_string(rc));
+        LOGGER_ERROR("Failed to connect to MQTT broker, return code: " + std::to_string(rc));
         return false;
     }
 
     connected = true;
-    Logger::info("Successfully connected to MQTT broker: " + brokerUrl);
+    LOGGER_INFO("Successfully connected to MQTT broker: " + brokerUrl);
 
     // 重新订阅之前的主题
     for (const auto& pair : topicCallbacks) {
@@ -117,7 +117,7 @@ void MQTTClientWrapper::disconnect() {
     if (connected && client != nullptr) {
         MQTTClient_disconnect(client, 1000);
         connected = false;
-        Logger::info("MQTT connection disconnected: " + clientId + " from " + brokerUrl);
+        LOGGER_INFO("MQTT connection disconnected: " + clientId + " from " + brokerUrl);
     }
 }
 
@@ -132,7 +132,7 @@ bool MQTTClientWrapper::subscribe(const std::string& topic, int qos, MessageCall
     std::lock_guard<std::mutex> lock(mutex);
 
     if (!initialized) {
-        Logger::error("MQTT client not initialized");
+        LOGGER_ERROR("MQTT client not initialized");
         return false;
     }
 
@@ -142,10 +142,10 @@ bool MQTTClientWrapper::subscribe(const std::string& topic, int qos, MessageCall
     if (connected) {
         int rc = MQTTClient_subscribe(client, topic.c_str(), qos);
         if (rc != MQTTCLIENT_SUCCESS) {
-            Logger::error("Failed to subscribe to topic " + topic + ", return code: " + std::to_string(rc));
+            LOGGER_ERROR("Failed to subscribe to topic " + topic + ", return code: " + std::to_string(rc));
             return false;
         }
-        Logger::info("Successfully subscribed to topic: " + topic + " (client: " + clientId + ")");
+        LOGGER_INFO("Successfully subscribed to topic: " + topic + " (client: " + clientId + ")");
     }
 
     return true;
@@ -155,7 +155,7 @@ bool MQTTClientWrapper::subscribe(const std::string& topic, int qos, MessageCall
     std::lock_guard<std::mutex> lock(mutex);
 
     if (!initialized) {
-        Logger::error("MQTT client not initialized");
+        LOGGER_ERROR("MQTT client not initialized");
         return false;
     }
 
@@ -165,10 +165,10 @@ bool MQTTClientWrapper::subscribe(const std::string& topic, int qos, MessageCall
     if (connected) {
         int rc = MQTTClient_subscribe(client, topic.c_str(), qos);
         if (rc != MQTTCLIENT_SUCCESS) {
-            Logger::error("Failed to subscribe to topic " + topic + ", return code: " + std::to_string(rc));
+            LOGGER_ERROR("Failed to subscribe to topic " + topic + ", return code: " + std::to_string(rc));
             return false;
         }
-        Logger::info("Successfully subscribed to topic: " + topic + " (client: " + clientId + ")");
+        LOGGER_INFO("Successfully subscribed to topic: " + topic + " (client: " + clientId + ")");
     }
 
     return true;
@@ -179,19 +179,19 @@ bool MQTTClientWrapper::unsubscribe(const std::string& topic) {
     std::lock_guard<std::mutex> lock(mutex);
 
     if (!initialized || !connected) {
-        Logger::error("MQTT client not initialized or not connected");
+        LOGGER_ERROR("MQTT client not initialized or not connected");
         return false;
     }
 
     int rc = MQTTClient_unsubscribe(client, topic.c_str());
     if (rc != MQTTCLIENT_SUCCESS) {
-        Logger::error("Failed to unsubscribe from topic " + topic + ", return code: " + std::to_string(rc));
+        LOGGER_ERROR("Failed to unsubscribe from topic " + topic + ", return code: " + std::to_string(rc));
         return false;
     }
 
     // 移除回调函数
     topicCallbacks.erase(topic);
-    Logger::info("Successfully unsubscribed from topic: " + topic + " (client: " + clientId + ")");
+    LOGGER_INFO("Successfully unsubscribed from topic: " + topic + " (client: " + clientId + ")");
 
     return true;
 }
@@ -202,7 +202,7 @@ bool MQTTClientWrapper::publish(const std::string& topic, const std::string& pay
     std::lock_guard<std::mutex> lock(mutex);
 
     if (!initialized) {
-        Logger::error("MQTT client not initialized");
+        LOGGER_ERROR("MQTT client not initialized");
         return false;
     }
 
@@ -222,14 +222,14 @@ bool MQTTClientWrapper::publish(const std::string& topic, const std::string& pay
     MQTTClient_deliveryToken token;
     int rc = MQTTClient_publishMessage(client, topic.c_str(), &pubmsg, &token);
     if (rc != MQTTCLIENT_SUCCESS) {
-        Logger::error("Failed to publish message, return code: " + std::to_string(rc));
+        LOGGER_ERROR("Failed to publish message, return code: " + std::to_string(rc));
         return false;
     }
 
     // 等待消息发布完成
     rc = MQTTClient_waitForCompletion(client, token, 5000);
     if (rc != MQTTCLIENT_SUCCESS) {
-        Logger::error("Failed to wait for message delivery completion, return code: " + std::to_string(rc));
+        LOGGER_ERROR("Failed to wait for message delivery completion, return code: " + std::to_string(rc));
         return false;
     }
 
@@ -292,16 +292,16 @@ void MQTTClientWrapper::staticconnectionLostCallback(void* context, char* cause)
         }
 
         std::string causeStr = (cause != nullptr) ? cause : "Unknown reason";
-        Logger::info("MQTT connection lost: " + instance->clientId + " from " + instance->brokerUrl + " - " + causeStr);
+        LOGGER_INFO("MQTT connection lost: " + instance->clientId + " from " + instance->brokerUrl + " - " + causeStr);
 
         // 调用用户设置的回调函数
         if (instance->connectionLostCallback) {
             try {
                 instance->connectionLostCallback(causeStr);
             } catch (const std::exception& e) {
-                Logger::error("Exception in connection lost callback: " + std::string(e.what()));
+                LOGGER_ERROR("Exception in connection lost callback: " + std::string(e.what()));
             } catch (...) {
-                Logger::error("Unknown exception in connection lost callback");
+                LOGGER_ERROR("Unknown exception in connection lost callback");
             }
         }
 
@@ -325,7 +325,7 @@ bool MQTTClientWrapper::checkHealth() {
         // 注意：MQTTClient库会自动处理PING，但我们可以检查isConnected状态
         bool actuallyConnected = MQTTClient_isConnected(client);
         if (!actuallyConnected) {
-            Logger::warning("MQTT client " + clientId + " reports as connected but is actually disconnected");
+            LOGGER_WARNING("MQTT client " + clientId + " reports as connected but is actually disconnected");
             connected = false;
             lastDisconnectTime = std::time(nullptr);
             return false;
@@ -339,7 +339,7 @@ bool MQTTClientWrapper::checkHealth() {
         if (autoReconnect && lastDisconnectTime > 0 &&
             (now - lastDisconnectTime) > reconnectDelaySeconds) {
 
-            Logger::info("Health check initiating reconnect for MQTT client: " + clientId);
+            LOGGER_INFO("Health check initiating reconnect for MQTT client: " + clientId);
             return reconnect();
         }
         return false;
@@ -380,7 +380,7 @@ void MQTTClientWrapper::setReconnectPolicy(bool enable, int maxAttempts, int ini
     initialReconnectDelayMs = initialDelayMs;
     maxReconnectDelayMs = maxDelayMs;
 
-    Logger::info("Set reconnect policy for MQTT client " + clientId + ": enabled=" +
+    LOGGER_INFO("Set reconnect policy for MQTT client " + clientId + ": enabled=" +
                  (enable ? "true" : "false") + ", maxAttempts=" + std::to_string(maxAttempts) +
                  ", initialDelay=" + std::to_string(initialDelayMs) + "ms, maxDelay=" +
                  std::to_string(maxDelayMs) + "ms");
@@ -400,7 +400,7 @@ bool MQTTClientWrapper::reconnect() {
 
     // 如果设置了最大重试次数并且已经达到，则不再尝试
     if (maxReconnectAttempts > 0 && attempts > maxReconnectAttempts) {
-        Logger::error("MQTT client " + clientId + " exceeded maximum reconnect attempts (" +
+        LOGGER_ERROR("MQTT client " + clientId + " exceeded maximum reconnect attempts (" +
                       std::to_string(maxReconnectAttempts) + ")");
         return false;
     }
@@ -413,7 +413,7 @@ bool MQTTClientWrapper::reconnect() {
         return false;
     }
 
-    Logger::info("Attempting to reconnect MQTT client " + clientId + " to " + brokerUrl +
+    LOGGER_INFO("Attempting to reconnect MQTT client " + clientId + " to " + brokerUrl +
                  " (attempt " + std::to_string(attempts) + ", delay: " +
                  std::to_string(reconnectDelay) + "ms)");
 
@@ -438,19 +438,19 @@ bool MQTTClientWrapper::reconnect() {
             connected = true;
             connectionStartTime = now;
             lastDisconnectTime = 0;
-            Logger::info("Successfully reconnected MQTT client: " + clientId + " to " + brokerUrl);
+            LOGGER_INFO("Successfully reconnected MQTT client: " + clientId + " to " + brokerUrl);
 
             // 重新订阅所有主题
             for (const auto& pair : topicCallbacks) {
                 MQTTClient_subscribe(client, pair.first.c_str(), 1);
-                Logger::debug("Resubscribed to topic: " + pair.first);
+                LOGGER_DEBUG("Resubscribed to topic: " + pair.first);
             }
 
             // 重置重连尝试计数
             reconnectAttempts = 0;
             return true;
         } else {
-            Logger::warning("Failed to reconnect MQTT client " + clientId + ", error code: " +
+            LOGGER_WARNING("Failed to reconnect MQTT client " + clientId + ", error code: " +
                             std::to_string(rc));
         }
     }
@@ -477,7 +477,7 @@ bool MQTTClientManager::createClient(const std::string& clientName,
 
     // 检查客户端是否已存在
     if (clients.find(clientName) != clients.end()) {
-        Logger::warning("MQTT client already exists with name: " + clientName);
+        LOGGER_WARNING("MQTT client already exists with name: " + clientName);
         return false;
     }
 
@@ -488,14 +488,14 @@ bool MQTTClientManager::createClient(const std::string& clientName,
 
     // 初始化并连接客户端
     if (!client->isConnected() && !client->connect()) {
-        Logger::warning("Failed to connect new MQTT client: " + clientName);
+        LOGGER_WARNING("Failed to connect new MQTT client: " + clientName);
         // 即使连接失败，我们仍然将客户端添加到映射中
         // 它可以稍后连接
     }
 
     // 添加到映射中
     clients[clientName] = client;
-    Logger::info("Created MQTT client: " + clientName + " for broker: " + brokerUrl);
+    LOGGER_INFO("Created MQTT client: " + clientName + " for broker: " + brokerUrl);
 
     return true;
 }
@@ -524,7 +524,7 @@ bool MQTTClientManager::removeClient(const std::string& clientName) {
 
         // 从映射中移除
         clients.erase(it);
-        Logger::info("Removed MQTT client: " + clientName);
+        LOGGER_INFO("Removed MQTT client: " + clientName);
         return true;
     }
 
@@ -553,7 +553,7 @@ void MQTTClientManager::cleanup() {
     }
 
     clients.clear();
-    Logger::info("Cleaned up all MQTT clients");
+    LOGGER_INFO("Cleaned up all MQTT clients");
 }
 
 // 检查所有客户端的健康状态并尝试恢复
@@ -561,7 +561,7 @@ int MQTTClientManager::checkAndRecoverClients() {
     std::lock_guard<std::mutex> lock(mutex);
     int healthyCount = 0;
 
-    Logger::debug("Checking health of " + std::to_string(clients.size()) + " MQTT clients");
+    LOGGER_DEBUG("Checking health of " + std::to_string(clients.size()) + " MQTT clients");
 
     for (auto& pair : clients) {
         try {
@@ -574,19 +574,19 @@ int MQTTClientManager::checkAndRecoverClients() {
                 healthyCount++;
             } else {
                 int64_t disconnectedTime = client->getStatusDuration();
-                Logger::warning("MQTT client " + clientName + " is unhealthy, disconnected for " +
+                LOGGER_WARNING("MQTT client " + clientName + " is unhealthy, disconnected for " +
                                 std::to_string(disconnectedTime) + " seconds");
 
                 // 对长时间断开连接的客户端进行强制重连
                 if (disconnectedTime > 300) { // 5分钟
-                    Logger::info("Forcing reconnect for long-disconnected client: " + clientName);
+                    LOGGER_INFO("Forcing reconnect for long-disconnected client: " + clientName);
                     if (client->forceReconnect()) {
                         healthyCount++;
                     }
                 }
             }
         } catch (const std::exception& e) {
-            Logger::error("Error checking MQTT client health: " + std::string(e.what()));
+            LOGGER_ERROR("Error checking MQTT client health: " + std::string(e.what()));
         }
     }
 
@@ -596,13 +596,13 @@ int MQTTClientManager::checkAndRecoverClients() {
 // 设置MQTT连接健康检查的间隔时间
 void MQTTClientManager::setHealthCheckInterval(int intervalSeconds) {
     if (intervalSeconds < 1) {
-        Logger::warning("Invalid health check interval, must be at least 1 second");
+        LOGGER_WARNING("Invalid health check interval, must be at least 1 second");
         intervalSeconds = 1;
     }
 
     std::lock_guard<std::mutex> lock(mutex);
     healthCheckIntervalSeconds = intervalSeconds;
-    Logger::info("Set MQTT health check interval to " + std::to_string(intervalSeconds) + " seconds");
+    LOGGER_INFO("Set MQTT health check interval to " + std::to_string(intervalSeconds) + " seconds");
 }
 
 // 启动周期性健康检查
@@ -616,7 +616,7 @@ void MQTTClientManager::startPeriodicHealthCheck() {
     healthCheckRunning = true;
     healthCheckThread = std::thread(&MQTTClientManager::healthCheckLoop, this);
 
-    Logger::info("Started periodic MQTT health check (interval: " +
+    LOGGER_INFO("Started periodic MQTT health check (interval: " +
                  std::to_string(healthCheckIntervalSeconds) + " seconds)");
 }
 
@@ -632,7 +632,7 @@ void MQTTClientManager::stopPeriodicHealthCheck() {
 
     if (wasRunning && healthCheckThread.joinable()) {
         healthCheckThread.join();
-        Logger::info("Stopped periodic MQTT health check");
+        LOGGER_INFO("Stopped periodic MQTT health check");
     }
 }
 
@@ -645,19 +645,19 @@ void MQTTClientManager::setGlobalReconnectPolicy(bool enable, int maxAttempts,
         try {
             pair.second->setReconnectPolicy(enable, maxAttempts, initialDelayMs, maxDelayMs);
         } catch (const std::exception& e) {
-            Logger::error("Error setting reconnect policy for MQTT client " + pair.first +
+            LOGGER_ERROR("Error setting reconnect policy for MQTT client " + pair.first +
                           ": " + e.what());
         }
     }
 
-    Logger::info("Set global MQTT reconnect policy: enabled=" + std::string((enable ? "true" : "false")) +
+    LOGGER_INFO("Set global MQTT reconnect policy: enabled=" + std::string((enable ? "true" : "false")) +
                  ", maxAttempts=" + std::to_string(maxAttempts) + ", initialDelay=" +
                  std::to_string(initialDelayMs) + "ms, maxDelay=" + std::to_string(maxDelayMs) + "ms");
 }
 
 // 健康检查线程函数
 void MQTTClientManager::healthCheckLoop() {
-    Logger::info("MQTT health check loop started");
+    LOGGER_INFO("MQTT health check loop started");
 
     while (healthCheckRunning) {
         try {
@@ -669,10 +669,10 @@ void MQTTClientManager::healthCheckLoop() {
                 totalCount = clients.size();
             }
 
-            Logger::debug("MQTT health check: " + std::to_string(healthyCount) + "/" +
+            LOGGER_DEBUG("MQTT health check: " + std::to_string(healthyCount) + "/" +
                           std::to_string(totalCount) + " clients healthy");
         } catch (const std::exception& e) {
-            Logger::error("Error in MQTT health check loop: " + std::string(e.what()));
+            LOGGER_ERROR("Error in MQTT health check loop: " + std::string(e.what()));
         }
 
         // 使用sleep_for的好处是可以更快地响应停止请求
@@ -681,7 +681,7 @@ void MQTTClientManager::healthCheckLoop() {
         }
     }
 
-    Logger::info("MQTT health check loop stopped");
+    LOGGER_INFO("MQTT health check loop stopped");
 }
 
 

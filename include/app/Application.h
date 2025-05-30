@@ -137,11 +137,18 @@ private:
 
     void handlePTZControl(const std::string& serverName, const std::string& topic, MQTTClient_message& message);
 
+    void handleAIEnabledControl(const std::string& serverName, const std::string& topic, const std::string& payload);
+
     /**
      * @brief mqtt消息发布
      * @param serverName
      */
-    void publishSystemStatus(const std::string& serverName, const std::string& payload);
+    void publishSystemStatus(const std::string& serverName, const std::string& topic, const std::string& payload);
+
+    /*
+     *@brief 定时发送AI算法状态信息
+     * */
+    void publishAIStatus(const std::string& serverName);
 
     /**
      * @brief 向所有MQTT服务端发送消息
@@ -181,7 +188,7 @@ private:
 
     void test_model();
 
-    void handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult);
+    void handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult, double targetValue);
 
 private:
     // 成员变量
@@ -231,6 +238,10 @@ private:
     std::vector<std::unique_ptr<SingleModelEntry>> singleModelPools_;
     int timeCount = 0;
     bool warningFlag = false;
+
+    // 添加线程相关成员
+    std::unique_ptr<std::thread> mqttAIStatusThread;
+    std::atomic<bool> mqttAIStatusStarted{false};
 
 };
 

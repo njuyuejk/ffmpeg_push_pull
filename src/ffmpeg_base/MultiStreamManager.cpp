@@ -30,7 +30,7 @@ MultiStreamManager::MultiStreamManager(int maxConcurrentStreams)
         : maxConcurrentStreams_(maxConcurrentStreams),
           threadPool_(std::make_unique<ThreadPool>(maxConcurrentStreams)) {
 
-    Logger::info("Created MultiStreamManager with max " +
+    LOGGER_INFO("Created MultiStreamManager with max " +
                  std::to_string(maxConcurrentStreams) + " concurrent streams");
 }
 
@@ -61,7 +61,7 @@ MultiStreamManager::~MultiStreamManager() {
                     watchdog_->unregisterTarget("stream_" + streamId);
                 } catch (...) {
                     // 忽略异常，仅在日志中记录
-                    Logger::warning("Failed to unregister stream " + streamId + " from watchdog");
+                    LOGGER_WARNING("Failed to unregister stream " + streamId + " from watchdog");
                 }
             }
 
@@ -72,9 +72,9 @@ MultiStreamManager::~MultiStreamManager() {
         // 停止所有流
         stopAll();
     } catch (const std::exception& e) {
-        Logger::error("Exception in MultiStreamManager destructor: " + std::string(e.what()));
+        LOGGER_ERROR("Exception in MultiStreamManager destructor: " + std::string(e.what()));
     } catch (...) {
-        Logger::error("Unknown exception in MultiStreamManager destructor");
+        LOGGER_ERROR("Unknown exception in MultiStreamManager destructor");
     }
 }
 
@@ -83,7 +83,7 @@ std::string MultiStreamManager::startStream(const StreamConfig& config) {
 
     // 检查是否已达到最大流数量
     if (streams_.size() >= static_cast<size_t>(maxConcurrentStreams_)) {
-        Logger::warning("Cannot start new stream, maximum concurrent streams reached: " +
+        LOGGER_WARNING("Cannot start new stream, maximum concurrent streams reached: " +
                         std::to_string(maxConcurrentStreams_));
         throw FFmpegException("Maximum concurrent streams reached");
     }
@@ -95,7 +95,7 @@ std::string MultiStreamManager::startStream(const StreamConfig& config) {
     } else {
         // 检查ID是否已存在
         if (streams_.find(streamId) != streams_.end()) {
-            Logger::warning("Stream ID already exists: " + streamId);
+            LOGGER_WARNING("Stream ID already exists: " + streamId);
             throw FFmpegException("Stream ID already exists: " + streamId);
         }
     }
@@ -138,15 +138,15 @@ std::string MultiStreamManager::startStream(const StreamConfig& config) {
         // 等待启动完成，最多10秒
         auto status = startFuture.wait_for(std::chrono::seconds(10));
         if (status != std::future_status::ready) {
-            Logger::warning("Timeout waiting for stream to start: " + streamId);
+            LOGGER_WARNING("Timeout waiting for stream to start: " + streamId);
             // 即使超时，我们也保留处理器，它可能仍在启动中
         }
 
-        Logger::info("Started stream: " + streamId);
+        LOGGER_INFO("Started stream: " + streamId);
     } catch (const FFmpegException& e) {
         // 启动失败，从映射中移除
         streams_.erase(streamId);
-        Logger::error("Failed to start stream " + streamId + ": " + std::string(e.what()));
+        LOGGER_ERROR("Failed to start stream " + streamId + ": " + std::string(e.what()));
         throw;
     }
 
@@ -161,7 +161,7 @@ bool MultiStreamManager::stopStream(const std::string& streamId) {
         std::lock_guard<std::mutex> lock(streamsMutex_);
         auto it = streams_.find(streamId);
         if (it == streams_.end()) {
-            Logger::warning("Stream not found to stop: " + streamId);
+            LOGGER_WARNING("Stream not found to stop: " + streamId);
             return false;
         }
         processor = it->second;
@@ -171,9 +171,9 @@ bool MultiStreamManager::stopStream(const std::string& streamId) {
     if (watchdog_) {
         try {
             watchdog_->unregisterTarget("stream_" + streamId);
-            Logger::debug("Unregistered stream " + streamId + " from watchdog");
+            LOGGER_DEBUG("Unregistered stream " + streamId + " from watchdog");
         } catch (const std::exception& e) {
-            Logger::warning("Error unregistering from watchdog: " + std::string(e.what()));
+            LOGGER_WARNING("Error unregistering from watchdog: " + std::string(e.what()));
         }
     }
 
@@ -188,10 +188,10 @@ bool MultiStreamManager::stopStream(const std::string& streamId) {
         auto stopFuture = threadPool_->enqueue([processor, streamId]() {
             try {
                 processor->stop();
-                Logger::info("Stopped stream: " + streamId);
+                LOGGER_INFO("Stopped stream: " + streamId);
                 return true;
             } catch (const std::exception& e) {
-                Logger::error("Error stopping stream " + streamId + ": " + e.what());
+                LOGGER_ERROR("Error stopping stream " + streamId + ": " + e.what());
                 return false;
             }
         });
@@ -201,11 +201,11 @@ bool MultiStreamManager::stopStream(const std::string& streamId) {
         if (status == std::future_status::ready) {
             stopSuccess = stopFuture.get();
         } else {
-            Logger::warning("Timeout waiting for stream " + streamId + " to stop");
+            LOGGER_WARNING("Timeout waiting for stream " + streamId + " to stop");
             stopSuccess = false;
         }
     } catch (const std::exception& e) {
-        Logger::error("Exception stopping stream " + streamId + ": " + std::string(e.what()));
+        LOGGER_ERROR("Exception stopping stream " + streamId + ": " + std::string(e.what()));
         stopSuccess = false;
     }
 
@@ -236,9 +236,9 @@ void MultiStreamManager::stopAll() {
         for (const auto& streamId : streamIds) {
             try {
                 watchdog_->unregisterTarget("stream_" + streamId);
-                Logger::debug("Unregistered stream " + streamId + " from watchdog during stopAll");
+                LOGGER_DEBUG("Unregistered stream " + streamId + " from watchdog during stopAll");
             } catch (const std::exception& e) {
-                Logger::warning("Error unregistering stream from watchdog: " + std::string(e.what()));
+                LOGGER_WARNING("Error unregistering stream from watchdog: " + std::string(e.what()));
             }
         }
     }
@@ -253,11 +253,11 @@ void MultiStreamManager::stopAll() {
 
         stopFutures.push_back(threadPool_->enqueue([processor, streamId]() -> bool {
             try {
-                Logger::info("Stopping stream: " + streamId);
+                LOGGER_INFO("Stopping stream: " + streamId);
                 processor->stop();
                 return true;
             } catch (const std::exception& e) {
-                Logger::error("Error stopping stream " + streamId + ": " + std::string(e.what()));
+                LOGGER_ERROR("Error stopping stream " + streamId + ": " + std::string(e.what()));
                 return false;
             }
         }));
@@ -274,7 +274,7 @@ void MultiStreamManager::stopAll() {
         auto currentTime = std::chrono::steady_clock::now();
         if (currentTime >= stopEndTime) {
             // 已达到全局超时
-            Logger::warning("Global timeout reached while stopping streams");
+            LOGGER_WARNING("Global timeout reached while stopping streams");
             failureCount += stopFutures.size() - i;
             break;
         }
@@ -285,7 +285,7 @@ void MultiStreamManager::stopAll() {
         // 使用剩余超时时间等待此future
         auto status = stopFutures[i].wait_for(remainingTime);
         if (status != std::future_status::ready) {
-            Logger::warning("Timeout stopping stream " + streamIds[i]);
+            LOGGER_WARNING("Timeout stopping stream " + streamIds[i]);
             failureCount++;
             continue;
         }
@@ -299,7 +299,7 @@ void MultiStreamManager::stopAll() {
                 failureCount++;
             }
         } catch (const std::exception& e) {
-            Logger::error("Exception getting stop result: " + std::string(e.what()));
+            LOGGER_ERROR("Exception getting stop result: " + std::string(e.what()));
             failureCount++;
         }
     }
@@ -311,10 +311,10 @@ void MultiStreamManager::stopAll() {
     }
 
     if (failureCount > 0) {
-        Logger::warning("Failed to cleanly stop " + std::to_string(failureCount) + " out of " +
+        LOGGER_WARNING("Failed to cleanly stop " + std::to_string(failureCount) + " out of " +
                         std::to_string(processorsToStop.size()) + " streams");
     } else {
-        Logger::info("Stopped all streams successfully");
+        LOGGER_INFO("Stopped all streams successfully");
     }
 }
 
@@ -372,13 +372,13 @@ bool MultiStreamManager::updateStreamConfig(const std::string& streamId, const S
 
     auto it = streams_.find(streamId);
     if (it == streams_.end()) {
-        Logger::warning("Stream not found for config update: " + streamId);
+        LOGGER_WARNING("Stream not found for config update: " + streamId);
         return false;
     }
 
     // 检查流是否正在运行
     if (it->second->isRunning()) {
-        Logger::warning("Cannot update config while stream is running: " + streamId);
+        LOGGER_WARNING("Cannot update config while stream is running: " + streamId);
         return false;
     }
 
@@ -407,7 +407,7 @@ void MultiStreamManager::setWatchdog(Watchdog* watchdog) {
 
         // 如果传入null指针，记录并直接返回
         if (!watchdog) {
-            Logger::warning("Attempting to set null watchdog to MultiStreamManager");
+            LOGGER_WARNING("Attempting to set null watchdog to MultiStreamManager");
             return;
         }
 
@@ -442,15 +442,15 @@ void MultiStreamManager::setWatchdog(Watchdog* watchdog) {
         if (!watchdogFeederRunning_) {
             watchdogFeederRunning_ = true;
             watchdogFeederThread_ = std::thread(&MultiStreamManager::watchdogFeederLoop, this);
-            Logger::info("Started watchdog feeder thread");
+            LOGGER_INFO("Started watchdog feeder thread");
         }
 
-        Logger::info("Watchdog set for MultiStreamManager");
+        LOGGER_INFO("Watchdog set for MultiStreamManager");
     } catch (const std::exception& e) {
-        Logger::error("Exception in MultiStreamManager::setWatchdog: " + std::string(e.what()));
+        LOGGER_ERROR("Exception in MultiStreamManager::setWatchdog: " + std::string(e.what()));
         watchdog_ = nullptr;
     } catch (...) {
-        Logger::error("Unknown exception in MultiStreamManager::setWatchdog");
+        LOGGER_ERROR("Unknown exception in MultiStreamManager::setWatchdog");
         watchdog_ = nullptr;
     }
 }
@@ -462,7 +462,7 @@ void MultiStreamManager::watchdogFeederLoop() {
     // 记录失败计数的映射
     std::map<std::string, int> streamFailureCounts;
 
-    Logger::info("Watchdog feeder thread started");
+    LOGGER_INFO("Watchdog feeder thread started");
 
     while (watchdogFeederRunning_) {
         try {
@@ -501,7 +501,7 @@ void MultiStreamManager::watchdogFeederLoop() {
 
                         // 如果连续失败次数达到阈值，尝试重连
                         if (streamFailureCounts[streamId] >= MAX_FAILURE_COUNT_BEFORE_RECONNECT) {
-                            Logger::warning("Stream " + streamId + " failed " +
+                            LOGGER_WARNING("Stream " + streamId + " failed " +
                                             std::to_string(streamFailureCounts[streamId]) +
                                             " times, attempting auto-reconnect");
 
@@ -512,7 +512,7 @@ void MultiStreamManager::watchdogFeederLoop() {
                             streamFailureCounts[streamId] = 0;
                         } else {
                             // 流有问题但尚未达到重连阈值，记录问题
-                            Logger::debug("Stream " + streamId + " has issues: running=" +
+                            LOGGER_DEBUG("Stream " + streamId + " has issues: running=" +
                                           (processor->isRunning() ? "yes" : "no") +
                                           ", error=" + (processor->hasError() ? "yes" : "no") +
                                           ", failure count=" + std::to_string(streamFailureCounts[streamId]));
@@ -527,16 +527,16 @@ void MultiStreamManager::watchdogFeederLoop() {
             }
 
         } catch (const std::exception& e) {
-            Logger::error("Exception in watchdog feeder: " + std::string(e.what()));
+            LOGGER_ERROR("Exception in watchdog feeder: " + std::string(e.what()));
         } catch (...) {
-            Logger::error("Unknown exception in watchdog feeder");
+            LOGGER_ERROR("Unknown exception in watchdog feeder");
         }
 
         // 睡眠一段时间
         std::this_thread::sleep_for(std::chrono::milliseconds(FEED_INTERVAL_MS));
     }
 
-    Logger::info("Watchdog feeder thread exited");
+    LOGGER_INFO("Watchdog feeder thread exited");
 }
 
 void MultiStreamManager::reconnectStream(const std::string& streamId) {
@@ -547,7 +547,7 @@ void MultiStreamManager::reconnectStream(const std::string& streamId) {
         std::lock_guard<std::mutex> lock(streamsMutex_);
         auto it = streams_.find(streamId);
         if (it == streams_.end()) {
-            Logger::warning("Stream not found for reconnect: " + streamId);
+            LOGGER_WARNING("Stream not found for reconnect: " + streamId);
             return;
         }
         processor = it->second;
@@ -558,7 +558,7 @@ void MultiStreamManager::reconnectStream(const std::string& streamId) {
     // 停止处理器
     bool stopSuccess = stopStream(streamId);
     if (!stopSuccess) {
-        Logger::warning("Failed to stop stream for reconnect: " + streamId);
+        LOGGER_WARNING("Failed to stop stream for reconnect: " + streamId);
     }
 
     // 短暂暂停后重连
@@ -567,9 +567,9 @@ void MultiStreamManager::reconnectStream(const std::string& streamId) {
     // 使用相同配置启动新的处理器
     try {
         startStream(config);
-        Logger::info("Successfully reconnected stream: " + streamId);
+        LOGGER_INFO("Successfully reconnected stream: " + streamId);
     } catch (const FFmpegException& e) {
-        Logger::error("Failed to reconnect stream " + streamId + ": " + std::string(e.what()));
+        LOGGER_ERROR("Failed to reconnect stream " + streamId + ": " + std::string(e.what()));
     }
 }
 

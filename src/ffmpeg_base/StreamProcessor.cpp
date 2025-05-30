@@ -43,15 +43,15 @@ StreamProcessor::~StreamProcessor() {
         stop();
         cleanup();
     } catch (const std::exception& e) {
-        Logger::error("Exception in StreamProcessor destructor: " + std::string(e.what()));
+        LOGGER_ERROR("Exception in StreamProcessor destructor: " + std::string(e.what()));
     } catch (...) {
-        Logger::error("Unknown exception in StreamProcessor destructor");
+        LOGGER_ERROR("Unknown exception in StreamProcessor destructor");
     }
 }
 
 void StreamProcessor::start() {
     if (isRunning_) {
-        Logger::warning("Stream already running: " + config_.id);
+        LOGGER_WARNING("Stream already running: " + config_.id);
         return;
     }
 
@@ -63,11 +63,11 @@ void StreamProcessor::start() {
         lastFrameTime_ = av_gettime(); // 初始化最后一帧时间
 
         processingThread_ = std::thread(&StreamProcessor::processLoop, this);
-        Logger::info("Started stream processing: " + config_.id + " (" +
+        LOGGER_INFO("Started stream processing: " + config_.id + " (" +
                      config_.inputUrl + " -> " + config_.outputUrl + ")");
     } catch (const FFmpegException& e) {
         // 改变这里的处理方式，标记为错误但不重新抛出异常
-        Logger::error("Failed to start stream " + config_.id + ": " + std::string(e.what()));
+        LOGGER_ERROR("Failed to start stream " + config_.id + ": " + std::string(e.what()));
         cleanup();
         hasError_ = true;
         isRunning_ = false;
@@ -77,20 +77,20 @@ void StreamProcessor::start() {
 }
 
 void StreamProcessor::stop() {
-    Logger::info("Request to stop stream: " + config_.id);
+    LOGGER_INFO("Request to stop stream: " + config_.id);
 
     // 首先将运行标志设置为false，通知处理线程退出
     bool wasRunning = isRunning_.exchange(false);
 
     // 如果之前不是运行状态，直接返回
     if (!wasRunning) {
-        Logger::info("Stream " + config_.id + " already stopped, no action needed");
+        LOGGER_INFO("Stream " + config_.id + " already stopped, no action needed");
         return;
     }
 
     // 检查处理线程是否存在和可加入
     if (!processingThread_.joinable()) {
-        Logger::info("Processing thread for stream " + config_.id + " is not joinable");
+        LOGGER_INFO("Processing thread for stream " + config_.id + " is not joinable");
         return;
     }
 
@@ -100,7 +100,7 @@ void StreamProcessor::stop() {
 
         // 尝试温和地等待线程结束
         {
-            Logger::debug("Waiting for processing thread to end for stream: " + config_.id);
+            LOGGER_DEBUG("Waiting for processing thread to end for stream: " + config_.id);
 
             // 使用单独的线程和超时来等待处理线程
             std::atomic<bool> threadJoined{false};
@@ -113,9 +113,9 @@ void StreamProcessor::stop() {
                         threadJoined = true;
                     }
                 } catch (const std::exception& e) {
-                    Logger::error("Exception joining processing thread: " + std::string(e.what()));
+                    LOGGER_ERROR("Exception joining processing thread: " + std::string(e.what()));
                 } catch (...) {
-                    Logger::error("Unknown exception joining processing thread");
+                    LOGGER_ERROR("Unknown exception joining processing thread");
                 }
             });
 
@@ -125,7 +125,7 @@ void StreamProcessor::stop() {
             }
 
             if (!threadJoined) {
-                Logger::warning("Timeout joining processing thread for stream: " + config_.id);
+                LOGGER_WARNING("Timeout joining processing thread for stream: " + config_.id);
                 shouldDetach = true;
             }
 
@@ -143,29 +143,29 @@ void StreamProcessor::stop() {
         if (shouldDetach && processingThread_.joinable()) {
             try {
                 processingThread_.detach();
-                Logger::info("Detached processing thread for stream " + config_.id);
+                LOGGER_INFO("Detached processing thread for stream " + config_.id);
             } catch (const std::exception& e) {
-                Logger::error("Exception detaching processing thread: " + std::string(e.what()));
+                LOGGER_ERROR("Exception detaching processing thread: " + std::string(e.what()));
             }
         }
 
         // 确保进行完整的资源清理
         cleanup();
 
-        Logger::info("Stream " + config_.id + " successfully stopped");
+        LOGGER_INFO("Stream " + config_.id + " successfully stopped");
     } catch (const std::exception& e) {
-        Logger::error("Exception stopping stream " + config_.id + ": " + std::string(e.what()));
+        LOGGER_ERROR("Exception stopping stream " + config_.id + ": " + std::string(e.what()));
 
         // 最后的安全措施 - 尝试分离线程而不是让它挂起
         if (processingThread_.joinable()) {
             try {
                 processingThread_.detach();
             } catch (...) {
-                Logger::error("Final attempt to detach processing thread failed");
+                LOGGER_ERROR("Final attempt to detach processing thread failed");
             }
         }
     } catch (...) {
-        Logger::error("Unknown exception stopping stream " + config_.id);
+        LOGGER_ERROR("Unknown exception stopping stream " + config_.id);
 
         // 类似的最终安全措施
         if (processingThread_.joinable()) {
@@ -192,12 +192,12 @@ const StreamConfig& StreamProcessor::getConfig() const {
 
 bool StreamProcessor::updateConfig(const StreamConfig& config) {
     if (isRunning_) {
-        Logger::warning("Cannot update config while stream is running: " + config_.id);
+        LOGGER_WARNING("Cannot update config while stream is running: " + config_.id);
         return false;
     }
 
     if (!config.validate()) {
-        Logger::error("Invalid stream configuration for: " + config.id);
+        LOGGER_ERROR("Invalid stream configuration for: " + config.id);
         return false;
     }
 
@@ -223,7 +223,7 @@ void StreamProcessor::initialize() {
         }
     } else {
         setupInputStreams();
-        Logger::info("Stream " + config_.id + " initialized in pull-only mode (no pushing)");
+        LOGGER_INFO("Stream " + config_.id + " initialized in pull-only mode (no pushing)");
     }
 }
 
@@ -280,7 +280,7 @@ void StreamProcessor::openInput() {
         char *unused = nullptr;
         av_dict_get_string(options, &unused, '=', ',');
         if (unused) {
-            Logger::warning("Unused input options: " + std::string(unused));
+            LOGGER_WARNING("Unused input options: " + std::string(unused));
             av_free(unused);
         }
     }
@@ -306,7 +306,7 @@ void StreamProcessor::openInput() {
     }
 
     // 输出找到的流信息
-    Logger::debug("Input stream information:");
+    LOGGER_DEBUG("Input stream information:");
     for (unsigned int i = 0; i < inputFormatContext_->nb_streams; i++) {
         AVStream* stream = inputFormatContext_->streams[i];
 
@@ -321,41 +321,41 @@ void StreamProcessor::openInput() {
             default: streamType = "Other"; break;
         }
 
-        Logger::debug("  Stream #" + std::to_string(i) + ": " + streamType + " - " + codecName);
+        LOGGER_DEBUG("  Stream #" + std::to_string(i) + ": " + streamType + " - " + codecName);
 
         // 如果是视频流，打印更多信息
         if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            Logger::debug("    Resolution: " + std::to_string(stream->codecpar->width) + "x" +
+            LOGGER_DEBUG("    Resolution: " + std::to_string(stream->codecpar->width) + "x" +
                           std::to_string(stream->codecpar->height));
 
             if (stream->r_frame_rate.num && stream->r_frame_rate.den) {
                 double fps = (double)stream->r_frame_rate.num / stream->r_frame_rate.den;
-                Logger::debug("    Frame rate: " + std::to_string(fps) + " fps");
+                LOGGER_DEBUG("    Frame rate: " + std::to_string(fps) + " fps");
             } else {
-                Logger::warning("    Frame rate could not be determined");
+                LOGGER_WARNING("    Frame rate could not be determined");
             }
 
             // 获取视频编码器详细信息
             const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
             if (codec) {
-                Logger::debug("    Codec: " + std::string(codec->name) + " (" + codec->long_name + ")");
+                LOGGER_DEBUG("    Codec: " + std::string(codec->name) + " (" + codec->long_name + ")");
             }
         }
 
         // 如果是音频流，打印更多信息
         if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            Logger::debug("    Sample rate: " + std::to_string(stream->codecpar->sample_rate) + " Hz");
-            Logger::debug("    Channels: " + std::to_string(stream->codecpar->channels));
+            LOGGER_DEBUG("    Sample rate: " + std::to_string(stream->codecpar->sample_rate) + " Hz");
+            LOGGER_DEBUG("    Channels: " + std::to_string(stream->codecpar->channels));
 
             // 获取音频编码器详细信息
             const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
             if (codec) {
-                Logger::debug("    Codec: " + std::string(codec->name) + " (" + codec->long_name + ")");
+                LOGGER_DEBUG("    Codec: " + std::string(codec->name) + " (" + codec->long_name + ")");
             }
         }
     }
 
-    Logger::info("Successfully opened input: " + config_.inputUrl);
+    LOGGER_INFO("Successfully opened input: " + config_.inputUrl);
 }
 
 void StreamProcessor::openOutput() {
@@ -389,7 +389,7 @@ void StreamProcessor::openOutput() {
         }
     }
 
-    Logger::info("Successfully prepared output: " + config_.outputUrl);
+    LOGGER_INFO("Successfully prepared output: " + config_.outputUrl);
 }
 
 AVBufferRef* StreamProcessor::createHardwareDevice() {
@@ -398,7 +398,7 @@ AVBufferRef* StreamProcessor::createHardwareDevice() {
         return nullptr;
     }
 
-    Logger::debug("Attempting to create hardware device of type: " + config_.hwaccelType);
+    LOGGER_DEBUG("Attempting to create hardware device of type: " + config_.hwaccelType);
 
     // 如果是"auto"，尝试不同的硬件加速类型
     if (config_.hwaccelType == "auto") {
@@ -423,22 +423,22 @@ AVBufferRef* StreamProcessor::createHardwareDevice() {
                 continue;
 
             const char* typeName = av_hwdevice_get_type_name(hwType);
-            Logger::debug("Trying hardware type: " + std::string(typeName ? typeName : "Unknown"));
+            LOGGER_DEBUG("Trying hardware type: " + std::string(typeName ? typeName : "Unknown"));
 
             int ret = av_hwdevice_ctx_create(&hwDeviceContext, hwType, nullptr, nullptr, 0);
             if (ret >= 0) {
                 const char* hwName = av_hwdevice_get_type_name(hwType);
-                Logger::info("Auto-detected hardware acceleration: " + std::string(hwName));
+                LOGGER_INFO("Auto-detected hardware acceleration: " + std::string(hwName));
                 return hwDeviceContext;
             } else {
                 char errBuf[AV_ERROR_MAX_STRING_SIZE] = {0};
                 av_strerror(ret, errBuf, AV_ERROR_MAX_STRING_SIZE);
-                Logger::debug("Failed to initialize " + std::string(typeName ? typeName : "Unknown") +
+                LOGGER_DEBUG("Failed to initialize " + std::string(typeName ? typeName : "Unknown") +
                               " hardware: " + errBuf);
             }
         }
 
-        Logger::warning("No hardware acceleration device found, falling back to software");
+        LOGGER_WARNING("No hardware acceleration device found, falling back to software");
         return nullptr;
     }
 
@@ -447,7 +447,7 @@ AVBufferRef* StreamProcessor::createHardwareDevice() {
     AVHWDeviceType hwType = av_hwdevice_find_type_by_name(config_.hwaccelType.c_str());
 
     if (hwType == AV_HWDEVICE_TYPE_NONE) {
-        Logger::warning("Hardware acceleration type not found: " + config_.hwaccelType);
+        LOGGER_WARNING("Hardware acceleration type not found: " + config_.hwaccelType);
         return nullptr;
     }
 
@@ -455,12 +455,12 @@ AVBufferRef* StreamProcessor::createHardwareDevice() {
     if (ret < 0) {
         char errBuf[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(ret, errBuf, AV_ERROR_MAX_STRING_SIZE);
-        Logger::warning("Failed to create hardware device context (" + config_.hwaccelType +
+        LOGGER_WARNING("Failed to create hardware device context (" + config_.hwaccelType +
                         "): " + errBuf);
         return nullptr;
     }
 
-    Logger::info("Created hardware acceleration context: " + config_.hwaccelType);
+    LOGGER_INFO("Created hardware acceleration context: " + config_.hwaccelType);
     return hwDeviceContext;
 }
 
@@ -538,7 +538,7 @@ const AVCodec* StreamProcessor::getEncoderByHardwareType(AVHWDeviceType hwType, 
     for (const auto& candidate : encoderCandidates) {
         const AVCodec* encoder = avcodec_find_encoder_by_name(candidate.c_str());
         if (encoder) {
-            Logger::debug("Found encoder: " + candidate);
+            LOGGER_DEBUG("Found encoder: " + candidate);
             // 验证此编码器是否与硬件类型兼容
             if (hwType != AV_HWDEVICE_TYPE_NONE &&
                 candidate != "libx264" && candidate != "libx265") {
@@ -555,7 +555,7 @@ const AVCodec* StreamProcessor::getEncoderByHardwareType(AVHWDeviceType hwType, 
                 }
 
                 if (!supportsHW) {
-                    Logger::debug("Encoder " + candidate + " does not support hardware type " +
+                    LOGGER_DEBUG("Encoder " + candidate + " does not support hardware type " +
                                   av_hwdevice_get_type_name(hwType));
                     continue;  // 尝试下一个候选编码器
                 }
@@ -568,12 +568,12 @@ const AVCodec* StreamProcessor::getEncoderByHardwareType(AVHWDeviceType hwType, 
 
     if (!selectedEncoder) {
         // 如果找不到特定编码器，尝试使用默认编码器
-        Logger::warning("No suitable hardware encoder found, falling back to default");
+        LOGGER_WARNING("No suitable hardware encoder found, falling back to default");
         selectedEncoder = avcodec_find_encoder(codecId);
     }
 
     if (selectedEncoder) {
-        Logger::info("Selected encoder: " + std::string(selectedEncoder->name) +
+        LOGGER_INFO("Selected encoder: " + std::string(selectedEncoder->name) +
                      (hwType != AV_HWDEVICE_TYPE_NONE ?
                       " for hardware type: " + std::string(av_hwdevice_get_type_name(hwType)) :
                       " (software)"));
@@ -593,7 +593,7 @@ void StreamProcessor::setupStreams() {
             setupAudioStream(inputStream);
         } else {
             // 其他类型的流（字幕等）暂不处理
-            Logger::debug("Ignoring stream of type: " +
+            LOGGER_DEBUG("Ignoring stream of type: " +
                           std::to_string(inputStream->codecpar->codec_type));
         }
     }
@@ -623,7 +623,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
     }
     const AVCodec* decoder = avcodec_find_decoder_by_name(base_name.c_str());
     if (!decoder) {
-        Logger::warning("Unsupported video codec");
+        LOGGER_WARNING("Unsupported video codec");
         return;
     }
 
@@ -652,7 +652,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
                 streamCtx.decoderContext->hw_device_ctx = av_buffer_ref(streamCtx.hwDeviceContext);
                 hwType = ((AVHWDeviceContext*)streamCtx.hwDeviceContext->data)->type;
             } else {
-                Logger::warning("Decoder context not initialized, cannot attach hardware device");
+                LOGGER_WARNING("Decoder context not initialized, cannot attach hardware device");
             }
         }
     }
@@ -666,7 +666,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
 
         // Additional RKMPP specific options
         av_dict_set(&decoderOptions, "use_direct_mode", "0", 0);
-        Logger::info("Set up RKMPP decoder to use NV12 output format");
+        LOGGER_INFO("Set up RKMPP decoder to use NV12 output format");
     }
 
     // 设置解码器选项
@@ -682,7 +682,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
     if (ret < 0) {
         if (streamCtx.decoderContext->hw_device_ctx) {
             // 如果硬件解码失败，尝试回退到软件解码
-            Logger::warning("Hardware-accelerated decoding failed, falling back to software decoding");
+            LOGGER_WARNING("Hardware-accelerated decoding failed, falling back to software decoding");
             av_buffer_unref(&streamCtx.decoderContext->hw_device_ctx);
             streamCtx.decoderContext->hw_device_ctx = nullptr;
 
@@ -743,7 +743,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
         throw FFmpegException("Failed to find suitable video encoder");
     }
 
-    Logger::info("Using video encoder: " + std::string(encoder->name));
+    LOGGER_INFO("Using video encoder: " + std::string(encoder->name));
 
     // 分配编码器上下文
     streamCtx.encoderContext = avcodec_alloc_context3(encoder);
@@ -770,7 +770,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
         if (key == "hwaccel_pix_fmt") {
             pixFmtStr = value;
             std::transform(pixFmtStr.begin(), pixFmtStr.end(), pixFmtStr.begin(), ::tolower);
-            Logger::debug("User specified hardware pixel format: " + pixFmtStr);
+            LOGGER_DEBUG("User specified hardware pixel format: " + pixFmtStr);
         }
     }
 
@@ -796,20 +796,20 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
             }
 
             if (!formatSupported && encoder->pix_fmts) {
-                Logger::warning(" not supported by encoder");
+                LOGGER_WARNING(" not supported by encoder");
                 streamCtx.encoderContext->pix_fmt = encoder->pix_fmts[0];
             }
         }
 
-        Logger::info("Using hardware encoding with pixel format");
+        LOGGER_INFO("Using hardware encoding with pixel format");
     } else {
         // 对于软件编码，使用编码器支持的第一个格式
         if (encoder->pix_fmts) {
             streamCtx.encoderContext->pix_fmt = encoder->pix_fmts[0];
-            Logger::info("Using software encoding with pixel format");
+            LOGGER_INFO("Using software encoding with pixel format");
         } else {
             streamCtx.encoderContext->pix_fmt = AV_PIX_FMT_YUV420P; // 默认
-            Logger::info("Using default pixel format: YUV420P");
+            LOGGER_INFO("Using default pixel format: YUV420P");
         }
     }
 
@@ -860,10 +860,10 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
             ret = av_hwframe_ctx_init(hwFramesContext);
             if (ret < 0) {
                 av_buffer_unref(&hwFramesContext);
-                Logger::warning("Failed to initialize hardware frames context, falling back to software");
+                LOGGER_WARNING("Failed to initialize hardware frames context, falling back to software");
             } else {
                 streamCtx.encoderContext->hw_frames_ctx = hwFramesContext;
-                Logger::info("Hardware frame context initialized with format");
+                LOGGER_INFO("Hardware frame context initialized with format");
             }
         }
     }
@@ -901,7 +901,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
 
     // 添加到视频流列表
     videoStreams_.push_back(streamCtx);
-    Logger::info("Set up video stream: input#" + std::to_string(inputStream->index) +
+    LOGGER_INFO("Set up video stream: input#" + std::to_string(inputStream->index) +
                  " -> output#" + std::to_string(outputStream->index) +
                  " (" + std::string(encoder->name) + ")");
 }
@@ -915,7 +915,7 @@ void StreamProcessor::setupAudioStream(AVStream* inputStream) {
     // 查找解码器
     const AVCodec* decoder = avcodec_find_decoder(inputStream->codecpar->codec_id);
     if (!decoder) {
-        Logger::warning("Unsupported audio codec");
+        LOGGER_WARNING("Unsupported audio codec");
         return;
     }
 
@@ -1009,7 +1009,7 @@ void StreamProcessor::setupAudioStream(AVStream* inputStream) {
         }
     }
 
-    Logger::info("Using audio encoder: " + std::string(encoder->name));
+    LOGGER_INFO("Using audio encoder: " + std::string(encoder->name));
 
     // 分配编码器上下文
     streamCtx.encoderContext = avcodec_alloc_context3(encoder);
@@ -1101,7 +1101,7 @@ void StreamProcessor::setupAudioStream(AVStream* inputStream) {
 
     // 添加到音频流列表
     audioStreams_.push_back(streamCtx);
-    Logger::info("Set up audio stream: input#" + std::to_string(inputStream->index) +
+    LOGGER_INFO("Set up audio stream: input#" + std::to_string(inputStream->index) +
                  " -> output#" + std::to_string(outputStream->index) +
                  " (" + std::string(encoder->name) + ")");
 }
@@ -1117,7 +1117,7 @@ void StreamProcessor::setupInputStreams() {
             setupInputAudioStream(inputStream);
         } else {
             // 忽略其他类型的流（字幕等）
-            Logger::debug("Ignoring stream of type: " +
+            LOGGER_DEBUG("Ignoring stream of type: " +
                           std::to_string(inputStream->codecpar->codec_type));
         }
     }
@@ -1148,7 +1148,7 @@ void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
     }
     const AVCodec* decoder = avcodec_find_decoder_by_name(base_name.c_str());
     if (!decoder) {
-        Logger::warning("Unsupported video codec");
+        LOGGER_WARNING("Unsupported video codec");
         return;
     }
 
@@ -1177,7 +1177,7 @@ void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
                 streamCtx.decoderContext->hw_device_ctx = av_buffer_ref(streamCtx.hwDeviceContext);
                 hwType = ((AVHWDeviceContext*)streamCtx.hwDeviceContext->data)->type;
             } else {
-                Logger::warning("Decoder context not initialized, cannot attach hardware device");
+                LOGGER_WARNING("Decoder context not initialized, cannot attach hardware device");
             }
         }
     }
@@ -1191,7 +1191,7 @@ void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
 
         // Additional RKMPP specific options
         av_dict_set(&decoderOptions, "use_direct_mode", "0", 0);
-        Logger::info("Set up RKMPP decoder to use NV12 output format");
+        LOGGER_INFO("Set up RKMPP decoder to use NV12 output format");
     }
 
     // 设置解码器选项
@@ -1207,7 +1207,7 @@ void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
     if (ret < 0) {
         if (streamCtx.decoderContext->hw_device_ctx) {
             // 如果硬件解码失败，尝试回退到软件解码
-            Logger::warning("Hardware-accelerated decoding failed, falling back to software decoding");
+            LOGGER_WARNING("Hardware-accelerated decoding failed, falling back to software decoding");
             av_buffer_unref(&streamCtx.decoderContext->hw_device_ctx);
             streamCtx.decoderContext->hw_device_ctx = nullptr;
 
@@ -1221,7 +1221,7 @@ void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
         }
     }
 
-    Logger::info("stream fps is: " + std::to_string(av_q2d(inputStream->avg_frame_rate)));
+    LOGGER_INFO("stream fps is: " + std::to_string(av_q2d(inputStream->avg_frame_rate)));
 
     // 由于我们不推流，将输出流设为 nullptr
     streamCtx.outputStream = nullptr;
@@ -1238,7 +1238,7 @@ void StreamProcessor::setupInputVideoStream(AVStream* inputStream) {
 
     // 添加到视频流列表
     videoStreams_.push_back(streamCtx);
-    Logger::info("Set up input-only video stream: input#" + std::to_string(inputStream->index));
+    LOGGER_INFO("Set up input-only video stream: input#" + std::to_string(inputStream->index));
 }
 
 void StreamProcessor::setupInputAudioStream(AVStream* inputStream) {
@@ -1250,7 +1250,7 @@ void StreamProcessor::setupInputAudioStream(AVStream* inputStream) {
     // 查找解码器
     const AVCodec* decoder = avcodec_find_decoder(inputStream->codecpar->codec_id);
     if (!decoder) {
-        Logger::warning("Unsupported audio codec");
+        LOGGER_WARNING("Unsupported audio codec");
         return;
     }
 
@@ -1296,7 +1296,7 @@ void StreamProcessor::setupInputAudioStream(AVStream* inputStream) {
 
     // 添加到音频流列表
     audioStreams_.push_back(streamCtx);
-    Logger::info("Set up input-only audio stream: input#" + std::to_string(inputStream->index));
+    LOGGER_INFO("Set up input-only audio stream: input#" + std::to_string(inputStream->index));
 }
 
 // 添加到processLoop方法中，增强调试信息输出
@@ -1305,7 +1305,7 @@ void StreamProcessor::processLoop() {
     try {
         packet = av_packet_alloc();
         if (!packet) {
-            Logger::error("Failed to allocate packet memory");
+            LOGGER_ERROR("Failed to allocate packet memory");
             hasError_ = true;
             return;
         }
@@ -1319,25 +1319,25 @@ void StreamProcessor::processLoop() {
         // 记录开始时间
         int64_t startTime = av_gettime() / 1000000;
         lastFrameTime_ = av_gettime();
-        Logger::info("Starting process loop for stream: " + config_.id);
+        LOGGER_INFO("Starting process loop for stream: " + config_.id);
 
         // 处理循环
         while (isRunning_) {
             try {
                 // 检查退出信号
                 if (!isRunning_) {
-                    Logger::info("Exit signal detected for stream: " + config_.id);
+                    LOGGER_INFO("Exit signal detected for stream: " + config_.id);
                     break;
                 }
 
                 // 检查流是否停滞
                 if (isStreamStalled() && !reconnectInProgress) {
-                    Logger::warning("Stream " + config_.id + " appears stalled (no data for "
+                    LOGGER_WARNING("Stream " + config_.id + " appears stalled (no data for "
                                     + std::to_string(noDataTimeout_ / 1000000) + " seconds)");
 
                     reconnectInProgress = true;
                     if (!reconnect()) {
-                        Logger::error("Failed to reconnect stream " + config_.id + ", entering wait mode");
+                        LOGGER_ERROR("Failed to reconnect stream " + config_.id + ", entering wait mode");
                         hasError_ = true;
                         av_usleep(5000000); // 5秒
                         reconnectInProgress = false;
@@ -1350,7 +1350,7 @@ void StreamProcessor::processLoop() {
 
                 // 检查输入上下文是否有效
                 if (!inputFormatContext_) {
-                    Logger::error("Input context invalid for stream: " + config_.id);
+                    LOGGER_ERROR("Input context invalid for stream: " + config_.id);
                     hasError_ = true;
                     av_usleep(1000000); // 1秒
                     continue;
@@ -1366,12 +1366,12 @@ void StreamProcessor::processLoop() {
 
                         if (config_.isLocalFile) {
                             // 对于本地MP4文件，循环回到开始位置
-                            Logger::info("End of local file reached, seeking back to beginning: " + config_.id);
+                            LOGGER_INFO("End of local file reached, seeking back to beginning: " + config_.id);
 
                             // 定位到文件开始位置
                             ret = av_seek_frame(inputFormatContext_, -1, 0, AVSEEK_FLAG_BACKWARD);
                             if (ret < 0) {
-                                Logger::error("Failed to seek to the beginning of the file: " + config_.id);
+                                LOGGER_ERROR("Failed to seek to the beginning of the file: " + config_.id);
                                 break;
                             }
 
@@ -1392,7 +1392,7 @@ void StreamProcessor::processLoop() {
                             lastFrameTime_ = av_gettime();
                             continue;
                         } else {
-                            Logger::info("End of input stream: " + config_.id);
+                            LOGGER_INFO("End of input stream: " + config_.id);
                             break;
                         }
                     } else if (ret == AVERROR(EAGAIN)) {
@@ -1401,12 +1401,12 @@ void StreamProcessor::processLoop() {
                     } else {
                         streamErrorCount++;
                         if (streamErrorCount > MAX_ERRORS_BEFORE_RECONNECT && !reconnectInProgress) {
-                            Logger::warning("Too many consecutive errors (" + std::to_string(streamErrorCount)
+                            LOGGER_WARNING("Too many consecutive errors (" + std::to_string(streamErrorCount)
                                             + "), attempting reconnection");
 
                             reconnectInProgress = true;
                             if (!reconnect()) {
-                                Logger::error("Failed to reconnect stream " + config_.id + ", entering wait mode");
+                                LOGGER_ERROR("Failed to reconnect stream " + config_.id + ", entering wait mode");
                                 hasError_ = true;
                                 av_usleep(5000000); // 5秒
                                 reconnectInProgress = false;
@@ -1417,7 +1417,7 @@ void StreamProcessor::processLoop() {
                             continue;
                         }
 
-                        Logger::warning("Error reading frame (attempt " + std::to_string(streamErrorCount) +
+                        LOGGER_WARNING("Error reading frame (attempt " + std::to_string(streamErrorCount) +
                                         "/" + std::to_string(MAX_ERRORS_BEFORE_RECONNECT) + "): " +
                                         std::to_string(ret));
                         av_usleep(100000);  // 错误后休眠100毫秒
@@ -1438,15 +1438,15 @@ void StreamProcessor::processLoop() {
                             packetProcessed = true;
                             frameCount++;
                         } catch (const FFmpegException& e) {
-                            Logger::error("Error processing video packet: " + std::string(e.what()));
+                            LOGGER_ERROR("Error processing video packet: " + std::string(e.what()));
                             // If error is related to writing, attempt reconnection
                             if (std::string(e.what()).find("Error writing encoded packet") != std::string::npos) {
                                 if (!reconnectInProgress) {
-                                    Logger::warning("Output error detected, attempting reconnection");
+                                    LOGGER_WARNING("Output error detected, attempting reconnection");
                                     reconnectInProgress = true;
                                     if (!reconnect()) {
                                         // Just log and continue - don't exit the loop
-                                        Logger::error("Failed to reconnect stream " + config_.id + " after output error");
+                                        LOGGER_ERROR("Failed to reconnect stream " + config_.id + " after output error");
                                         hasError_ = true;
                                         av_usleep(5000000); // 5 seconds
                                     }
@@ -1466,14 +1466,14 @@ void StreamProcessor::processLoop() {
                                 processAudioPacket(packet, streamCtx);
                                 packetProcessed = true;
                             } catch (const FFmpegException& e) {
-                                Logger::error("Error processing audio packet: " + std::string(e.what()));
+                                LOGGER_ERROR("Error processing audio packet: " + std::string(e.what()));
                                 // Handle output errors similar to video
                                 if (std::string(e.what()).find("Error writing encoded packet") != std::string::npos) {
                                     if (!reconnectInProgress) {
-                                        Logger::warning("Output error detected, attempting reconnection");
+                                        LOGGER_WARNING("Output error detected, attempting reconnection");
                                         reconnectInProgress = true;
                                         if (!reconnect()) {
-                                            Logger::error("Failed to reconnect stream " + config_.id + " after output error");
+                                            LOGGER_ERROR("Failed to reconnect stream " + config_.id + " after output error");
                                             hasError_ = true;
                                             av_usleep(5000000); // 5 seconds
                                         }
@@ -1493,7 +1493,7 @@ void StreamProcessor::processLoop() {
                     int64_t runTime = currentTime - startTime;
                     double avgFps = runTime > 0 ? (double)frameCount / runTime : 0;
 
-                    Logger::debug("Stream " + config_.id + " processed " +
+                    LOGGER_DEBUG("Stream " + config_.id + " processed " +
                                   std::to_string(frameCount) + " frames, avg. " +
                                   std::to_string(avgFps) + " fps (running for " +
                                   std::to_string(runTime) + " seconds)");
@@ -1510,13 +1510,13 @@ void StreamProcessor::processLoop() {
                     av_packet_unref(packet);
                 }
 
-                Logger::error("Stream processing error: " + std::string(e.what()));
+                LOGGER_ERROR("Stream processing error: " + std::string(e.what()));
 
                 if (!reconnectInProgress && isRunning_) {
-                    Logger::warning("Stream error detected, attempting reconnection");
+                    LOGGER_WARNING("Stream error detected, attempting reconnection");
                     reconnectInProgress = true;
                     if (!reconnect()) {
-                        Logger::error("Failed to reconnect stream " + config_.id + ", entering wait mode");
+                        LOGGER_ERROR("Failed to reconnect stream " + config_.id + ", entering wait mode");
                         hasError_ = true;
                         av_usleep(5000000); // 5秒
                         reconnectInProgress = false;
@@ -1531,7 +1531,7 @@ void StreamProcessor::processLoop() {
                     av_packet_unref(packet);
                 }
 
-                Logger::error("Standard exception in stream " + config_.id + ": " + std::string(e.what()));
+                LOGGER_ERROR("Standard exception in stream " + config_.id + ": " + std::string(e.what()));
                 av_usleep(1000000); // 1秒
             } catch (...) {
                 // 安全地释放包
@@ -1539,7 +1539,7 @@ void StreamProcessor::processLoop() {
                     av_packet_unref(packet);
                 }
 
-                Logger::error("Unknown exception in stream " + config_.id);
+                LOGGER_ERROR("Unknown exception in stream " + config_.id);
                 av_usleep(1000000); // 1秒
             }
         }
@@ -1549,16 +1549,16 @@ void StreamProcessor::processLoop() {
         int64_t totalTime = endTime - startTime;
         double avgFps = totalTime > 0 ? (double)frameCount / totalTime : 0;
 
-        Logger::info("Exiting process loop for stream: " + config_.id + " after " +
+        LOGGER_INFO("Exiting process loop for stream: " + config_.id + " after " +
                      std::to_string(totalTime) + " seconds, processed " +
                      std::to_string(frameCount) + " frames (avg. " +
                      std::to_string(avgFps) + " fps)");
 
     } catch (const std::exception& e) {
-        Logger::error("Critical exception in stream processing loop: " + std::string(e.what()));
+        LOGGER_ERROR("Critical exception in stream processing loop: " + std::string(e.what()));
         hasError_ = true;
     } catch (...) {
-        Logger::error("Unknown critical exception in stream processing loop");
+        LOGGER_ERROR("Unknown critical exception in stream processing loop");
         hasError_ = true;
     }
 
@@ -1591,7 +1591,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
             // 接收解码后的帧
             ret = avcodec_receive_frame(streamCtx.decoderContext, streamCtx.frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                Logger::debug("decoder frame is failed, errorCode is: " + std::to_string(ret));
+                LOGGER_DEBUG("decoder frame is failed, errorCode is: " + std::to_string(ret));
                 break;
             } else if (ret < 0) {
                 throw FFmpegException("Error receiving frame from decoder", ret);
@@ -1609,10 +1609,10 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 pts = av_rescale_q(pts, streamCtx.inputStream->time_base, {1, 1000});
             }
 
-            Logger::debug("帧格式为: " + std::to_string(streamCtx.frame->format) + " 硬件帧格式为: " + std::to_string(streamCtx.hwFrame->format));
+            LOGGER_DEBUG("帧格式为: " + std::to_string(streamCtx.frame->format) + " 硬件帧格式为: " + std::to_string(streamCtx.hwFrame->format));
 
             if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME) {
-                Logger::debug("Detected DRM_PRIME format (179), converting to NV12 for processing");
+                LOGGER_DEBUG("Detected DRM_PRIME format (179), converting to NV12 for processing");
 
                 // Prepare the hw frame for NV12 format
                 streamCtx.hwFrame->width = streamCtx.frame->width;
@@ -1631,7 +1631,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
                 if (ret < 0) {
                     // If standard transfer fails, we need to handle this in a specialized way
-                    Logger::warning("Standard hardware frame transfer failed for DRM_PRIME, using fallback method");
+                    LOGGER_WARNING("Standard hardware frame transfer failed for DRM_PRIME, using fallback method");
 
                     // RKMPP specific handling - If needed, implement custom mapping here
                     // This is placeholder code - actual implementation depends on your SDK
@@ -1660,7 +1660,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
 
                 hwFrameUsed = true;
 
-                Logger::debug("DRM_PRIME frame converted to NV12 format");
+                LOGGER_DEBUG("DRM_PRIME frame converted to NV12 format");
             }
 
             // 调用帧处理函数
@@ -1705,7 +1705,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                         frameToEncode->format == AV_PIX_FMT_DRM_PRIME) {
                         // 转换为编码器期望的格式，通常是NV12或YUV420P
                         frameToEncode->format = streamCtx.encoderContext->pix_fmt;
-                        Logger::debug("Corrected invalid pixel format");
+                        LOGGER_DEBUG("Corrected invalid pixel format");
                     }
                 }
             }
@@ -1730,7 +1730,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                     needsConversion = true;
                 } else {
                     // 硬件格式之间的转换由硬件处理
-                    Logger::debug("Both source and target are hardware formats, skipping software conversion");
+                    LOGGER_DEBUG("Both source and target are hardware formats, skipping software conversion");
                     needsConversion = false;
                 }
             }
@@ -1745,7 +1745,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 }
 
                 if (directNV12Support) {
-                    Logger::debug("Using direct NV12 input to hardware encoder, skipping conversion");
+                    LOGGER_DEBUG("Using direct NV12 input to hardware encoder, skipping conversion");
                     needsConversion = false;
                 }
             }
@@ -1758,7 +1758,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                     AVPixelFormat srcFormat = (AVPixelFormat)frameToEncode->format;
                     if (srcFormat == AV_PIX_FMT_NONE || srcFormat == AV_PIX_FMT_DRM_PRIME) {
                         srcFormat = AV_PIX_FMT_NV12;  // 默认假设NV12
-                        Logger::warning("Invalid source format, assuming NV12");
+                        LOGGER_WARNING("Invalid source format, assuming NV12");
                     }
 
                     streamCtx.swsContext = sws_getContext(
@@ -1770,11 +1770,11 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                     );
 
                     if (!streamCtx.swsContext) {
-                        Logger::error("Failed to create scaling context: source format");
+                        LOGGER_ERROR("Failed to create scaling context: source format");
                         throw FFmpegException("Failed to create scaling context");
                     }
 
-                    Logger::info("Created scaling context");
+                    LOGGER_INFO("Created scaling context");
                 }
 
                 // 为缩放输出分配帧缓冲区
@@ -2063,9 +2063,9 @@ void StreamProcessor::cleanup() {
         videoStreams_.clear();
         audioStreams_.clear();
 
-        Logger::debug("Resources cleanup completed for stream " + config_.id);
+        LOGGER_DEBUG("Resources cleanup completed for stream " + config_.id);
     } catch (const std::exception& e) {
-        Logger::error("Exception during resource cleanup: " + std::string(e.what()));
+        LOGGER_ERROR("Exception during resource cleanup: " + std::string(e.what()));
         // 即使发生异常，也确保将指针置空以防止释放后使用
         inputFormatContext_ = nullptr;
         outputFormatContext_ = nullptr;
@@ -2108,12 +2108,12 @@ bool StreamProcessor::isStreamStalled() const {
 bool StreamProcessor::reconnect() {
     // 如果已经达到最大重连尝试次数，不要继续
     if (reconnectAttempts_ >= maxReconnectAttempts_) {
-        Logger::error("Stream " + config_.id + " exceeded maximum reconnection attempts ("
+        LOGGER_ERROR("Stream " + config_.id + " exceeded maximum reconnection attempts ("
                       + std::to_string(maxReconnectAttempts_) + ")");
         return false;
     }
 
-    Logger::warning("Attempting to reconnect stream: " + config_.id + " (attempt "
+    LOGGER_WARNING("Attempting to reconnect stream: " + config_.id + " (attempt "
                     + std::to_string(reconnectAttempts_ + 1) + "/"
                     + std::to_string(maxReconnectAttempts_) + ")");
 
@@ -2124,7 +2124,7 @@ bool StreamProcessor::reconnect() {
     int64_t reconnectDelay = 1000000 * (1 << (reconnectAttempts_ - 1));
     reconnectDelay = std::min(reconnectDelay, (int64_t)30000000); // 最多30秒
 
-    Logger::info("Waiting " + std::to_string(reconnectDelay / 1000000) + " seconds before reconnecting");
+    LOGGER_INFO("Waiting " + std::to_string(reconnectDelay / 1000000) + " seconds before reconnecting");
     av_usleep(reconnectDelay);
 
     try {
@@ -2135,19 +2135,19 @@ bool StreamProcessor::reconnect() {
         initialize();
 
         // 成功后重置状态变量
-        Logger::info("Successfully reconnected stream: " + config_.id);
+        LOGGER_INFO("Successfully reconnected stream: " + config_.id);
         resetErrorState();
         isReconnecting_ = false;
         return true;
     } catch (const FFmpegException& e) {
-        Logger::error("Failed to reconnect stream " + config_.id + ": " + std::string(e.what()));
+        LOGGER_ERROR("Failed to reconnect stream " + config_.id + ": " + std::string(e.what()));
 
         // 确保即使在失败后也处于一致状态
         try {
             // 额外的清理尝试，确保资源被释放
             cleanup();
         } catch (...) {
-            Logger::error("Error during cleanup after failed reconnection");
+            LOGGER_ERROR("Error during cleanup after failed reconnection");
         }
 
         isReconnecting_ = false;
@@ -2165,14 +2165,14 @@ bool StreamProcessor::reconnect() {
 void StreamProcessor::setVideoFrameCallback(VideoFrameCallback callback) {
     std::lock_guard<std::mutex> lock(callbackMutex_);
     videoFrameCallback_ = callback;
-    Logger::info("Video frame callback set for stream: " + config_.id);
+    LOGGER_INFO("Video frame callback set for stream: " + config_.id);
 }
 
 // 设置音频帧回调函数
 void StreamProcessor::setAudioFrameCallback(AudioFrameCallback callback) {
     std::lock_guard<std::mutex> lock(callbackMutex_);
     audioFrameCallback_ = callback;
-    Logger::info("Audio frame callback set for stream: " + config_.id);
+    LOGGER_INFO("Audio frame callback set for stream: " + config_.id);
 }
 
 // 处理视频帧的方法
@@ -2182,9 +2182,9 @@ void StreamProcessor::handleVideoFrame(const AVFrame* frame, int64_t pts, int fp
         try {
             videoFrameCallback_(frame, pts, fps);
         } catch (const std::exception& e) {
-            Logger::error("Exception in video frame callback: " + std::string(e.what()));
+            LOGGER_ERROR("Exception in video frame callback: " + std::string(e.what()));
         } catch (...) {
-            Logger::error("Unknown exception in video frame callback");
+            LOGGER_ERROR("Unknown exception in video frame callback");
         }
     }
 }
@@ -2196,9 +2196,9 @@ void StreamProcessor::handleAudioFrame(const AVFrame* frame, int64_t pts, int fp
         try {
             audioFrameCallback_(frame, pts, fps);
         } catch (const std::exception& e) {
-            Logger::error("Exception in audio frame callback: " + std::string(e.what()));
+            LOGGER_ERROR("Exception in audio frame callback: " + std::string(e.what()));
         } catch (...) {
-            Logger::error("Unknown exception in audio frame callback");
+            LOGGER_ERROR("Unknown exception in audio frame callback");
         }
     }
 }

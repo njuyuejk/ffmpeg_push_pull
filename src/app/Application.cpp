@@ -74,7 +74,7 @@ bool Application::initialize(const std::string& configFilePath) {
     }
 
     if (periodicReconnectInterval_ > 0) {
-        Logger::info("Periodic reconnect enabled, interval: " +
+        LOGGER_INFO("Periodic reconnect enabled, interval: " +
                      std::to_string(periodicReconnectInterval_) + " seconds");
     }
 
@@ -88,12 +88,12 @@ bool Application::initialize(const std::string& configFilePath) {
     isHttpConnect_ = true;
 
     if (!httpClient_->Head("/")) {
-        Logger::error("HTTP server connect failed: " + httpConfig.host + ":" +
+        LOGGER_ERROR("HTTP server connect failed: " + httpConfig.host + ":" +
                       std::to_string(httpConfig.port));
         isHttpConnect_ = false;
     }
 
-    Logger::info("HTTP server connect info: " + httpConfig.host + ":" + std::to_string(httpConfig.port));
+    LOGGER_INFO("HTTP server connect info: " + httpConfig.host + ":" + std::to_string(httpConfig.port));
 
     // 获取应用程序配置
     monitorIntervalSeconds_ = 30; // 默认30秒
@@ -111,7 +111,7 @@ bool Application::initialize(const std::string& configFilePath) {
     useWatchdog_ = AppConfig::getUseWatchdog();
     watchdogIntervalSeconds_ = AppConfig::getWatchdogInterval();
 
-    Logger::info("Configuration loaded - watchdog: " + std::string(useWatchdog_ ? "enabled" : "disabled") +
+    LOGGER_INFO("Configuration loaded - watchdog: " + std::string(useWatchdog_ ? "enabled" : "disabled") +
                  ", interval: " + std::to_string(watchdogIntervalSeconds_) + "s");
 
     // 注册信号处理器
@@ -130,9 +130,9 @@ bool Application::initialize(const std::string& configFilePath) {
             // 将看门狗设置到流管理器
             streamManager_->setWatchdog(watchdog_.get());
 
-            Logger::info("Watchdog started with interval: " + std::to_string(watchdogIntervalSeconds_) + "s");
+            LOGGER_INFO("Watchdog started with interval: " + std::to_string(watchdogIntervalSeconds_) + "s");
         } catch (const std::exception& e) {
-            Logger::error("Failed to setup watchdog: " + std::string(e.what()));
+            LOGGER_ERROR("Failed to setup watchdog: " + std::string(e.what()));
             useWatchdog_ = false;
             watchdog_.reset();
         }
@@ -140,19 +140,19 @@ bool Application::initialize(const std::string& configFilePath) {
 
     // 初始化MQTT客户端
     if (!initializeMQTTClients()) {
-        Logger::warning("Failed to initialize MQTT clients, continuing without MQTT support");
+        LOGGER_WARNING("Failed to initialize MQTT clients, continuing without MQTT support");
     }
 
     running_ = true;
 
-    Logger::info("Application initialized with config: " + configFilePath_);
+    LOGGER_INFO("Application initialized with config: " + configFilePath_);
     return true;
 }
 
 // 运行应用
 int Application::run() {
     // 主循环 - 监控所有流
-    Logger::info("Starting main loop, press Ctrl+C to exit");
+    LOGGER_INFO("Starting main loop, press Ctrl+C to exit");
 
     // 启动所有配置的流
     startAllStreams();
@@ -161,6 +161,8 @@ int Application::run() {
     setupCustomFrameProcessing();
 
     lastPeriodicReconnectTime_ = time(nullptr);
+
+    publishAIStatus("main_server");
 
     // 监控循环
     while (running_) {
@@ -177,18 +179,22 @@ int Application::run() {
 
 // 处理信号
 void Application::handleSignal(int signal) {
-    Logger::info("Received signal: " + std::to_string(signal));
+    LOGGER_INFO("Received signal: " + std::to_string(signal));
     running_ = false;
 }
 
 // 清理应用
 void Application::cleanup() {
-    Logger::info("Cleaning up application resources...");
+    LOGGER_INFO("Cleaning up application resources...");
     running_ = false;  // 确保主循环终止
 
     // 记录清理开始时间（用于超时）
     auto cleanupStart = std::chrono::steady_clock::now();
     bool cleanupCompleted = false;
+
+    if (mqttAIStatusThread && mqttAIStatusThread->joinable()) {
+        mqttAIStatusThread->join();
+    }
 
     // 清理mqtt连接
     cleanupMQTTClients();
@@ -205,11 +211,11 @@ void Application::cleanup() {
                     watchdog_->stop();
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     watchdog_.reset();
-                    Logger::info("Watchdog stopped and cleaned up");
+                    LOGGER_INFO("Watchdog stopped and cleaned up");
                 } catch (const std::exception& e) {
-                    Logger::error("Error stopping watchdog: " + std::string(e.what()));
+                    LOGGER_ERROR("Error stopping watchdog: " + std::string(e.what()));
                 } catch (...) {
-                    Logger::error("Unknown error stopping watchdog");
+                    LOGGER_ERROR("Unknown error stopping watchdog");
                 }
             }
 
@@ -222,19 +228,19 @@ void Application::cleanup() {
                     stopAllStreams();
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                     streamManager_.reset();
-                    Logger::info("Stream manager cleaned up");
+                    LOGGER_INFO("Stream manager cleaned up");
                 } catch (const std::exception& e) {
-                    Logger::error("Error cleaning up stream manager: " + std::string(e.what()));
+                    LOGGER_ERROR("Error cleaning up stream manager: " + std::string(e.what()));
                 } catch (...) {
-                    Logger::error("Unknown error cleaning up stream manager");
+                    LOGGER_ERROR("Unknown error cleaning up stream manager");
                 }
             }
 
             cleanupCompleted = true;
         } catch (const std::exception& e) {
-            Logger::error("Exception during cleanup process: " + std::string(e.what()));
+            LOGGER_ERROR("Exception during cleanup process: " + std::string(e.what()));
         } catch (...) {
-            Logger::error("Unknown exception during cleanup process");
+            LOGGER_ERROR("Unknown exception during cleanup process");
         }
     });
 
@@ -248,7 +254,7 @@ void Application::cleanup() {
 
     // 处理清理超时
     if (!cleanupCompleted) {
-        Logger::warning("Cleanup operation timed out, proceeding with forced exit");
+        LOGGER_WARNING("Cleanup operation timed out, proceeding with forced exit");
 
         if (cleanupThread.joinable()) {
             cleanupThread.detach();
@@ -286,13 +292,13 @@ void Application::listStreams() {
 
     std::vector<std::string> streams = streamManager_->listStreams();
 
-    Logger::info("Running streams (" + std::to_string(streams.size()) + "):");
+    LOGGER_INFO("Running streams (" + std::to_string(streams.size()) + "):");
     for (const auto& streamId : streams) {
         std::string status = streamManager_->hasStreamError(streamId) ? "ERROR" :
                              (streamManager_->isStreamRunning(streamId) ? "RUNNING" : "STOPPED");
 
         StreamConfig config = streamManager_->getStreamConfig(streamId);
-        Logger::info("  - " + streamId + " [" + status + "] " +
+        LOGGER_INFO("  - " + streamId + " [" + status + "] " +
                      config.inputUrl + " -> " + config.outputUrl);
     }
     streams.clear();
@@ -311,15 +317,15 @@ void Application::monitorStreams() {
     }
 
     if (!isHttpConnect_) {
-        Logger::info("reconnect http server");
+        LOGGER_INFO("reconnect http server");
         const HTTPServerConfig& httpConfig = AppConfig::getHTTPServerConfig();
         httpClient_ = std::make_unique<httplib::Client>(httpConfig.host, httpConfig.port);
         httpClient_->set_connection_timeout(httpConfig.connectionTimeout);
         if (!httpClient_->Head("/")) {
-            Logger::error("reconnect http server failed: " + httpConfig.host + ":" +
+            LOGGER_ERROR("reconnect http server failed: " + httpConfig.host + ":" +
                           std::to_string(httpConfig.port));
         } else {
-            Logger::info("reconnect http server success: " + httpConfig.host + ":" +
+            LOGGER_INFO("reconnect http server success: " + httpConfig.host + ":" +
                          std::to_string(httpConfig.port));
             isHttpConnect_ = true;
         }
@@ -351,7 +357,7 @@ void Application::monitorStreams() {
             if (lastRestartTime.find(streamId) != lastRestartTime.end() &&
                 currentTime - lastRestartTime[streamId] > RESTART_RESET_TIME) {
                 restartAttempts[streamId] = 0;
-                Logger::debug("Reset restart counter for stream: " + streamId);
+                LOGGER_DEBUG("Reset restart counter for stream: " + streamId);
             }
             continue; // 流正常运行，无需处理
         }
@@ -360,7 +366,7 @@ void Application::monitorStreams() {
         bool unhealthyInWatchdog = false;
         if (watchdog_ && !watchdog_->isTargetHealthy("stream_" + streamId)) {
             int failCount = watchdog_->getTargetFailCount("stream_" + streamId);
-            Logger::warning("Stream " + streamId + " unhealthy according to watchdog (failures: " +
+            LOGGER_WARNING("Stream " + streamId + " unhealthy according to watchdog (failures: " +
                             (failCount >= 0 ? std::to_string(failCount) : "unknown") + ")");
             unhealthyInWatchdog = true;
         }
@@ -383,7 +389,7 @@ void Application::monitorStreams() {
 
                 // 仅在进入长重试模式时记录一次
                 if (restartAttempts[streamId] == MAX_RESTART_ATTEMPTS) {
-                    Logger::warning("Stream " + streamId + " entered long retry mode after " +
+                    LOGGER_WARNING("Stream " + streamId + " entered long retry mode after " +
                                     std::to_string(MAX_RESTART_ATTEMPTS) + " attempts");
                 }
             } else {
@@ -400,9 +406,9 @@ void Application::monitorStreams() {
 
             // 记录重连尝试
             if (usingLongRetryInterval) {
-                Logger::info("Periodic retry for stream: " + streamId + " (in long retry mode)");
+                LOGGER_INFO("Periodic retry for stream: " + streamId + " (in long retry mode)");
             } else {
-                Logger::warning("Attempting to reconnect stream: " + streamId + " (attempt "
+                LOGGER_WARNING("Attempting to reconnect stream: " + streamId + " (attempt "
                                 + std::to_string(restartAttempts[streamId] + 1) + ")");
             }
 
@@ -419,7 +425,7 @@ void Application::monitorStreams() {
     if (periodicReconnectInterval_ > 0) {
         int64_t currentTime = time(nullptr);
         if (currentTime - lastPeriodicReconnectTime_ > periodicReconnectInterval_) {
-            Logger::info("Performing periodic reconnect check");
+            LOGGER_INFO("Performing periodic reconnect check");
 
             // 保存有错误的流
             std::vector<std::string> errorStreams;
@@ -431,7 +437,7 @@ void Application::monitorStreams() {
 
             // 重启每个失败的流（使用线程池异步方式）
             for (const auto& streamId : errorStreams) {
-                Logger::info("Periodic reconnect for stream with error: " + streamId);
+                LOGGER_INFO("Periodic reconnect for stream with error: " + streamId);
                 streamManager_->asyncReconnectStream(streamId);
             }
 
@@ -464,16 +470,16 @@ void Application::startAllStreams() {
         }
 
         if (!autoStart) {
-            Logger::info("Skipping auto-start for stream: " + config.id + " (autoStart=false)");
+            LOGGER_INFO("Skipping auto-start for stream: " + config.id + " (autoStart=false)");
             continue;
         }
 
         try {
             streamManager_->startStream(config);
-            Logger::info("Started stream: " + config.id);
+            LOGGER_INFO("Started stream: " + config.id);
             successCount++;
         } catch (const FFmpegException& e) {
-            Logger::error("Failed to start stream " + config.id + ": " + e.what());
+            LOGGER_ERROR("Failed to start stream " + config.id + ": " + e.what());
         }
     }
 
@@ -484,7 +490,7 @@ void Application::startAllStreams() {
 
 //    test_model();
 
-    Logger::info("Started " + std::to_string(successCount) + " of " +
+    LOGGER_INFO("Started " + std::to_string(successCount) + " of " +
                  std::to_string(configs.size()) + " streams");
 }
 
@@ -493,7 +499,7 @@ void Application::stopAllStreams() {
     if (!streamManager_) return;
 
     streamManager_->stopAll();
-    Logger::info("Stopped all streams");
+    LOGGER_INFO("Stopped all streams");
 }
 
 void Application::setupCustomFrameProcessing() {
@@ -534,7 +540,7 @@ void Application::setupCustomFrameProcessing() {
             for (const auto& modelConfig : config.models) {
                 // 跳过禁用的模型
                 if (!modelConfig.enabled) {
-                    Logger::info("流 " + streamId + " 的模型类型 " +
+                    LOGGER_INFO("流 " + streamId + " 的模型类型 " +
                                  std::to_string(modelConfig.modelType) + " 已禁用");
                     continue;
                 }
@@ -544,14 +550,18 @@ void Application::setupCustomFrameProcessing() {
                 aiModel->streamId = streamId;
                 aiModel->count = 0;
                 aiModel->modelType = modelConfig.modelType;
-                aiModel->isEnabled = true;  // 已在上面检查，此时肯定是启用的
+                if (modelConfig.modelType == 5) {
+                    aiModel->isEnabled = false;
+                } else {
+                    aiModel->isEnabled = true;  // 已在上面检查，此时肯定是启用的
+                }
                 aiModel->warningFlag = false;
                 aiModel->timeCount = 0;
                 aiModel->params = modelConfig.modelParams;  // 复制模型特定参数
                 aiModel->singleRKModel = initSingleModel(modelConfig.modelType, modelConfig.modelParams);
                 singleModelPools_.push_back(std::move(aiModel));
 
-                Logger::info("为流 " + streamId + " 添加了已启用的模型类型 " +
+                LOGGER_INFO("为流 " + streamId + " 添加了已启用的模型类型 " +
                              std::to_string(modelConfig.modelType));
             }
 
@@ -562,7 +572,7 @@ void Application::setupCustomFrameProcessing() {
 //                    processFrameAI(streamId, frame, pts);
                 });
 
-                Logger::info("Custom video frame processing set up for stream: " + streamId);
+                LOGGER_INFO("Custom video frame processing set up for stream: " + streamId);
             }
         }
     }
@@ -570,13 +580,13 @@ void Application::setupCustomFrameProcessing() {
 
 // MQTT客户端初始化
 bool Application::initializeMQTTClients() {
-    Logger::info("Initializing MQTT clients using MQTTClientManager...");
+    LOGGER_INFO("Initializing MQTT clients using MQTTClientManager...");
 
     // 获取 MQTT 服务器配置
     const auto& mqttServers = AppConfig::getMQTTServers();
 
     if (mqttServers.empty()) {
-        Logger::info("No MQTT servers configured, skipping MQTT initialization");
+        LOGGER_INFO("No MQTT servers configured, skipping MQTT initialization");
         return true;
     }
 
@@ -585,10 +595,10 @@ bool Application::initializeMQTTClients() {
     // 初始化每个 MQTT 客户端
     for (const auto& serverConfig : mqttServers) {
         try {
-            Logger::info("Initializing MQTT client for server: " + serverConfig.name);
+            LOGGER_INFO("Initializing MQTT client for server: " + serverConfig.name);
 
             if (serverConfig.name.empty() || serverConfig.brokerUrl.empty()) {
-                Logger::warning("MQTT server name or URL is empty, skipping");
+                LOGGER_WARNING("MQTT server name or URL is empty, skipping");
                 continue;
             }
 
@@ -599,7 +609,7 @@ bool Application::initializeMQTTClients() {
                 std::mt19937 gen(rd());
                 std::uniform_int_distribution<> dis(1000, 9999);
                 clientId = "ffmpeg_" + std::to_string(dis(gen));
-                Logger::info("Generated random client ID: " + clientId);
+                LOGGER_INFO("Generated random client ID: " + clientId);
             }
 
             // 使用管理器创建 MQTT 客户端
@@ -614,20 +624,20 @@ bool Application::initializeMQTTClients() {
             );
 
             if (!clientCreated) {
-                Logger::warning("Failed to create MQTT client for server " + serverConfig.name);
+                LOGGER_WARNING("Failed to create MQTT client for server " + serverConfig.name);
                 continue;
             }
 
             // 获取客户端
             auto client = mqttManager.getClient(serverConfig.name);
             if (!client) {
-                Logger::warning("Failed to get MQTT client for server " + serverConfig.name);
+                LOGGER_WARNING("Failed to get MQTT client for server " + serverConfig.name);
                 continue;
             }
 
             // 设置连接断开回调函数
             client->setConnectionLostCallback([this, serverName = serverConfig.name](const std::string& cause) {
-                Logger::warning("MQTT connection lost for server " + serverName + ": " + cause);
+                LOGGER_WARNING("MQTT connection lost for server " + serverName + ": " + cause);
                 // 客户端包装器自动处理重连
             });
 
@@ -642,27 +652,27 @@ bool Application::initializeMQTTClients() {
 
                 // 订阅主题
                 if (client->subscribe(sub.topic, sub.qos, messageCallback)) {
-                    Logger::info("Subscribed to topic " + sub.topic + " on server " + serverConfig.name);
+                    LOGGER_INFO("Subscribed to topic " + sub.topic + " on server " + serverConfig.name);
                     registerTopicHandler(serverConfig.name, sub.topic,
                                          [this](const std::string& serverName, const std::string& topic, const std::string& payload) {
-                                             this->handlePTZControl(serverName, topic, payload);
+                                             this->handleAIEnabledControl(serverName, topic, payload);
                                          });
                 }
                 else {
-                    Logger::warning("Failed to subscribe to topic " + sub.topic + " on server " + serverConfig.name);
+                    LOGGER_WARNING("Failed to subscribe to topic " + sub.topic + " on server " + serverConfig.name);
                 }
             }
 
             successCount++;
-            Logger::info("MQTT client for server " + serverConfig.name + " initialized successfully");
+            LOGGER_INFO("MQTT client for server " + serverConfig.name + " initialized successfully");
         }
         catch (const std::exception& e) {
-            Logger::error("Failed to initialize MQTT client for server " + serverConfig.name + ": " + e.what());
+            LOGGER_ERROR("Failed to initialize MQTT client for server " + serverConfig.name + ": " + e.what());
             // 继续处理其他服务器
         }
     }
 
-    Logger::info("Initialized " + std::to_string(successCount) + " of " +
+    LOGGER_INFO("Initialized " + std::to_string(successCount) + " of " +
                  std::to_string(mqttServers.size()) + " MQTT clients");
 
     configureMQTTMonitoring();
@@ -682,7 +692,7 @@ void Application::registerTopicHandler(const std::string& serverName, const std:
 }
 
 void Application::handleMQTTMessage(const std::string& serverName, const std::string& topic, MQTTClient_message& message) {
-    Logger::debug("Received MQTT message from server " + serverName + " on topic " + topic);
+    LOGGER_DEBUG("Received MQTT message from server " + serverName + " on topic " + topic);
 
     try {
         // 查找此特定服务器和主题的处理程序
@@ -698,16 +708,16 @@ void Application::handleMQTTMessage(const std::string& serverName, const std::st
         // 如果没有找到特定处理程序，进行通用处理
         if (!handlerFound) {
             // 根据需要添加更多通用处理
-            Logger::debug("No specific handler found for topic: " + topic);
+            LOGGER_DEBUG("No specific handler found for topic: " + topic);
         }
     }
     catch (const std::exception& e) {
-        Logger::error("Error handling MQTT message: " + std::string(e.what()));
+        LOGGER_ERROR("Error handling MQTT message: " + std::string(e.what()));
     }
 }
 
 void Application::handleMQTTMessage(const std::string& serverName, const std::string& topic, const std::string& payload) {
-    Logger::debug("Received MQTT message from server " + serverName + " on topic " + topic);
+    LOGGER_DEBUG("Received MQTT message from server " + serverName + " on topic " + topic);
 
     try {
         // 查找此特定服务器和主题的处理程序
@@ -723,17 +733,17 @@ void Application::handleMQTTMessage(const std::string& serverName, const std::st
         // 如果没有找到特定处理程序，进行通用处理
         if (!handlerFound) {
             // 根据需要添加更多通用处理
-            Logger::debug("No specific handler found for topic: " + topic);
+            LOGGER_DEBUG("No specific handler found for topic: " + topic);
         }
     }
     catch (const std::exception& e) {
-        Logger::error("Error handling MQTT message: " + std::string(e.what()));
+        LOGGER_ERROR("Error handling MQTT message: " + std::string(e.what()));
     }
 }
 
 void Application::handlePTZControl(const std::string& serverName, const std::string& topic, const std::string& payload) {
     try {
-        Logger::info("start process ptz message");
+        LOGGER_INFO("start process ptz message");
 
         // 模型启停控制
         if (topic == "model/aiControl") {
@@ -769,7 +779,7 @@ void Application::handlePTZControl(const std::string& serverName, const std::str
 //            ptzControl.ParseFromString(payload);
 //            PTZControl::PTZControl::Control commandValue = ptzControl.control();
 //            std::string type_name = PTZControl::PTZControl::Control_Name(commandValue);
-//            Logger::info("payload message ptz command is: " + std::to_string(ptzControl.control()) + " name is: " + type_name);
+//            LOGGER_INFO("payload message ptz command is: " + std::to_string(ptzControl.control()) + " name is: " + type_name);
 //            std::string path = "/api/front-end/ptz/" + std::string("34020000001320000003") + "/" + std::string("34020000001320000002") +
 //                    "?command=" + type_name + "&horizonSpeed=" + std::to_string(ptzControl.horizonspeed()) +
 //                    "&verticalSpeed=" + std::to_string(ptzControl.verticalspeed()) + "&zoomSpeed=" + std::to_string(ptzControl.zoomspeed());
@@ -788,58 +798,117 @@ void Application::handlePTZControl(const std::string& serverName, const std::str
 //            if (isHttpConnect_) {
 //                auto res = httpClient_->Get(path.c_str());
 //                if (res && res->status == 200) {
-//                    Logger::info("ptz control request success, response message is: " + res->body);
+//                    LOGGER_INFO("ptz control request success, response message is: " + res->body);
 //                } else {
-//                    Logger::info("ptz control request failed");
+//                    LOGGER_INFO("ptz control request failed");
 //                    isHttpConnect_ = false;
 //                }
 //            }
         }
         catch (...) {
-            Logger::warning("Failed to parse JSON payload for stream control message");
+            LOGGER_WARNING("Failed to parse JSON payload for stream control message");
             return;
         }
 
     }
     catch (const std::exception& e) {
-        Logger::error("Error processing PTZ control message: " + std::string(e.what()));
+        LOGGER_ERROR("Error processing PTZ control message: " + std::string(e.what()));
     }
 }
 
 void Application::handlePTZControl(const std::string& serverName, const std::string& topic, MQTTClient_message& message) {
     try {
-        Logger::info("start process ptz message");
+        LOGGER_INFO("start process ptz message");
         // 解析 JSON 消息
         PTZControl::PTZControl ptzControl;
         try {
             ptzControl.ParseFromArray(message.payload, message.payloadlen);
-            Logger::info("payload message is: " + std::to_string(ptzControl.horizonspeed()));
+            LOGGER_INFO("payload message is: " + std::to_string(ptzControl.horizonspeed()));
 //            std::string path = "/api/front-end/ptz/" + std::string(message["deviceId"]) + "/" + std::string(message["channelId"]) +
 //                               "?command=" + std::string(message["command"]) + "&horizonSpeed=" + std::string(message["horizonSpeed"]) +
 //                               "&verticalSpeed=" + std::string(message["verticalSpeed"]) + "&zoomSpeed=" + std::string(message["zoomSpeed"]);
             std::string path = "/user/" + std::to_string(ptzControl.control());
             auto res = httpClient_->Get(path.c_str());
             if (res && res->status == 200 ) {
-                Logger::info("ptz control request success, response message is: " + res->body);
+                LOGGER_INFO("ptz control request success, response message is: " + res->body);
             } else {
-                Logger::info("ptz control request failed");
+                LOGGER_INFO("ptz control request failed");
             }
         }
         catch (...) {
-            Logger::warning("Failed to parse JSON payload for stream control message");
+            LOGGER_WARNING("Failed to parse JSON payload for stream control message");
             return;
         }
 
     }
     catch (const std::exception& e) {
-        Logger::error("Error processing PTZ control message: " + std::string(e.what()));
+        LOGGER_ERROR("Error processing PTZ control message: " + std::string(e.what()));
     }
 }
 
-void Application::publishSystemStatus(const std::string& serverName, const std::string& payload) {
+void Application::handleAIEnabledControl(const std::string& serverName, const std::string& topic, const std::string& payload) {
+    try {
+        LOGGER_INFO("start process AI control message");
+
+        if (topic == "wubarobot/logic_to_terminal/ai_enable") {
+            // 解析 JSON 消息
+            AIDataResponse::AIEnabled aiEnabled;
+//            AIDataResponse::AIStatus aiStatus;
+
+            aiEnabled.ParseFromString(payload);
+            int modelType = aiEnabled.event_type();
+
+            LOGGER_INFO("接收到MQTT消息, 模型: " + std::to_string(aiEnabled.event_type()) + " 启用状态：" + std::to_string(aiEnabled.isenabled()));
+
+            for (auto &model : singleModelPools_) {
+                if (model->modelType == modelType) {
+                    model->isEnabled = aiEnabled.isenabled();
+                }
+
+                LOGGER_INFO("模型 " + std::to_string(model->modelType) + " 的可用状态为: " + std::to_string(model->isEnabled));
+
+//                AIDataResponse::EventState* eventState = aiStatus.add_event_state();
+//                eventState->set_event_type(static_cast<AIDataResponse::AIEvent_EventType>(model->modelType));
+//                eventState->set_isenabled(model->isEnabled);
+            }
+//
+//            // 序列化并发布事件
+//            std::string serialized_message;
+//            if (!aiStatus.SerializeToString(&serialized_message)) {
+//                LOGGER_ERROR("模型类型 " + std::to_string(modelType) + " 的消息序列化失败");
+//                return;
+//            }
+
+//            publishSystemStatus("main_server", "wubarobot/logic_to_terminal/ai_status", serialized_message);
+            LOGGER_INFO("已完成对AI事件" + std::to_string(modelType) + "的控制");
+        } else if (topic == "wubarobot/terminal_to_logic/test_recognize_meter_ask") {
+//            AIDataResponse::TestRecognizeMeterAsk testRecognizeMeterAsk;
+//            testRecognizeMeterAsk.ParseFromString(payload);
+//            int meterType = testRecognizeMeterAsk.meter_type();
+//
+//            if (meterType == 1) {
+//                for (auto &model : singleModelPools_) {
+//                    if (model->modelType == 5) {
+//                        model->isEnabled = true;
+//                        LOGGER_INFO("模型 " + std::to_string(model->modelType) + " 的可用状态为: " + std::to_string(model->isEnabled));
+//                        break;
+//                    }
+////                AIDataResponse::EventState* eventState = aiStatus.add_event_state();
+////                eventState->set_event_type(static_cast<AIDataResponse::AIEvent_EventType>(model->modelType));
+////                eventState->set_isenabled(model->isEnabled);
+//                }
+//            }
+        }
+    }
+    catch (const std::exception& e) {
+        LOGGER_ERROR("AI enabled message: " + std::string(e.what()));
+    }
+}
+
+void Application::publishSystemStatus(const std::string& serverName, const std::string& topic, const std::string& payload) {
     auto client = mqttManager.getClient(serverName);
     if (!client) {
-        Logger::error("Cannot publish system status: MQTT client not found for server " + serverName);
+        LOGGER_ERROR("Cannot publish system status: MQTT client not found for server " + serverName);
         return;
     }
 
@@ -859,7 +928,7 @@ void Application::publishSystemStatus(const std::string& serverName, const std::
 //
 //        std::string serialized_message;
 //        if (!aiResult.SerializeToString(&serialized_message)) {
-//            Logger::error("序列化消息失败");
+//            LOGGER_ERROR("序列化消息失败");
 //        }
 
         // 创建状态消息
@@ -871,18 +940,91 @@ void Application::publishSystemStatus(const std::string& serverName, const std::
 //        statusMsg["verticalSpeed"] = 64;
 //        statusMsg["zoomSpeed"] = 8;
 
-//        Logger::info("publish message is: " + statusMsg.dump());
+//        LOGGER_INFO("publish message is: " + statusMsg.dump());
 
         // 发布状态
 //        client->publish("system/status/response", statusMsg.dump(), 1);
 //        client->publish("test/ptz", statusMsg.dump(), 2);
 //        client->publish("test/airesult", serialized_message, 2);
-        client->publish("wubarobot/inner/ai_event", payload, 2);
-        Logger::info("Published system status to server " + serverName);
+        client->publish(topic.c_str(), payload, 0);
+        LOGGER_DEBUG("Published mqtt message to server " + serverName);
     }
     catch (const std::exception& e) {
-        Logger::error("Error publishing system status: " + std::string(e.what()));
+        LOGGER_ERROR("Error publishing system status: " + std::string(e.what()));
     }
+}
+
+void Application::publishAIStatus(const std::string& serverName) {
+    auto client = mqttManager.getClient(serverName);
+    if (!client) {
+        LOGGER_ERROR("Cannot publish system status: MQTT client not found for server " + serverName);
+        return;
+    }
+
+    // 在新线程中启动服务器
+    mqttAIStatusStarted = false;
+    mqttAIStatusThread = std::make_unique<std::thread>([this]() {
+
+        mqttAIStatusStarted = true;
+
+        while (running_) {
+
+            AIDataResponse::AIStatus aiStatus;
+
+            for (auto &model : singleModelPools_) {
+
+                AIDataResponse::EventState* eventState = aiStatus.add_event_state();
+                eventState->set_event_type(static_cast<AIDataResponse::AIEvent_EventType>(model->modelType));
+                eventState->set_isenabled(model->isEnabled);
+            }
+
+            // 序列化并发布事件
+            std::string serialized_message;
+            if (!aiStatus.SerializeToString(&serialized_message)) {
+                LOGGER_ERROR("模型启用状态消息序列化失败");
+                return;
+            }
+
+//            AIDataResponse::AIEnabled aiEnabled;
+//            aiEnabled.set_event_type(AIDataResponse::AIEvent_EventType_Plate);
+//            aiEnabled.set_isenabled(false);
+//
+//            // 序列化并发布事件
+//            std::string serialized_message1;
+//            if (!aiEnabled.SerializeToString(&serialized_message1)) {
+//                LOGGER_ERROR("模型启用状态消息序列化失败");
+//                return;
+//            }
+//            publishSystemStatus("main_server", "wubarobot/logic_to_terminal/ai_enable", serialized_message1);
+
+            publishSystemStatus("main_server", "wubarobot/logic_to_terminal/ai_status", serialized_message);
+
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        }
+
+        mqttAIStatusStarted = false;
+        LOGGER_INFO("mqtt AI status thread ended");
+    });
+
+    // 等待服务器启动
+    int waitCount = 0;
+    while (!mqttAIStatusStarted && waitCount < 50) { // 最多等待5秒
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        waitCount++;
+    }
+
+    if (mqttAIStatusStarted) {
+        LOGGER_INFO("HTTP server successfully started");
+        return;
+    } else {
+        LOGGER_ERROR("HTTP server failed to start within timeout");
+        if (mqttAIStatusThread && mqttAIStatusThread->joinable()) {
+            mqttAIStatusThread->join();
+        }
+        return;
+    }
+
 }
 
 bool Application::publishToAllServers(const std::string& topic, const std::string& payload, int qos) {
@@ -895,17 +1037,17 @@ bool Application::publishToAllServers(const std::string& topic, const std::strin
             try {
                 if (client->isConnected()) {
                     if (!client->publish(topic, payload, qos)) {
-                        Logger::error("Failed to publish message to server " + name);
+                        LOGGER_ERROR("Failed to publish message to server " + name);
                         success = false;
                     }
                 }
                 else {
-                    Logger::warning("Cannot publish to server " + name + ": not connected");
+                    LOGGER_WARNING("Cannot publish to server " + name + ": not connected");
                     success = false;
                 }
             }
             catch (const std::exception& e) {
-                Logger::error("Error publishing to server " + name + ": " + std::string(e.what()));
+                LOGGER_ERROR("Error publishing to server " + name + ": " + std::string(e.what()));
                 success = false;
             }
         }
@@ -915,7 +1057,7 @@ bool Application::publishToAllServers(const std::string& topic, const std::strin
 }
 
 void Application::cleanupMQTTClients() {
-    Logger::info("Cleaning up MQTT clients...");
+    LOGGER_INFO("Cleaning up MQTT clients...");
 
     // 停止MQTT监控
     if (mqttMonitoringEnabled_) {
@@ -931,13 +1073,13 @@ void Application::configureMQTTMonitoring() {
         if (key == "mqttHealthCheckInterval") {
             try {
                 mqttHealthCheckInterval_ = std::stoi(value);
-                Logger::info("MQTT health check interval set to " + value + " seconds");
+                LOGGER_INFO("MQTT health check interval set to " + value + " seconds");
             } catch (...) {
-                Logger::warning("Invalid MQTT health check interval: " + value + ", using default");
+                LOGGER_WARNING("Invalid MQTT health check interval: " + value + ", using default");
             }
         } else if (key == "mqttMonitoringEnabled") {
             mqttMonitoringEnabled_ = (value == "true" || value == "1");
-            Logger::info("MQTT monitoring " + std::string(mqttMonitoringEnabled_ ? "enabled" : "disabled"));
+            LOGGER_INFO("MQTT monitoring " + std::string(mqttMonitoringEnabled_ ? "enabled" : "disabled"));
         }
     }
 
@@ -953,7 +1095,7 @@ void Application::configureMQTTMonitoring() {
         // 启动周期性健康检查
         mqttManager.startPeriodicHealthCheck();
 
-        Logger::info("MQTT monitoring configured and started");
+        LOGGER_INFO("MQTT monitoring configured and started");
     }
 }
 
@@ -983,7 +1125,7 @@ void Application::monitorMQTTConnections() {
 
                 // 如果断开时间过长，记录警告
                 if (disconnectedTime > 300) { // 5分钟
-                    Logger::warning("MQTT client " + name + " disconnected for " +
+                    LOGGER_WARNING("MQTT client " + name + " disconnected for " +
                                     std::to_string(disconnectedTime) + " seconds");
                 }
             }
@@ -991,7 +1133,7 @@ void Application::monitorMQTTConnections() {
 
         // 如果有断开连接的客户端，尝试进行一次健康检查恢复
         if (!disconnectedClients.empty()) {
-            Logger::info("Found " + std::to_string(disconnectedClients.size()) +
+            LOGGER_INFO("Found " + std::to_string(disconnectedClients.size()) +
                          " disconnected MQTT clients, attempting recovery");
             mqttManager.checkAndRecoverClients();
         }
@@ -1015,7 +1157,7 @@ std::vector<std::unique_ptr<rknn_lite>> Application::initModel(int modelType) {
         model_name = "./model/yolov8n-p2-uav.rknn";
     }
 
-    Logger::info("init model :" + std::string(model_name));
+    LOGGER_INFO("init model :" + std::string(model_name));
 
     std::vector<std::unique_ptr<rknn_lite>> rkpool;
 
@@ -1045,21 +1187,21 @@ std::unique_ptr<rknn_lite> Application::initSingleModel(int modelType, const std
 
     switch (modelType) {
         case 1:
-            model_name = "./model/yolov8-plate.rknn";
-            break;
-        case 3:
             model_name = "./model/yolov8n-fire-smoke.rknn";
             break;
-        case 4:
+        case 2:
             model_name = "./model/yolov8_relu_person_best.rknn";
             break;
-        case 5:
+        case 3:
             model_name = "./model/yolov8n-p2-uav.rknn";
             break;
-        case 6:
-            model_name = "./model/yolov8n-meter.rknn";
+        case 4:
+            model_name = "./model/yolov8-plate.rknn";
             break;
-        case 7:
+        case 5:
+            model_name = "./model/meter_yolov8s_v2_200.rknn";
+            break;
+        case 6:
             model_name = "./model/yolov8n-crack.rknn";
             break;
         default:
@@ -1071,7 +1213,7 @@ std::unique_ptr<rknn_lite> Application::initSingleModel(int modelType, const std
     auto it = params.find("model_path");
     if (it != params.end() && !it->second.empty()) {
         model_name = const_cast<char*>(it->second.c_str());
-        Logger::info("使用自定义模型路径：" + it->second);
+        LOGGER_INFO("使用自定义模型路径：" + it->second);
     }
 
     float objectThresh = 0.5;
@@ -1080,7 +1222,7 @@ std::unique_ptr<rknn_lite> Application::initSingleModel(int modelType, const std
         objectThresh = std::stof(confidence_threshold->second);
     }
 
-    Logger::info("init single model :" + std::string(model_name));
+    LOGGER_INFO("init single model :" + std::string(model_name));
 
     std::unique_ptr<rknn_lite> rknn_ptr = std::make_unique<rknn_lite>(model_name, modelType % 3, modelType, objectThresh);
 
@@ -1141,14 +1283,14 @@ void Application::processFrameAI(const std::string& streamId, const AVFrame* fra
 //                    std::string dirPath = "/root/data/" + std::string(buffer_day);
                     std::string dirPath = AppConfig::getDirPath();
                     if (!dirExists(dirPath)) {
-                        Logger::info("目录不存在，正在创建...");
+                        LOGGER_INFO("目录不存在，正在创建...");
                         if (createDirRecursive(dirPath)) {
-                            Logger::info("目录创建成功！");
+                            LOGGER_INFO("目录创建成功！");
                         } else {
-                            Logger::error("目录创建失败！");
+                            LOGGER_ERROR("目录创建失败！");
                         }
                     } else {
-                        Logger::debug("目录已存在！");
+                        LOGGER_DEBUG("目录已存在！");
                     }
 
                     std::string fileName;
@@ -1171,7 +1313,7 @@ void Application::processFrameAI(const std::string& streamId, const AVFrame* fra
 
                     std::string filePath = dirPath + fileName;
 
-                    // Logger::info("filename is: "+ fileName);
+                    // LOGGER_INFO("filename is: "+ fileName);
                     cv::imwrite(filePath, dstMat);
 
                     uuid_t uuid;
@@ -1187,13 +1329,13 @@ void Application::processFrameAI(const std::string& streamId, const AVFrame* fra
 
                     std::string serialized_message;
                     if (!aiEvent.SerializeToString(&serialized_message)) {
-                        Logger::error("序列化消息失败");
+                        LOGGER_ERROR("序列化消息失败");
                     }
 
-                    publishSystemStatus("main_server", serialized_message);
+                    publishSystemStatus("main_server", "wubarobot/inner/ai_event", serialized_message);
                 }
 
-                Logger::info("AI识别处理结束，请做后续相关处理");
+                LOGGER_INFO("AI识别处理结束，请做后续相关处理");
 //                publishSystemStatus("main_server", dstMat);
 //                    cv::imwrite("./test.jpg", dstMat);
             }
@@ -1212,7 +1354,7 @@ void Application::processFrameAI(const std::string& streamId, const AVFrame* fra
             }
         }
     } catch (const std::exception& e) {
-        Logger::error("ai service is failed, please check model..., error info: " + std::string(e.what()));
+        LOGGER_ERROR("ai service is failed, please check model..., error info: " + std::string(e.what()));
     }
 //    cv::imwrite("D:\\project\\C++\\my\\ffmpeg_push_pull\\cmake-build-debug/test.jpg", dstMat);
 }
@@ -1266,24 +1408,28 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
                     model->singleRKModel->endValue = 1.6;
 
                     if (!model->singleRKModel->interf()) {
-                        Logger::error("模型 " + std::to_string(model->modelType) + " 推理时出错，检查输入内容...");
+                        LOGGER_ERROR("模型 " + std::to_string(model->modelType) + " 推理时出错，检查输入内容...");
                     }
 
                     // 获取结果
                     cv::Mat dstMat = model->singleRKModel->ori_img;
                     bool warning = model->singleRKModel->warning;
                     std::string plateResult = model->singleRKModel->plateResult;
+                    double targetValue = model->singleRKModel->value;
 
-                    Logger::debug("使用模型类型 " + std::to_string(model->modelType) +
+                    LOGGER_DEBUG("使用模型类型 " + std::to_string(model->modelType) +
                                   " 处理帧，警告 = " + std::to_string(warning));
 
                     // 如有需要处理警告 - 每个模型有自己的警告状态
                     if (warning && !model->warningFlag) {
-                        handleModelWarning(model.get(), dstMat, plateResult);
+                        handleModelWarning(model.get(), dstMat, plateResult, targetValue);
                         model->warningFlag = true;
+                        if (model->modelType == 5) {
+                            model->isEnabled = false;
+                        }
                         model->timeCount = 1;
                     } else if (model->warningFlag && warning) {
-                        Logger::info("AI模型 " + std::to_string(model->modelType) +
+                        LOGGER_DEBUG("AI模型 " + std::to_string(model->modelType) +
                                      " 仍处于警告间隔中 (" + std::to_string(model->timeCount) +
                                      "/5)");
                         model->timeCount++;
@@ -1294,15 +1440,15 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
                         }
                     } else if (model->warningFlag && !warning) {
                         // 警告条件已清除
-                        Logger::info("模型 " +
+                        LOGGER_DEBUG("模型 " +
                                      std::to_string(model->modelType) + " 的警告条件已清除");
                         model->warningFlag = false;
                         model->timeCount = 0;
                     } else {
-                        Logger::debug("AI任务处理结束, 模型 " + std::to_string(model->modelType) + " 无报警发生...");
+                        LOGGER_DEBUG("AI任务处理结束, 模型 " + std::to_string(model->modelType) + " 无报警发生...");
                     }
                 } catch (const std::exception& e) {
-                    Logger::error("处理模型 " + std::to_string(model->modelType) +
+                    LOGGER_ERROR("处理模型 " + std::to_string(model->modelType) +
                                   " 时出错：" + std::string(e.what()));
                 }
 
@@ -1320,7 +1466,7 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
         }
 
     } catch (const std::exception& e) {
-        Logger::error("AI服务失败，请检查模型。错误：" + std::string(e.what()));
+        LOGGER_ERROR("AI服务失败，请检查模型。错误：" + std::string(e.what()));
     }
 
 //    try {
@@ -1352,7 +1498,7 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
 //                segAddMask = modelPool->singleRKModel->SrcAddMask;
 //            }
 //
-//            Logger::debug("各个状态结果: "+ std::to_string(warning) + " 时间次数: " + std::to_string(warningFlag) + " 时间数量: " + std::to_string(timeCount));
+//            LOGGER_DEBUG("各个状态结果: "+ std::to_string(warning) + " 时间次数: " + std::to_string(warningFlag) + " 时间数量: " + std::to_string(timeCount));
 //
 //            if (warning && !warningFlag) {
 //
@@ -1373,14 +1519,14 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
 //                std::string dirPath = AppConfig::getDirPath() + "/" + std::string(buffer_day);
 //                std::string tempPath = AppConfig::getDirPath();
 //                if (!dirExists(dirPath)) {
-//                    Logger::info("目录不存在，正在创建...");
+//                    LOGGER_INFO("目录不存在，正在创建...");
 //                    if (createDirRecursive(dirPath)) {
-//                        Logger::info("目录创建成功！");
+//                        LOGGER_INFO("目录创建成功！");
 //                    } else {
-//                        Logger::error("目录创建失败！");
+//                        LOGGER_ERROR("目录创建失败！");
 //                    }
 //                } else {
-//                    Logger::debug("目录已存在！");
+//                    LOGGER_DEBUG("目录已存在！");
 //                }
 //
 //                std::string fileName;
@@ -1409,7 +1555,7 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
 //
 //                std::string filePath = tempPath + fileName;
 //
-//                // Logger::info("filename is: "+ fileName);
+//                // LOGGER_INFO("filename is: "+ fileName);
 //
 //                if (modelPool->modelType == 7) {
 //                    cv::imwrite(filePath, segAddMask);
@@ -1430,7 +1576,7 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
 //
 //                std::string serialized_message;
 //                if (!aiEvent.SerializeToString(&serialized_message)) {
-//                    Logger::error("序列化消息失败");
+//                    LOGGER_ERROR("序列化消息失败");
 //                }
 //
 //                publishSystemStatus("main_server", serialized_message);
@@ -1440,7 +1586,7 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
 //                timeCount = 1;
 //            } else if (warningFlag && warning) {
 //
-//                Logger::info("AI处理结束, 处于报警间隔期间...");
+//                LOGGER_INFO("AI处理结束, 处于报警间隔期间...");
 //
 //                timeCount++;
 //                if (timeCount > 5) {
@@ -1450,7 +1596,7 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
 //                }
 //
 //            } else {
-//                Logger::info("AI处理结束, 无报警发生...");
+//                LOGGER_INFO("AI处理结束, 无报警发生...");
 //            }
 //
 //            modelPool->count++;
@@ -1458,12 +1604,12 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
 //                modelPool->count = 0;
 //            }
 //
-//            Logger::info("AI识别处理结束，请做后续相关处理");
+//            LOGGER_INFO("AI识别处理结束，请做后续相关处理");
 ////            publishSystemStatus("main_server", dstMat);
 ////            cv::imwrite("./test.jpg", dstMat);
 //        }
 //    } catch (const std::exception& e) {
-//        Logger::error("ai service is failed, please check model..., error info: " + std::string(e.what()));
+//        LOGGER_ERROR("ai service is failed, please check model..., error info: " + std::string(e.what()));
 //    }
 }
 
@@ -1481,7 +1627,7 @@ void Application::test_model() {
     rkmodel->interf();
 }
 
-void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult) {
+void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult, double targetValue) {
     // 获取当前时间
     std::time_t now = std::time(nullptr);
     std::tm* localTime = std::localtime(&now);
@@ -1495,11 +1641,11 @@ void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dst
 
     // 确保目录存在
     if (!dirExists(dirPath)) {
-        Logger::info("目录不存在，正在创建...");
+        LOGGER_INFO("目录不存在，正在创建...");
         if (createDirRecursive(dirPath)) {
-            Logger::info("目录创建成功！");
+            LOGGER_INFO("目录创建成功！");
         } else {
-            Logger::error("创建目录失败！");
+            LOGGER_ERROR("创建目录失败！");
             return;
         }
     }
@@ -1510,26 +1656,26 @@ void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dst
 
     switch (model->modelType) {
         case 1:
-            fileName = "/" + std::string(buffer_day) + "/plate_" + std::string(buffer) + ".jpg";
-            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Plate);
-            break;
-        case 3:
             fileName = "/" + std::string(buffer_day) + "/fire_smoke_" + std::string(buffer) + ".jpg";
             aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Fire);
             break;
-        case 4:
+        case 2:
             fileName = "/" + std::string(buffer_day) + "/person_" + std::string(buffer) + ".jpg";
             aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
             break;
-        case 5:
+        case 3:
             fileName = "/" + std::string(buffer_day) + "/uav_" + std::string(buffer) + ".jpg";
             aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_UAV);
             break;
-        case 6:
-            fileName = "/" + std::string(buffer_day) + "/meter_" + std::string(buffer) + ".jpg";
-            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+        case 4:
+            fileName = "/" + std::string(buffer_day) + "/plate_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Plate);
             break;
-        case 7:
+        case 5:
+            fileName = "/" + std::string(buffer_day) + "/meter_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_RecognizeMeter);
+            break;
+        case 6:
             fileName = "/" + std::string(buffer_day) + "/crack_" + std::string(buffer) + ".jpg";
             aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
             break;
@@ -1557,13 +1703,16 @@ void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dst
     AIDataResponse::PlateParam* plateParam = aiEvent.mutable_plate_param();
     plateParam->set_plate_number(plateResult);
 
+    // AIDataResponse::MeterParam* meterParam = aiEvent.mutable_meter_param();
+    // meterParam->set_meter_value(targetValue);
+
     // 序列化并发布事件
     std::string serialized_message;
     if (!aiEvent.SerializeToString(&serialized_message)) {
-        Logger::error("模型类型 " + std::to_string(model->modelType) + " 的消息序列化失败");
+        LOGGER_ERROR("模型类型 " + std::to_string(model->modelType) + " 的消息序列化失败");
         return;
     }
 
-    publishSystemStatus("main_server", serialized_message);
-    Logger::info("已为模型类型 " + std::to_string(model->modelType) + " 发布AI事件");
+    publishSystemStatus("main_server", "wubarobot/inner/ai_event", serialized_message);
+    LOGGER_DEBUG("已为模型类型 " + std::to_string(model->modelType) + " 发布AI事件");
 }

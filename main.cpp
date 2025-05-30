@@ -54,7 +54,7 @@ int main(int argc, char* argv[]) {
 //    LogLevel logLevel = static_cast<LogLevel>(1);
 //    Logger::init(true, "./logs", logLevel);
 
-    Logger::info("Starting 58AI Program... \n"
+    LOGGER_INFO("Starting 58AI Program... \n"
                           "===============================================\n"
                           "         ███████╗ █████╗  █████╗ ██╗\n"
                           "         ██╔════╝██╔══██╗██╔══██╗██║\n"
@@ -99,7 +99,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Fatal error: " << e.what() << std::endl;
 
         try {
-            Logger::fatal("Program fatal error: " + std::string(e.what()));
+            LOGGER_FATAL("Program fatal error: " + std::string(e.what()));
             Logger::shutdown();
         } catch (...) {
             std::cerr << "Error logging fatal error" << std::endl;
@@ -110,7 +110,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Unknown fatal error" << std::endl;
 
         try {
-            Logger::fatal("Program encountered unknown fatal error");
+            LOGGER_FATAL("Program encountered unknown fatal error");
             Logger::shutdown();
         } catch (...) {
             std::cerr << "Error logging fatal error" << std::endl;

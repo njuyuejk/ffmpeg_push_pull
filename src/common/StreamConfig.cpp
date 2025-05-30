@@ -228,11 +228,11 @@ bool StreamConfig::validate() const {
         try {
             int attempts = std::stoi(extraOptions.at("maxReconnectAttempts"));
             if (attempts < 0) {
-                Logger::warning("Invalid maxReconnectAttempts value (must be >= 0): " + extraOptions.at("maxReconnectAttempts"));
+                LOGGER_WARNING("Invalid maxReconnectAttempts value (must be >= 0): " + extraOptions.at("maxReconnectAttempts"));
                 return false;
             }
         } catch (const std::exception& e) {
-            Logger::warning("Invalid maxReconnectAttempts format: " + extraOptions.at("maxReconnectAttempts"));
+            LOGGER_WARNING("Invalid maxReconnectAttempts format: " + extraOptions.at("maxReconnectAttempts"));
             return false;
         }
     }
@@ -241,11 +241,11 @@ bool StreamConfig::validate() const {
         try {
             int timeout = std::stoi(extraOptions.at("noDataTimeout"));
             if (timeout < 1000) { // 至少1秒
-                Logger::warning("Invalid noDataTimeout value (must be >= 1000 ms): " + extraOptions.at("noDataTimeout"));
+                LOGGER_WARNING("Invalid noDataTimeout value (must be >= 1000 ms): " + extraOptions.at("noDataTimeout"));
                 return false;
             }
         } catch (const std::exception& e) {
-            Logger::warning("Invalid noDataTimeout format: " + extraOptions.at("noDataTimeout"));
+            LOGGER_WARNING("Invalid noDataTimeout format: " + extraOptions.at("noDataTimeout"));
             return false;
         }
     }
@@ -255,11 +255,11 @@ bool StreamConfig::validate() const {
         try {
             int threshold = std::stoi(extraOptions.at("watchdogFailThreshold"));
             if (threshold < 1) {
-                Logger::warning("Invalid watchdogFailThreshold value (must be >= 1): " + extraOptions.at("watchdogFailThreshold"));
+                LOGGER_WARNING("Invalid watchdogFailThreshold value (must be >= 1): " + extraOptions.at("watchdogFailThreshold"));
                 return false;
             }
         } catch (const std::exception& e) {
-            Logger::warning("Invalid watchdogFailThreshold format: " + extraOptions.at("watchdogFailThreshold"));
+            LOGGER_WARNING("Invalid watchdogFailThreshold format: " + extraOptions.at("watchdogFailThreshold"));
             return false;
         }
     }
@@ -340,7 +340,7 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
             // 加载HTTP服务器配置
             if (general.contains("http_server") && general["http_server"].is_object()) {
                 httpServerConfig = HTTPServerConfig::fromJson(general["http_server"]);
-                Logger::info("Loaded HTTP server configuration: " + httpServerConfig.host + ":" +
+                LOGGER_INFO("Loaded HTTP server configuration: " + httpServerConfig.host + ":" +
                              std::to_string(httpServerConfig.port));
             }
 
@@ -376,40 +376,40 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
                 mqttServers.push_back(serverConfig);
             }
 
-            Logger::info("Loaded " + std::to_string(mqttServers.size()) + " MQTT server configurations");
+            LOGGER_INFO("Loaded " + std::to_string(mqttServers.size()) + " MQTT server configurations");
         }
 
         // 输出加载信息
-        Logger::info("Loaded " + std::to_string(streamConfigs.size()) + " stream configurations");
-        Logger::info("Global watchdog settings: useWatchdog=" + std::string(useWatchdog ? "true" : "false") +
+        LOGGER_INFO("Loaded " + std::to_string(streamConfigs.size()) + " stream configurations");
+        LOGGER_INFO("Global watchdog settings: useWatchdog=" + std::string(useWatchdog ? "true" : "false") +
                      ", interval=" + std::to_string(watchdogInterval) + "s");
 
         for (const auto& config : streamConfigs) {
-            Logger::debug("Loaded stream: " + config.id + " (" + config.inputUrl + " -> " + config.outputUrl + ")");
+            LOGGER_DEBUG("Loaded stream: " + config.id + " (" + config.inputUrl + " -> " + config.outputUrl + ")");
 
             // 记录重连和看门狗相关配置
             if (config.extraOptions.find("maxReconnectAttempts") != config.extraOptions.end()) {
-                Logger::debug("  maxReconnectAttempts: " + config.extraOptions.at("maxReconnectAttempts"));
+                LOGGER_DEBUG("  maxReconnectAttempts: " + config.extraOptions.at("maxReconnectAttempts"));
             }
             if (config.extraOptions.find("noDataTimeout") != config.extraOptions.end()) {
-                Logger::debug("  noDataTimeout: " + config.extraOptions.at("noDataTimeout") + " ms");
+                LOGGER_DEBUG("  noDataTimeout: " + config.extraOptions.at("noDataTimeout") + " ms");
             }
             if (config.extraOptions.find("watchdogEnabled") != config.extraOptions.end()) {
-                Logger::debug("  watchdogEnabled: " + config.extraOptions.at("watchdogEnabled"));
+                LOGGER_DEBUG("  watchdogEnabled: " + config.extraOptions.at("watchdogEnabled"));
             }
             if (config.extraOptions.find("watchdogFailThreshold") != config.extraOptions.end()) {
-                Logger::debug("  watchdogFailThreshold: " + config.extraOptions.at("watchdogFailThreshold"));
+                LOGGER_DEBUG("  watchdogFailThreshold: " + config.extraOptions.at("watchdogFailThreshold"));
             }
         }
 
         return true;
     }
     catch (const json::exception& e) {
-        Logger::error("JSON parsing error: " + std::string(e.what()));
+        LOGGER_ERROR("JSON parsing error: " + std::string(e.what()));
         return false;
     }
     catch (const std::exception& e) {
-        Logger::error("Error loading config file: " + std::string(e.what()));
+        LOGGER_ERROR("Error loading config file: " + std::string(e.what()));
         return false;
     }
 }
@@ -479,11 +479,11 @@ bool AppConfig::saveToFile(const std::string& configFilePath) {
         return true;
     }
     catch (const json::exception& e) {
-        Logger::error("JSON error while saving config: " + std::string(e.what()));
+        LOGGER_ERROR("JSON error while saving config: " + std::string(e.what()));
         return false;
     }
     catch (const std::exception& e) {
-        Logger::error("Error saving config file: " + std::string(e.what()));
+        LOGGER_ERROR("Error saving config file: " + std::string(e.what()));
         return false;
     }
 }

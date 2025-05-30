@@ -68,8 +68,6 @@ void Logger::init(bool logToFile, const std::string& logDir, LogLevel minLevel) 
     }
 
     initialized = true;
-
-//    info("Logger initialized");
 }
 
 void Logger::shutdown() {
@@ -227,8 +225,18 @@ void Logger::checkAndRotateLogFile() {
     }
 }
 
-void Logger::log(LogLevel level, const std::string& message) {
+std::string Logger::extractFilename(const char* filepath) {
+    if (!filepath) return "";
 
+    std::string path(filepath);
+    size_t lastSlash = path.find_last_of("/\\");
+    if (lastSlash != std::string::npos) {
+        return path.substr(lastSlash + 1);
+    }
+    return path;
+}
+
+void Logger::log(LogLevel level, const std::string& message) {
     // 如果日志系统正在关闭，只允许致命错误和通过shutdownMessage方法发送的消息
     if (isShuttingDown && shutdownPhase >= 2 && level != LogLevel::FATAL) {
         return; // 在最终关闭阶段，丢弃普通消息
@@ -263,6 +271,61 @@ void Logger::log(LogLevel level, const std::string& message) {
     // 格式化日志消息
     std::string formattedMessage =
             std::string("[") + timeStr + "][" + levelStr + "] " + message;
+
+    // 输出到控制台
+    if (level == LogLevel::ERROR || level == LogLevel::FATAL) {
+        std::cerr << formattedMessage << std::endl;
+    } else {
+        std::cout << formattedMessage << std::endl;
+    }
+
+    // 输出到文件
+    if (initialized && useFileOutput && logFile.is_open()) {
+        logFile << formattedMessage << std::endl;
+        logFile.flush();
+    }
+}
+
+void Logger::logWithLocation(LogLevel level, const std::string& message,
+                             const char* file, int line, const char* function) {
+    // 如果日志系统正在关闭，只允许致命错误和通过shutdownMessage方法发送的消息
+    if (isShuttingDown && shutdownPhase >= 2 && level != LogLevel::FATAL) {
+        return; // 在最终关闭阶段，丢弃普通消息
+    }
+
+    // 检查日志级别
+    if (level < minimumLevel) {
+        return;
+    }
+
+    // 检查是否需要切换日志文件
+    checkAndRotateLogFile();
+
+    std::lock_guard<std::mutex> lock(logMutex);
+
+    // 获取当前时间
+    char timeStr[64];
+    time_t now = time(nullptr);
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+    // 转换日志级别为字符串
+    const char* levelStr;
+    switch (level) {
+        case LogLevel::DEBUG:   levelStr = "DEBUG"; break;
+        case LogLevel::INFO:    levelStr = "INFO"; break;
+        case LogLevel::WARNING: levelStr = "WARNING"; break;
+        case LogLevel::ERROR:   levelStr = "ERROR"; break;
+        case LogLevel::FATAL:   levelStr = "FATAL"; break;
+        default:                levelStr = "UNKNOWN";
+    }
+
+    // 提取文件名（去除路径）
+    std::string filename = extractFilename(file);
+
+    // 格式化带位置信息的日志消息
+    std::string formattedMessage =
+            std::string("[") + timeStr + "][" + levelStr + "][" +
+            filename + ":" + std::to_string(line) + "][" + function + "] " + message;
 
     // 输出到控制台
     if (level == LogLevel::ERROR || level == LogLevel::FATAL) {
@@ -361,7 +424,7 @@ void Logger::finalizeShutdown() {
     initialized = false;
 }
 
-
+// 原有的日志方法（保持不变）
 void Logger::debug(const std::string& message) {
     log(LogLevel::DEBUG, message);
 }
@@ -380,4 +443,25 @@ void Logger::error(const std::string& message) {
 
 void Logger::fatal(const std::string& message) {
     log(LogLevel::FATAL, message);
+}
+
+// 新增：带位置信息的日志方法
+void Logger::debugWithLocation(const std::string& message, const char* file, int line, const char* function) {
+    logWithLocation(LogLevel::DEBUG, message, file, line, function);
+}
+
+void Logger::infoWithLocation(const std::string& message, const char* file, int line, const char* function) {
+    logWithLocation(LogLevel::INFO, message, file, line, function);
+}
+
+void Logger::warningWithLocation(const std::string& message, const char* file, int line, const char* function) {
+    logWithLocation(LogLevel::WARNING, message, file, line, function);
+}
+
+void Logger::errorWithLocation(const std::string& message, const char* file, int line, const char* function) {
+    logWithLocation(LogLevel::ERROR, message, file, line, function);
+}
+
+void Logger::fatalWithLocation(const std::string& message, const char* file, int line, const char* function) {
+    logWithLocation(LogLevel::FATAL, message, file, line, function);
 }
