@@ -68,76 +68,13 @@ void Logger::init(bool logToFile, const std::string& logDir, LogLevel minLevel) 
     }
 
     initialized = true;
+
+//    info("Logger initialized");
 }
 
 void Logger::shutdown() {
     prepareShutdown();
     finalizeShutdown();
-}
-
-// 带位置信息的静态方法实现
-void Logger::debug(const std::string& message, const LogLocation& location) {
-    log(LogLevel::DEBUG, message, &location);
-}
-
-void Logger::info(const std::string& message, const LogLocation& location) {
-    log(LogLevel::INFO, message, &location);
-}
-
-void Logger::warning(const std::string& message, const LogLocation& location) {
-    log(LogLevel::WARNING, message, &location);
-}
-
-void Logger::error(const std::string& message, const LogLocation& location) {
-    log(LogLevel::ERROR, message, &location);
-}
-
-void Logger::fatal(const std::string& message, const LogLocation& location) {
-    log(LogLevel::FATAL, message, &location);
-}
-
-// 不带位置信息的方法（用于特殊情况）
-void Logger::debugPlain(const std::string& message) {
-    log(LogLevel::DEBUG, message, nullptr);
-}
-
-void Logger::infoPlain(const std::string& message) {
-    log(LogLevel::INFO, message, nullptr);
-}
-
-void Logger::warningPlain(const std::string& message) {
-    log(LogLevel::WARNING, message, nullptr);
-}
-
-void Logger::errorPlain(const std::string& message) {
-    log(LogLevel::ERROR, message, nullptr);
-}
-
-void Logger::fatalPlain(const std::string& message) {
-    log(LogLevel::FATAL, message, nullptr);
-}
-
-// 格式化位置信息
-std::string Logger::formatLocation(const LogLocation& location) {
-    std::string filename = location.file;
-
-    // 只显示文件名，不显示完整路径
-    size_t lastSeparator = filename.find_last_of("/\\");
-    if (lastSeparator != std::string::npos) {
-        filename = filename.substr(lastSeparator + 1);
-    }
-
-    std::stringstream ss;
-    ss << "[" << filename << ":" << location.line;
-
-    // 如果函数名不为空且不是默认的函数名，则包含它
-    if (location.function && strlen(location.function) > 0 &&
-        strcmp(location.function, "unknown") != 0) {
-        ss << " in " << location.function << "()";
-    }
-
-    ss << "]";
-    return ss.str();
 }
 
 bool Logger::createDirectory(const std::string& path) {
@@ -208,7 +145,7 @@ std::string Logger::getCurrentLogFilePath() {
     char dateStr[64];
     strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", localtime(&now));
 
-    // 日志文件格式：logs/log_YYYY-MM-DD.log
+    // 日志文件格式：logs/log_YYYY-MM-DD.txt
     return logDirectory + PATH_SEPARATOR + "log_" + std::string(dateStr) + ".log";
 }
 
@@ -224,9 +161,9 @@ void Logger::cleanupOldLogs() {
             size_t lastSeparator = filePath.find_last_of("/\\");
             std::string filename = filePath.substr(lastSeparator + 1);
 
-            // 检查文件名是否符合格式：log_YYYY-MM-DD.log
+            // 检查文件名是否符合格式：log_YYYY-MM-DD.txt
             if (filename.size() >= 15 && filename.substr(0, 4) == "log_" &&
-                filename.substr(filename.size() - 4) == ".log") {
+                filename.substr(filename.size() - 4) == ".txt") {
                 logFiles.push_back(filePath);
             }
         }
@@ -290,7 +227,8 @@ void Logger::checkAndRotateLogFile() {
     }
 }
 
-void Logger::log(LogLevel level, const std::string& message, const LogLocation* location) {
+void Logger::log(LogLevel level, const std::string& message) {
+
     // 如果日志系统正在关闭，只允许致命错误和通过shutdownMessage方法发送的消息
     if (isShuttingDown && shutdownPhase >= 2 && level != LogLevel::FATAL) {
         return; // 在最终关闭阶段，丢弃普通消息
@@ -323,14 +261,8 @@ void Logger::log(LogLevel level, const std::string& message, const LogLocation* 
     }
 
     // 格式化日志消息
-    std::string formattedMessage = std::string("[") + timeStr + "][" + levelStr + "]";
-
-    // 如果有位置信息，添加位置信息
-    if (location) {
-        formattedMessage += formatLocation(*location);
-    }
-
-    formattedMessage += " " + message;
+    std::string formattedMessage =
+            std::string("[") + timeStr + "][" + levelStr + "] " + message;
 
     // 输出到控制台
     if (level == LogLevel::ERROR || level == LogLevel::FATAL) {
@@ -427,4 +359,25 @@ void Logger::finalizeShutdown() {
     }
 
     initialized = false;
+}
+
+
+void Logger::debug(const std::string& message) {
+    log(LogLevel::DEBUG, message);
+}
+
+void Logger::info(const std::string& message) {
+    log(LogLevel::INFO, message);
+}
+
+void Logger::warning(const std::string& message) {
+    log(LogLevel::WARNING, message);
+}
+
+void Logger::error(const std::string& message) {
+    log(LogLevel::ERROR, message);
+}
+
+void Logger::fatal(const std::string& message) {
+    log(LogLevel::FATAL, message);
 }
