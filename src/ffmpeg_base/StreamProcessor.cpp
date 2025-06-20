@@ -778,29 +778,60 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
     if (pixFmtStr == "yuv420p") preferredFormat = AV_PIX_FMT_YUV420P;
     else if (pixFmtStr == "nv12") preferredFormat = AV_PIX_FMT_NV12;
     else if (pixFmtStr == "p010le") preferredFormat = AV_PIX_FMT_P010LE;
+    else if (pixFmtStr == "drm_prime") preferredFormat = AV_PIX_FMT_DRM_PRIME;
 
     if (streamCtx.hwDeviceContext) {
-        // 对于硬件编码，设置为首选格式
-        streamCtx.encoderContext->pix_fmt = preferredFormat;
 
-        // 对于NVIDIA NVENC，检查是否支持首选格式
-        if (std::string(encoder->name).find("nvenc") != std::string::npos) {
-            bool formatSupported = false;
-            int i = 0;
-            while (encoder->pix_fmts && encoder->pix_fmts[i] != AV_PIX_FMT_NONE) {
-                if (encoder->pix_fmts[i] == preferredFormat) {
-                    formatSupported = true;
-                    break;
+        bool isRKMPPEncoder = (std::string(encoder->name).find("rkmpp") != std::string::npos);
+
+        if (isRKMPPEncoder) {
+            // RKMPP编码器必须使用DRM_PRIME格式
+            streamCtx.encoderContext->pix_fmt = AV_PIX_FMT_DRM_PRIME;
+            LOGGER_INFO("Using RKMPP encoder with DRM_PRIME format");
+        } else {
+            // 对于其他硬件编码器，使用首选格式
+            streamCtx.encoderContext->pix_fmt = preferredFormat;
+
+            // 对于NVIDIA NVENC，检查是否支持首选格式
+            if (std::string(encoder->name).find("nvenc") != std::string::npos) {
+                bool formatSupported = false;
+                int i = 0;
+                while (encoder->pix_fmts && encoder->pix_fmts[i] != AV_PIX_FMT_NONE) {
+                    if (encoder->pix_fmts[i] == preferredFormat) {
+                        formatSupported = true;
+                        break;
+                    }
+                    i++;
                 }
-                i++;
-            }
 
-            if (!formatSupported && encoder->pix_fmts) {
-                LOGGER_WARNING(" not supported by encoder");
-                streamCtx.encoderContext->pix_fmt = encoder->pix_fmts[0];
+                if (!formatSupported && encoder->pix_fmts) {
+                    LOGGER_WARNING("Preferred format not supported by NVENC encoder");
+                    streamCtx.encoderContext->pix_fmt = encoder->pix_fmts[0];
+                }
             }
         }
 
+//        // 对于硬件编码，设置为首选格式
+//        streamCtx.encoderContext->pix_fmt = preferredFormat;
+//
+//        // 对于NVIDIA NVENC，检查是否支持首选格式
+//        if (std::string(encoder->name).find("nvenc") != std::string::npos) {
+//            bool formatSupported = false;
+//            int i = 0;
+//            while (encoder->pix_fmts && encoder->pix_fmts[i] != AV_PIX_FMT_NONE) {
+//                if (encoder->pix_fmts[i] == preferredFormat) {
+//                    formatSupported = true;
+//                    break;
+//                }
+//                i++;
+//            }
+//
+//            if (!formatSupported && encoder->pix_fmts) {
+//                LOGGER_WARNING(" not supported by encoder");
+//                streamCtx.encoderContext->pix_fmt = encoder->pix_fmts[0];
+//            }
+//        }
+//
         LOGGER_INFO("Using hardware encoding with pixel format");
     } else {
         // 对于软件编码，使用编码器支持的第一个格式
@@ -852,7 +883,16 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
         if (hwFramesContext) {
             AVHWFramesContext* framesCtx = (AVHWFramesContext*)hwFramesContext->data;
             framesCtx->format = streamCtx.encoderContext->pix_fmt;
-            framesCtx->sw_format = streamCtx.encoderContext->pix_fmt;  // 使用相同格式
+
+            // 对于RKMPP，软件格式应该是NV12
+            if (streamCtx.encoderContext->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
+                framesCtx->sw_format = AV_PIX_FMT_NV12;  // DRM_PRIME的底层软件格式
+                LOGGER_INFO("Set DRM_PRIME hardware frames context with NV12 software format");
+            } else {
+                framesCtx->sw_format = streamCtx.encoderContext->pix_fmt;
+            }
+
+//            framesCtx->sw_format = streamCtx.encoderContext->pix_fmt;  // 使用相同格式
             framesCtx->width = streamCtx.encoderContext->width;
             framesCtx->height = streamCtx.encoderContext->height;
             framesCtx->initial_pool_size = 20;  // 预分配足够的帧池
@@ -1575,6 +1615,9 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
     int ret;
     bool frameAcquired = false;
     bool hwFrameUsed = false;
+    bool callbackFrameUsed = false;
+    // 准备用于回调的帧（转换为NV12格式供AI处理）
+    AVFrame* callbackFrame = nullptr;
 
     try {
         // 将数据包发送到解码器
@@ -1587,11 +1630,19 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
             // 在每个循环开始时重置标志
             frameAcquired = false;
             hwFrameUsed = false;
+            callbackFrameUsed = false;
+
+            // 重置callbackFrame指针
+            if (callbackFrame && callbackFrameUsed) {
+                av_frame_free(&callbackFrame);
+                callbackFrame = nullptr;
+                callbackFrameUsed = false;
+            }
 
             // 接收解码后的帧
             ret = avcodec_receive_frame(streamCtx.decoderContext, streamCtx.frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                LOGGER_DEBUG("decoder frame is failed, errorCode is: " + std::to_string(ret));
+                LOGGER_DEBUG("Decoder frame receive failed, errorCode: " + std::to_string(ret));
                 break;
             } else if (ret < 0) {
                 throw FFmpegException("Error receiving frame from decoder", ret);
@@ -1602,69 +1653,56 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
             // 更新最后一帧时间以防止重连
             lastFrameTime_ = av_gettime();
 
-            // 仅拉流模式或正常模式都可以处理帧
+            // 计算时间戳
             int64_t pts = streamCtx.frame->pts;
             if (streamCtx.inputStream) {
-                // 转换为毫秒时间戳
                 pts = av_rescale_q(pts, streamCtx.inputStream->time_base, {1, 1000});
             }
 
-            LOGGER_DEBUG("帧格式为: " + std::to_string(streamCtx.frame->format) + " 硬件帧格式为: " + std::to_string(streamCtx.hwFrame->format));
-
             if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME) {
-                LOGGER_DEBUG("Detected DRM_PRIME format (179), converting to NV12 for processing");
+                LOGGER_DEBUG("Processing DRM_PRIME frame for callback");
 
-                // Prepare the hw frame for NV12 format
-                streamCtx.hwFrame->width = streamCtx.frame->width;
-                streamCtx.hwFrame->height = streamCtx.frame->height;
-                streamCtx.hwFrame->format = AV_PIX_FMT_NV12;  // Force NV12 format
-
-                // Allocate frame buffer if needed
-                if (!streamCtx.hwFrame->data[0]) {
-                    ret = av_frame_get_buffer(streamCtx.hwFrame, 32);  // 32-byte alignment
-                    if (ret < 0) {
-                        throw FFmpegException("Failed to allocate buffer for NV12 frame conversion", ret);
-                    }
+                // 为回调分配NV12帧
+                callbackFrame = av_frame_alloc();
+                if (!callbackFrame) {
+                    throw FFmpegException("Failed to allocate callback frame");
                 }
 
-                // Try standard hardware frame transfer
-                ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
+                callbackFrame->width = streamCtx.frame->width;
+                callbackFrame->height = streamCtx.frame->height;
+                callbackFrame->format = AV_PIX_FMT_NV12;
+
+                ret = av_frame_get_buffer(callbackFrame, 32);
                 if (ret < 0) {
-                    // If standard transfer fails, we need to handle this in a specialized way
-                    LOGGER_WARNING("Standard hardware frame transfer failed for DRM_PRIME, using fallback method");
-
-                    // RKMPP specific handling - If needed, implement custom mapping here
-                    // This is placeholder code - actual implementation depends on your SDK
-
-                    // Just to avoid throwing an exception in this example:
-                    if (streamCtx.swsContext == nullptr) {
-                        streamCtx.swsContext = sws_getContext(
-                                streamCtx.frame->width, streamCtx.frame->height,
-                                AV_PIX_FMT_YUV420P,  // Pretend it's YUV420P as an intermediate
-                                streamCtx.frame->width, streamCtx.frame->height,
-                                AV_PIX_FMT_NV12,
-                                SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
-                        );
-
-                        if (!streamCtx.swsContext) {
-                            throw FFmpegException("Failed to create scaling context for DRM_PRIME conversion");
-                        }
-                    }
-
-                    // This is a last resort fallback - it might not work correctly
-                    // depending on how RKMPP exposes the actual pixel data
-                    sws_scale(streamCtx.swsContext, streamCtx.frame->data,
-                              streamCtx.frame->linesize, 0, streamCtx.frame->height,
-                              streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
+                    av_frame_free(&callbackFrame);
+                    throw FFmpegException("Failed to allocate buffer for callback frame", ret);
                 }
 
-                hwFrameUsed = true;
-
-                LOGGER_DEBUG("DRM_PRIME frame converted to NV12 format");
+                // 从DRM_PRIME转换到NV12
+                ret = av_hwframe_transfer_data(callbackFrame, streamCtx.frame, 0);
+                if (ret < 0) {
+                    LOGGER_WARNING("Failed to transfer DRM_PRIME data to NV12 for callback");
+                    av_frame_free(&callbackFrame);
+                    callbackFrame = nullptr;
+                } else {
+                    callbackFrame->pts = streamCtx.frame->pts;
+                    callbackFrameUsed = true;
+                    LOGGER_DEBUG("Successfully converted DRM_PRIME to NV12 for callback");
+                }
+            } else if (streamCtx.frame->format == AV_PIX_FMT_NV12) {
+                // 直接使用NV12帧
+                callbackFrame = streamCtx.frame;
+            } else {
+                // 对于其他格式，可能需要转换
+                LOGGER_DEBUG("Frame format: " + std::to_string(streamCtx.frame->format));
+                callbackFrame = streamCtx.frame;
             }
 
-            // 调用帧处理函数
-            handleVideoFrame(streamCtx.hwFrame, pts, (int)av_q2d(streamCtx.inputStream->avg_frame_rate));
+            // 调用帧处理回调函数（如果设置了）
+            if (callbackFrame) {
+                int fps = streamCtx.inputStream ? (int)av_q2d(streamCtx.inputStream->avg_frame_rate) : 25;
+                handleVideoFrame(callbackFrame, pts, fps);
+            }
 
             // 如果是仅拉流模式，我们不需要编码或写入帧
             if (!config_.pushEnabled) {
@@ -1672,45 +1710,43 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 if (frameAcquired) {
                     av_frame_unref(streamCtx.frame);
                 }
-
-                if (hwFrameUsed) {
-                    av_frame_unref(streamCtx.hwFrame);
+                if (callbackFrameUsed && callbackFrame) {
+                    av_frame_free(&callbackFrame);
                 }
-
                 continue;
             }
 
+            // 推流处理 - 使用原始帧进行编码
             AVFrame* frameToEncode = streamCtx.frame;
 
-            // 处理硬件加速帧
-            if (streamCtx.frame->format == AV_PIX_FMT_CUDA ||
-                streamCtx.frame->format == AV_PIX_FMT_VAAPI ||
-                streamCtx.frame->format == AV_PIX_FMT_QSV ||
-                streamCtx.frame->format == AV_PIX_FMT_D3D11 ||
-                streamCtx.frame->format == AV_PIX_FMT_VIDEOTOOLBOX ||
-                streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME ||
-                streamCtx.frame->format == AV_PIX_FMT_NV12
-                ) {
-                // 如果需要，将硬件帧转换为软件帧
-                if (!streamCtx.encoderContext->hw_frames_ctx) {
-                    ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
+            // 对于DRM_PRIME格式的帧，可以直接用于硬件编码
+            if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME &&
+                streamCtx.encoderContext->hw_frames_ctx) {
+                // 直接使用DRM_PRIME帧进行硬件编码
+                LOGGER_DEBUG("Using DRM_PRIME frame directly for hardware encoding");
+                frameToEncode = streamCtx.frame;
+            } else if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME &&
+                       !streamCtx.encoderContext->hw_frames_ctx) {
+                // 需要转换DRM_PRIME到软件格式
+                if (!streamCtx.hwFrame->data[0]) {
+                    streamCtx.hwFrame->width = streamCtx.frame->width;
+                    streamCtx.hwFrame->height = streamCtx.frame->height;
+                    streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
+                    ret = av_frame_get_buffer(streamCtx.hwFrame, 32);
                     if (ret < 0) {
-                        throw FFmpegException("Error transferring data from hardware frame", ret);
-                    }
-                    frameToEncode = streamCtx.hwFrame;
-                    hwFrameUsed = true;
-
-                    // 处理可能的无效格式
-                    if (frameToEncode->format == AV_PIX_FMT_NONE ||
-                        frameToEncode->format == AV_PIX_FMT_DRM_PRIME) {
-                        // 转换为编码器期望的格式，通常是NV12或YUV420P
-                        frameToEncode->format = streamCtx.encoderContext->pix_fmt;
-                        LOGGER_DEBUG("Corrected invalid pixel format");
+                        throw FFmpegException("Failed to allocate buffer for encoding frame", ret);
                     }
                 }
+
+                ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
+                if (ret < 0) {
+                    throw FFmpegException("Error transferring DRM_PRIME data for encoding", ret);
+                }
+                frameToEncode = streamCtx.hwFrame;
+                hwFrameUsed = true;
             }
 
-            // 确定是否需要缩放或格式转换
+            // 检查是否需要缩放或格式转换
             bool needsConversion = false;
 
             // 如果分辨率不同，需要缩放
@@ -1719,46 +1755,33 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 needsConversion = true;
             }
 
-            // 如果格式不同，可能需要转换（除非都是硬件格式）
+            // 如果格式不同且不是硬件到硬件的转换
             if (streamCtx.encoderContext->pix_fmt != frameToEncode->format) {
-                // 检查是否都是硬件格式
-                bool bothHardwareFormats =
-                        (frameToEncode->format >= AV_PIX_FMT_CUDA &&
-                         streamCtx.encoderContext->pix_fmt >= AV_PIX_FMT_CUDA);
-
-                if (!bothHardwareFormats) {
+                // 对于DRM_PRIME到DRM_PRIME，通常不需要转换
+                if (!(frameToEncode->format == AV_PIX_FMT_DRM_PRIME &&
+                      streamCtx.encoderContext->pix_fmt == AV_PIX_FMT_DRM_PRIME)) {
                     needsConversion = true;
-                } else {
-                    // 硬件格式之间的转换由硬件处理
-                    LOGGER_DEBUG("Both source and target are hardware formats, skipping software conversion");
-                    needsConversion = false;
                 }
             }
 
-            // 如果使用硬件帧上下文，可以跳过转换
-            if (streamCtx.encoderContext->hw_frames_ctx && frameToEncode->format == AV_PIX_FMT_NV12) {
-                // 检查编码器是否支持NV12直接输入
-                bool directNV12Support = false;
-                if (std::string(avcodec_get_name(streamCtx.encoderContext->codec_id)).find("nvenc") != std::string::npos ||
-                    std::string(avcodec_get_name(streamCtx.encoderContext->codec_id)).find("qsv") != std::string::npos) {
-                    directNV12Support = true;
-                }
-
-                if (directNV12Support) {
-                    LOGGER_DEBUG("Using direct NV12 input to hardware encoder, skipping conversion");
-                    needsConversion = false;
-                }
+            // 如果使用硬件帧上下文，可以跳过某些转换
+            if (streamCtx.encoderContext->hw_frames_ctx &&
+                frameToEncode->format == AV_PIX_FMT_DRM_PRIME &&
+                streamCtx.encoderContext->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
+                LOGGER_DEBUG("Using direct DRM_PRIME to DRM_PRIME encoding, skipping conversion");
+                needsConversion = false;
             }
 
             // 如果需要缩放或格式转换
             if (needsConversion) {
+                LOGGER_DEBUG("Frame conversion needed for encoding");
+
                 // 如果需要，初始化缩放上下文
                 if (!streamCtx.swsContext) {
-                    // 确保源格式是有效的
                     AVPixelFormat srcFormat = (AVPixelFormat)frameToEncode->format;
-                    if (srcFormat == AV_PIX_FMT_NONE || srcFormat == AV_PIX_FMT_DRM_PRIME) {
-                        srcFormat = AV_PIX_FMT_NV12;  // 默认假设NV12
-                        LOGGER_WARNING("Invalid source format, assuming NV12");
+                    if (srcFormat == AV_PIX_FMT_DRM_PRIME) {
+                        srcFormat = AV_PIX_FMT_NV12;  // DRM_PRIME的底层格式通常是NV12
+                        LOGGER_WARNING("Converting DRM_PRIME to NV12 for scaling context");
                     }
 
                     streamCtx.swsContext = sws_getContext(
@@ -1770,30 +1793,31 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                     );
 
                     if (!streamCtx.swsContext) {
-                        LOGGER_ERROR("Failed to create scaling context: source format");
-                        throw FFmpegException("Failed to create scaling context");
+                        throw FFmpegException("Failed to create scaling context for encoding");
                     }
-
-                    LOGGER_INFO("Created scaling context");
+                    LOGGER_INFO("Created scaling context for encoding conversion");
                 }
 
-                // 为缩放输出分配帧缓冲区
-                if (!streamCtx.hwFrame->data[0]) {
+                // 分配转换输出帧
+                if (!streamCtx.hwFrame->data[0] || hwFrameUsed) {
+                    if (hwFrameUsed) {
+                        av_frame_unref(streamCtx.hwFrame);
+                    }
                     streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
                     streamCtx.hwFrame->width = streamCtx.encoderContext->width;
                     streamCtx.hwFrame->height = streamCtx.encoderContext->height;
                     ret = av_frame_get_buffer(streamCtx.hwFrame, 0);
                     if (ret < 0) {
-                        throw FFmpegException("Failed to allocate frame buffer for scaling", ret);
+                        throw FFmpegException("Failed to allocate frame buffer for conversion", ret);
                     }
                 }
 
-                // 缩放帧
+                // 执行转换
                 ret = sws_scale(streamCtx.swsContext, frameToEncode->data,
                                 frameToEncode->linesize, 0, frameToEncode->height,
                                 streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
                 if (ret < 0) {
-                    throw FFmpegException("Error during frame scaling", ret);
+                    throw FFmpegException("Error during frame conversion for encoding", ret);
                 }
 
                 streamCtx.hwFrame->pts = frameToEncode->pts;
@@ -1859,6 +1883,10 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
             if (hwFrameUsed) {
                 av_frame_unref(streamCtx.hwFrame);
             }
+
+            if (callbackFrameUsed && callbackFrame) {
+                av_frame_free(&callbackFrame);
+            }
         }
     } catch (const FFmpegException& e) {
         // 即使在异常情况下也清理帧
@@ -1870,10 +1898,318 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
             av_frame_unref(streamCtx.hwFrame);
         }
 
+        if (callbackFrameUsed && callbackFrame) {
+            av_frame_free(&callbackFrame);
+        }
+
         // 重新抛出异常
         throw;
     }
 }
+
+//void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& streamCtx) {
+//    int ret;
+//    bool frameAcquired = false;
+//    bool hwFrameUsed = false;
+//
+//    try {
+//        // 将数据包发送到解码器
+//        ret = avcodec_send_packet(streamCtx.decoderContext, packet);
+//        if (ret < 0) {
+//            throw FFmpegException("Error sending packet to decoder", ret);
+//        }
+//
+//        while (ret >= 0) {
+//            // 在每个循环开始时重置标志
+//            frameAcquired = false;
+//            hwFrameUsed = false;
+//
+//            // 接收解码后的帧
+//            ret = avcodec_receive_frame(streamCtx.decoderContext, streamCtx.frame);
+//            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+//                LOGGER_DEBUG("decoder frame is failed, errorCode is: " + std::to_string(ret));
+//                break;
+//            } else if (ret < 0) {
+//                throw FFmpegException("Error receiving frame from decoder", ret);
+//            }
+//
+//            frameAcquired = true;
+//
+//            // 更新最后一帧时间以防止重连
+//            lastFrameTime_ = av_gettime();
+//
+//            // 仅拉流模式或正常模式都可以处理帧
+//            int64_t pts = streamCtx.frame->pts;
+//            if (streamCtx.inputStream) {
+//                // 转换为毫秒时间戳
+//                pts = av_rescale_q(pts, streamCtx.inputStream->time_base, {1, 1000});
+//            }
+//
+////            LOGGER_DEBUG("帧格式为: " + std::to_string(streamCtx.frame->format) + " 硬件帧格式为: " + std::to_string(streamCtx.hwFrame->format));
+//
+//            if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME) {
+////                LOGGER_DEBUG("Detected DRM_PRIME format (179), converting to NV12 for processing");
+//
+//                // Prepare the hw frame for NV12 format
+//                streamCtx.hwFrame->width = streamCtx.frame->width;
+//                streamCtx.hwFrame->height = streamCtx.frame->height;
+//                streamCtx.hwFrame->format = AV_PIX_FMT_NV12;  // Force NV12 format
+//
+//                // Allocate frame buffer if needed
+//                if (!streamCtx.hwFrame->data[0]) {
+//                    ret = av_frame_get_buffer(streamCtx.hwFrame, 32);  // 32-byte alignment
+//                    if (ret < 0) {
+//                        throw FFmpegException("Failed to allocate buffer for NV12 frame conversion", ret);
+//                    }
+//                }
+//
+//                // Try standard hardware frame transfer
+//                ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
+//                if (ret < 0) {
+//                    // If standard transfer fails, we need to handle this in a specialized way
+//                    LOGGER_WARNING("Standard hardware frame transfer failed for DRM_PRIME, using fallback method");
+//
+//                    // RKMPP specific handling - If needed, implement custom mapping here
+//                    // This is placeholder code - actual implementation depends on your SDK
+//
+//                    // Just to avoid throwing an exception in this example:
+//                    if (streamCtx.swsContext == nullptr) {
+//                        streamCtx.swsContext = sws_getContext(
+//                                streamCtx.frame->width, streamCtx.frame->height,
+//                                AV_PIX_FMT_YUV420P,  // Pretend it's YUV420P as an intermediate
+//                                streamCtx.frame->width, streamCtx.frame->height,
+//                                AV_PIX_FMT_NV12,
+//                                SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
+//                        );
+//
+//                        if (!streamCtx.swsContext) {
+//                            throw FFmpegException("Failed to create scaling context for DRM_PRIME conversion");
+//                        }
+//                    }
+//
+//                    // This is a last resort fallback - it might not work correctly
+//                    // depending on how RKMPP exposes the actual pixel data
+//                    sws_scale(streamCtx.swsContext, streamCtx.frame->data,
+//                              streamCtx.frame->linesize, 0, streamCtx.frame->height,
+//                              streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
+//                }
+//
+//                hwFrameUsed = true;
+//
+////                LOGGER_DEBUG("DRM_PRIME frame converted to NV12 format");
+//            }
+//
+//            // 调用帧处理函数
+//            handleVideoFrame(streamCtx.hwFrame, pts, (int)av_q2d(streamCtx.inputStream->avg_frame_rate));
+//
+//            // 如果是仅拉流模式，我们不需要编码或写入帧
+//            if (!config_.pushEnabled) {
+//                // 释放帧
+//                if (frameAcquired) {
+//                    av_frame_unref(streamCtx.frame);
+//                }
+//
+//                if (hwFrameUsed) {
+//                    av_frame_unref(streamCtx.hwFrame);
+//                }
+//
+//                continue;
+//            }
+//
+//            AVFrame* frameToEncode = streamCtx.frame;
+//
+//            // 处理硬件加速帧
+//            if (streamCtx.frame->format == AV_PIX_FMT_CUDA ||
+//                streamCtx.frame->format == AV_PIX_FMT_VAAPI ||
+//                streamCtx.frame->format == AV_PIX_FMT_QSV ||
+//                streamCtx.frame->format == AV_PIX_FMT_D3D11 ||
+//                streamCtx.frame->format == AV_PIX_FMT_VIDEOTOOLBOX ||
+//                streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME ||
+//                streamCtx.frame->format == AV_PIX_FMT_NV12
+//                ) {
+//                // 如果需要，将硬件帧转换为软件帧
+//                if (!streamCtx.encoderContext->hw_frames_ctx) {
+//                    ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
+//                    if (ret < 0) {
+//                        throw FFmpegException("Error transferring data from hardware frame", ret);
+//                    }
+//                    frameToEncode = streamCtx.hwFrame;
+//                    hwFrameUsed = true;
+//
+//                    // 处理可能的无效格式
+//                    if (frameToEncode->format == AV_PIX_FMT_NONE ||
+//                        frameToEncode->format == AV_PIX_FMT_DRM_PRIME) {
+//                        // 转换为编码器期望的格式，通常是NV12或YUV420P
+//                        frameToEncode->format = streamCtx.encoderContext->pix_fmt;
+//                        LOGGER_DEBUG("Corrected invalid pixel format");
+//                    }
+//                }
+//            }
+//
+//            // 确定是否需要缩放或格式转换
+//            bool needsConversion = false;
+//
+//            // 如果分辨率不同，需要缩放
+//            if (streamCtx.encoderContext->width != frameToEncode->width ||
+//                streamCtx.encoderContext->height != frameToEncode->height) {
+//                needsConversion = true;
+//            }
+//
+//            // 如果格式不同，可能需要转换（除非都是硬件格式）
+//            if (streamCtx.encoderContext->pix_fmt != frameToEncode->format) {
+//                // 检查是否都是硬件格式
+//                bool bothHardwareFormats =
+//                        (frameToEncode->format >= AV_PIX_FMT_CUDA &&
+//                         streamCtx.encoderContext->pix_fmt >= AV_PIX_FMT_CUDA);
+//
+//                if (!bothHardwareFormats) {
+//                    needsConversion = true;
+//                } else {
+//                    // 硬件格式之间的转换由硬件处理
+//                    LOGGER_DEBUG("Both source and target are hardware formats, skipping software conversion");
+//                    needsConversion = false;
+//                }
+//            }
+//
+//            // 如果使用硬件帧上下文，可以跳过转换
+//            if (streamCtx.encoderContext->hw_frames_ctx && frameToEncode->format == AV_PIX_FMT_NV12) {
+//                // 检查编码器是否支持NV12直接输入
+//                bool directNV12Support = false;
+//                if (std::string(avcodec_get_name(streamCtx.encoderContext->codec_id)).find("nvenc") != std::string::npos ||
+//                    std::string(avcodec_get_name(streamCtx.encoderContext->codec_id)).find("qsv") != std::string::npos) {
+//                    directNV12Support = true;
+//                }
+//
+//                if (directNV12Support) {
+//                    LOGGER_DEBUG("Using direct NV12 input to hardware encoder, skipping conversion");
+//                    needsConversion = false;
+//                }
+//            }
+//
+//            // 如果需要缩放或格式转换
+//            if (needsConversion) {
+//                // 如果需要，初始化缩放上下文
+//                if (!streamCtx.swsContext) {
+//                    // 确保源格式是有效的
+//                    AVPixelFormat srcFormat = (AVPixelFormat)frameToEncode->format;
+//                    if (srcFormat == AV_PIX_FMT_NONE || srcFormat == AV_PIX_FMT_DRM_PRIME) {
+//                        srcFormat = AV_PIX_FMT_NV12;  // 默认假设NV12
+//                        LOGGER_WARNING("Invalid source format, assuming NV12");
+//                    }
+//
+//                    streamCtx.swsContext = sws_getContext(
+//                            frameToEncode->width, frameToEncode->height,
+//                            srcFormat,
+//                            streamCtx.encoderContext->width, streamCtx.encoderContext->height,
+//                            streamCtx.encoderContext->pix_fmt,
+//                            SWS_BILINEAR, nullptr, nullptr, nullptr
+//                    );
+//
+//                    if (!streamCtx.swsContext) {
+//                        LOGGER_ERROR("Failed to create scaling context: source format");
+//                        throw FFmpegException("Failed to create scaling context");
+//                    }
+//
+//                    LOGGER_INFO("Created scaling context");
+//                }
+//
+//                // 为缩放输出分配帧缓冲区
+//                if (!streamCtx.hwFrame->data[0]) {
+//                    streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
+//                    streamCtx.hwFrame->width = streamCtx.encoderContext->width;
+//                    streamCtx.hwFrame->height = streamCtx.encoderContext->height;
+//                    ret = av_frame_get_buffer(streamCtx.hwFrame, 0);
+//                    if (ret < 0) {
+//                        throw FFmpegException("Failed to allocate frame buffer for scaling", ret);
+//                    }
+//                }
+//
+//                // 缩放帧
+//                ret = sws_scale(streamCtx.swsContext, frameToEncode->data,
+//                                frameToEncode->linesize, 0, frameToEncode->height,
+//                                streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
+//                if (ret < 0) {
+//                    throw FFmpegException("Error during frame scaling", ret);
+//                }
+//
+//                streamCtx.hwFrame->pts = frameToEncode->pts;
+//                frameToEncode = streamCtx.hwFrame;
+//                hwFrameUsed = true;
+//            }
+//
+//            // 重新计算时间戳
+//            frameToEncode->pts = av_rescale_q(
+//                    frameToEncode->pts,
+//                    streamCtx.decoderContext->time_base,
+//                    streamCtx.encoderContext->time_base
+//            );
+//
+//            // 将帧发送到编码器
+//            ret = avcodec_send_frame(streamCtx.encoderContext, frameToEncode);
+//            if (ret < 0) {
+//                throw FFmpegException("Error sending frame to encoder", ret);
+//            }
+//
+//            // 处理编码后的数据包
+//            while (ret >= 0) {
+//                AVPacket* encodedPacket = av_packet_alloc();
+//                if (!encodedPacket) {
+//                    throw FFmpegException("Failed to allocate encoded packet");
+//                }
+//
+//                ret = avcodec_receive_packet(streamCtx.encoderContext, encodedPacket);
+//                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+//                    av_packet_free(&encodedPacket);
+//                    break;
+//                } else if (ret < 0) {
+//                    av_packet_free(&encodedPacket);
+//                    throw FFmpegException("Error receiving packet from encoder", ret);
+//                }
+//
+//                // 准备输出数据包
+//                encodedPacket->stream_index = streamCtx.outputStream->index;
+//
+//                // 重新计算时间戳
+//                av_packet_rescale_ts(
+//                        encodedPacket,
+//                        streamCtx.encoderContext->time_base,
+//                        streamCtx.outputStream->time_base
+//                );
+//
+//                // 写入数据包
+//                ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+//
+//                // 无论写入是否成功，都释放数据包
+//                av_packet_free(&encodedPacket);
+//
+//                if (ret < 0) {
+//                    throw FFmpegException("Error writing encoded packet", ret);
+//                }
+//            }
+//
+//            // 完成后始终取消引用帧
+//            if (frameAcquired) {
+//                av_frame_unref(streamCtx.frame);
+//            }
+//
+//            if (hwFrameUsed) {
+//                av_frame_unref(streamCtx.hwFrame);
+//            }
+//        }
+//    } catch (const FFmpegException& e) {
+//        // 即使在异常情况下也清理帧
+//        if (frameAcquired) {
+//            av_frame_unref(streamCtx.frame);
+//        }
+//
+//        if (hwFrameUsed) {
+//            av_frame_unref(streamCtx.hwFrame);
+//        }
+//
+//        // 重新抛出异常
+//        throw;
+//    }
+//}
 
 void StreamProcessor::processAudioPacket(AVPacket* packet, StreamContext& streamCtx) {
     int ret;
