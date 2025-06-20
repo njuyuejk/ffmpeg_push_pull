@@ -192,8 +192,26 @@ void Application::cleanup() {
     auto cleanupStart = std::chrono::steady_clock::now();
     bool cleanupCompleted = false;
 
+    // 首先处理MQTT AI状态线程 - 使用超时机制
     if (mqttAIStatusThread && mqttAIStatusThread->joinable()) {
-        mqttAIStatusThread->join();
+        LOGGER_INFO("Stopping MQTT AI status thread...");
+
+        // 等待线程结束，但有超时限制
+        auto threadJoinFuture = std::async(std::launch::async, [this]() {
+            if (mqttAIStatusThread->joinable()) {
+                mqttAIStatusThread->join();
+            }
+        });
+
+        // 等待最多2秒
+        if (threadJoinFuture.wait_for(std::chrono::seconds(2)) == std::future_status::timeout) {
+            LOGGER_WARNING("MQTT AI status thread join timeout, proceeding with cleanup");
+            // 线程可能仍在运行，但我们不等待了
+            mqttAIStatusThread->detach(); // 分离线程，让它自然结束
+        } else {
+            LOGGER_INFO("MQTT AI status thread stopped successfully");
+        }
+        mqttAIStatusThread.reset();
     }
 
     // 清理mqtt连接
@@ -550,7 +568,9 @@ void Application::setupCustomFrameProcessing() {
                 aiModel->streamId = streamId;
                 aiModel->count = 0;
                 aiModel->modelType = modelConfig.modelType;
-                if (modelConfig.modelType == 5) {
+                if (modelConfig.modelType == 5 || modelConfig.modelType == 6)
+//                if (modelConfig.modelType == 5)
+                {
                     aiModel->isEnabled = false;
                 } else {
                     aiModel->isEnabled = true;  // 已在上面检查，此时肯定是启用的
@@ -882,22 +902,20 @@ void Application::handleAIEnabledControl(const std::string& serverName, const st
 //            publishSystemStatus("main_server", "wubarobot/logic_to_terminal/ai_status", serialized_message);
             LOGGER_INFO("已完成对AI事件" + std::to_string(modelType) + "的控制");
         } else if (topic == "wubarobot/terminal_to_logic/test_recognize_meter_ask") {
-//            AIDataResponse::TestRecognizeMeterAsk testRecognizeMeterAsk;
-//            testRecognizeMeterAsk.ParseFromString(payload);
-//            int meterType = testRecognizeMeterAsk.meter_type();
-//
-//            if (meterType == 1) {
-//                for (auto &model : singleModelPools_) {
-//                    if (model->modelType == 5) {
-//                        model->isEnabled = true;
-//                        LOGGER_INFO("模型 " + std::to_string(model->modelType) + " 的可用状态为: " + std::to_string(model->isEnabled));
-//                        break;
-//                    }
-////                AIDataResponse::EventState* eventState = aiStatus.add_event_state();
-////                eventState->set_event_type(static_cast<AIDataResponse::AIEvent_EventType>(model->modelType));
-////                eventState->set_isenabled(model->isEnabled);
-//                }
-//            }
+            AIDataResponse::TestRecognizeMeterAsk testRecognizeMeterAsk;
+            testRecognizeMeterAsk.ParseFromString(payload);
+            int meterType = testRecognizeMeterAsk.meter_type();
+
+            for (auto &model : singleModelPools_) {
+                if (model->modelType == meterType) {
+                    model->isEnabled = true;
+                    LOGGER_INFO("模型 " + std::to_string(model->modelType) + " 的可用状态为: " + std::to_string(model->isEnabled));
+                    break;
+                }
+//                AIDataResponse::EventState* eventState = aiStatus.add_event_state();
+//                eventState->set_event_type(static_cast<AIDataResponse::AIEvent_EventType>(model->modelType));
+//                eventState->set_isenabled(model->isEnabled);
+            }
         }
     }
     catch (const std::exception& e) {
@@ -910,6 +928,19 @@ void Application::publishSystemStatus(const std::string& serverName, const std::
     if (!client) {
         LOGGER_ERROR("Cannot publish system status: MQTT client not found for server " + serverName);
         return;
+    }
+
+    // 检查连接状态
+    if (!client->isConnected()) {
+        LOGGER_DEBUG("MQTT client " + serverName + " is not connected, skipping message publish to topic: " + topic);
+
+        // 可选：尝试重连（但不等待）
+        if (client->checkHealth()) {
+            LOGGER_DEBUG("MQTT client " + serverName + " reconnected successfully");
+        } else {
+            LOGGER_DEBUG("MQTT client " + serverName + " reconnection failed, message dropped");
+            return;
+        }
     }
 
     try {
@@ -961,68 +992,85 @@ void Application::publishAIStatus(const std::string& serverName) {
         return;
     }
 
-    // 在新线程中启动服务器
+    // 检查连接状态
+    if (!client->isConnected()) {
+        LOGGER_DEBUG("MQTT client " + serverName + " is not connected");
+
+        // 可选：尝试重连（但不等待）
+        if (client->checkHealth()) {
+            LOGGER_DEBUG("MQTT client " + serverName + " reconnected successfully");
+        } else {
+            LOGGER_DEBUG("MQTT client " + serverName + " reconnection failed, message dropped");
+            return;
+        }
+    }
+
+    // 在新线程中启动AI状态发布
     mqttAIStatusStarted = false;
     mqttAIStatusThread = std::make_unique<std::thread>([this]() {
-
         mqttAIStatusStarted = true;
+        LOGGER_INFO("MQTT AI status thread started");
 
         while (running_) {
+            try {
+                // 构建AI状态消息
+                AIDataResponse::AIStatus aiStatus;
+                for (auto &model : singleModelPools_) {
+                    AIDataResponse::EventState* eventState = aiStatus.add_event_state();
+                    eventState->set_event_type(static_cast<AIDataResponse::AIEvent_EventType>(model->modelType));
+                    eventState->set_isenabled(model->isEnabled);
+                }
 
-            AIDataResponse::AIStatus aiStatus;
+                // 序列化并发布事件
+                std::string serialized_message;
+                if (aiStatus.SerializeToString(&serialized_message)) {
+                    publishSystemStatus("main_server", "wubarobot/logic_to_terminal/ai_status", serialized_message);
+                    LOGGER_DEBUG("Published AI status message successfully");
+                } else {
+                    LOGGER_ERROR("模型启用状态消息序列化失败");
+                }
 
-            for (auto &model : singleModelPools_) {
+                // 使用可中断的等待方式，每100ms检查一次退出条件
+                // 总共等待5秒 (50 * 100ms = 5000ms)
+                for (int i = 0; i < 50 && running_; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
 
-                AIDataResponse::EventState* eventState = aiStatus.add_event_state();
-                eventState->set_event_type(static_cast<AIDataResponse::AIEvent_EventType>(model->modelType));
-                eventState->set_isenabled(model->isEnabled);
+            } catch (const std::exception& e) {
+                LOGGER_ERROR("Error in MQTT AI status thread: " + std::string(e.what()));
+                // 即使出错也要等待一段时间，避免死循环
+                for (int i = 0; i < 10 && running_; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            } catch (...) {
+                LOGGER_ERROR("Unknown error in MQTT AI status thread");
+                for (int i = 0; i < 10 && running_; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
             }
-
-            // 序列化并发布事件
-            std::string serialized_message;
-            if (!aiStatus.SerializeToString(&serialized_message)) {
-                LOGGER_ERROR("模型启用状态消息序列化失败");
-                return;
-            }
-
-//            AIDataResponse::AIEnabled aiEnabled;
-//            aiEnabled.set_event_type(AIDataResponse::AIEvent_EventType_Plate);
-//            aiEnabled.set_isenabled(false);
-//
-//            // 序列化并发布事件
-//            std::string serialized_message1;
-//            if (!aiEnabled.SerializeToString(&serialized_message1)) {
-//                LOGGER_ERROR("模型启用状态消息序列化失败");
-//                return;
-//            }
-//            publishSystemStatus("main_server", "wubarobot/logic_to_terminal/ai_enable", serialized_message1);
-
-            publishSystemStatus("main_server", "wubarobot/logic_to_terminal/ai_status", serialized_message);
-
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-
         }
 
         mqttAIStatusStarted = false;
-        LOGGER_INFO("mqtt AI status thread ended");
+        LOGGER_INFO("MQTT AI status thread ended");
     });
 
-    // 等待服务器启动
+    // 等待线程启动，使用更短的超时时间
     int waitCount = 0;
-    while (!mqttAIStatusStarted && waitCount < 50) { // 最多等待5秒
+    while (!mqttAIStatusStarted && waitCount < 30) { // 最多等待3秒
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         waitCount++;
     }
 
     if (mqttAIStatusStarted) {
-        LOGGER_INFO("HTTP server successfully started");
-        return;
+        LOGGER_INFO("MQTT AI status thread successfully started");
     } else {
-        LOGGER_ERROR("HTTP server failed to start within timeout");
+        LOGGER_ERROR("MQTT AI status thread failed to start within timeout");
+        // 如果启动失败，确保清理线程资源
         if (mqttAIStatusThread && mqttAIStatusThread->joinable()) {
+            running_ = false; // 确保线程能退出
             mqttAIStatusThread->join();
         }
-        return;
+        mqttAIStatusThread.reset();
     }
 
 }
@@ -1202,7 +1250,10 @@ std::unique_ptr<rknn_lite> Application::initSingleModel(int modelType, const std
             model_name = "./model/meter_yolov8s_v2_200.rknn";
             break;
         case 6:
-            model_name = "./model/yolov8n-crack.rknn";
+            model_name = "./model/DBNet_water_meter.rknn";
+            break;
+        case 7:
+            model_name = "./model/yolov8n_crack_seg.rknn";
             break;
         default:
             model_name = "./model/yolov8n.rknn";
@@ -1415,7 +1466,12 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
                     cv::Mat dstMat = model->singleRKModel->ori_img;
                     bool warning = model->singleRKModel->warning;
                     std::string plateResult = model->singleRKModel->plateResult;
-                    double targetValue = model->singleRKModel->value;
+                    std::string targetValue;
+                    if (model->modelType == 6) {
+                        targetValue = model->singleRKModel->recNumResult;
+                    } else {
+                        targetValue = std::to_string(model->singleRKModel->value);
+                    }
 
                     LOGGER_DEBUG("使用模型类型 " + std::to_string(model->modelType) +
                                   " 处理帧，警告 = " + std::to_string(warning));
@@ -1424,7 +1480,7 @@ void Application::processDelayFrameAI(const std::string &streamId, const AVFrame
                     if (warning && !model->warningFlag) {
                         handleModelWarning(model.get(), dstMat, plateResult, targetValue);
                         model->warningFlag = true;
-                        if (model->modelType == 5) {
+                        if (model->modelType == 5 || model->modelType == 6) {
                             model->isEnabled = false;
                         }
                         model->timeCount = 1;
@@ -1627,7 +1683,7 @@ void Application::test_model() {
     rkmodel->interf();
 }
 
-void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult, double targetValue) {
+void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult, const std::string& targetValue) {
     // 获取当前时间
     std::time_t now = std::time(nullptr);
     std::tm* localTime = std::localtime(&now);
@@ -1676,8 +1732,12 @@ void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dst
             aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_RecognizeMeter);
             break;
         case 6:
-            fileName = "/" + std::string(buffer_day) + "/crack_" + std::string(buffer) + ".jpg";
-            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_Person);
+            fileName = "/" + std::string(buffer_day) + "/water_meter_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_WaterMeter);
+            break;
+        case 7:
+            fileName = "/" + std::string(buffer_day) + "/ConcreteCrack_" + std::string(buffer) + ".jpg";
+            aiEvent.set_event_type(AIDataResponse::AIEvent_EventType_ConcreteCrack);
             break;
         default:
             fileName = "/" + std::string(buffer_day) + "/warning_" + std::string(buffer) + ".jpg";
@@ -1703,8 +1763,8 @@ void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dst
     AIDataResponse::PlateParam* plateParam = aiEvent.mutable_plate_param();
     plateParam->set_plate_number(plateResult);
 
-    // AIDataResponse::MeterParam* meterParam = aiEvent.mutable_meter_param();
-    // meterParam->set_meter_value(targetValue);
+    AIDataResponse::MeterParam* meterParam = aiEvent.mutable_meter_param();
+    meterParam->set_meter_value(targetValue);
 
     // 序列化并发布事件
     std::string serialized_message;
@@ -1713,6 +1773,10 @@ void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dst
         return;
     }
 
+    LOGGER_INFO("发布的MQTT消息数据: " + aiEvent.DebugString());
+
+    // 测试话题 wubarobot/logic_to_terminal/ai_event
+    // 中控话题 wubarobot/inner/ai_event
     publishSystemStatus("main_server", "wubarobot/inner/ai_event", serialized_message);
     LOGGER_DEBUG("已为模型类型 " + std::to_string(model->modelType) + " 发布AI事件");
 }

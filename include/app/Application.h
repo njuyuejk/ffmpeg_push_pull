@@ -188,7 +188,7 @@ private:
 
     void test_model();
 
-    void handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult, double targetValue);
+    void handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult, const std::string& targetValue);
 
 private:
     // 成员变量
