@@ -380,6 +380,8 @@ void StreamProcessor::openOutput() {
             }
         }
 
+        av_dict_set(&options, "tcp_nodelay", "1", 0);           // 禁用Nagle算法
+
         ret = avio_open2(&outputFormatContext_->pb, config_.outputUrl.c_str(),
                          AVIO_FLAG_WRITE, nullptr, &options);
         av_dict_free(&options);
@@ -853,7 +855,9 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
 
     // 设置GOP（关键帧间隔）
     streamCtx.encoderContext->gop_size = config_.keyframeInterval;
-    streamCtx.encoderContext->max_b_frames = 1;
+
+    // 禁用B帧
+    streamCtx.encoderContext->max_b_frames = 0;
 
     // 设置低延迟参数
     if (config_.lowLatencyMode) {
@@ -874,8 +878,11 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
     }
 
     // 设置缓冲区大小
-    streamCtx.encoderContext->rc_buffer_size = config_.bufferSize;
-    streamCtx.encoderContext->rc_max_rate = config_.videoBitrate * 2;
+//    streamCtx.encoderContext->rc_buffer_size = config_.bufferSize;
+//    streamCtx.encoderContext->rc_initial_buffer_occupancy = streamCtx.encoderContext->rc_buffer_size / 8;
+//    streamCtx.encoderContext->rc_max_rate = config_.videoBitrate;
+//    streamCtx.encoderContext->rc_min_rate = config_.videoBitrate * 0.8;  // 最小码率
+//    streamCtx.encoderContext->rc_buffer_size = config_.videoBitrate / 4;  // 缓冲区为码率的1/4
 
     // 将硬件帧上下文连接到编码器（如果使用硬件加速）
     if (streamCtx.hwDeviceContext) {
@@ -895,7 +902,7 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
 //            framesCtx->sw_format = streamCtx.encoderContext->pix_fmt;  // 使用相同格式
             framesCtx->width = streamCtx.encoderContext->width;
             framesCtx->height = streamCtx.encoderContext->height;
-            framesCtx->initial_pool_size = 20;  // 预分配足够的帧池
+            framesCtx->initial_pool_size = 25;  // 预分配足够的帧池
 
             ret = av_hwframe_ctx_init(hwFramesContext);
             if (ret < 0) {
@@ -915,6 +922,16 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
             std::string optionName = key.substr(8); // 去除"encoder_"前缀
             av_dict_set(&encoderOptions, optionName.c_str(), value.c_str(), 0);
         }
+    }
+
+    bool isRKMPPEncoder = (std::string(encoder->name).find("rkmpp") != std::string::npos);
+
+    if (isRKMPPEncoder) {
+        // RKMPP特有的实时优化
+        av_dict_set(&encoderOptions, "forced-idr", "1", 0);         // 强制IDR帧
+        av_dict_set(&encoderOptions, "aq-mode", "0", 0);            // 禁用自适应量化以加速
+        av_dict_set(&encoderOptions, "rc_mode", "CBR", 0);          // 恒定码率更适合RTMP
+        av_dict_set(&encoderOptions, "quality", "realtime", 0);     // 实时质量模式
     }
 
     // 打开编码器
@@ -1825,12 +1842,65 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 hwFrameUsed = true;
             }
 
-            // 重新计算时间戳
-            frameToEncode->pts = av_rescale_q(
-                    frameToEncode->pts,
-                    streamCtx.decoderContext->time_base,
-                    streamCtx.encoderContext->time_base
-            );
+//            // 重新计算时间戳
+//            frameToEncode->pts = av_rescale_q(
+//                    frameToEncode->pts,
+//                    streamCtx.decoderContext->time_base,
+//                    streamCtx.encoderContext->time_base
+//            );
+
+            // 每个流独立的时间戳管理（避免静态变量问题）
+            if (streamCtx.first_frame_processed) {
+                // 第一帧：建立时间基准映射
+                streamCtx.first_frame_processed = false;
+                streamCtx.real_time_start = av_gettime();  // 实际处理开始时间
+
+                // 原始时间戳转换
+                int64_t converted_pts = av_rescale_q(
+                        frameToEncode->pts,
+                        streamCtx.decoderContext->time_base,
+                        streamCtx.encoderContext->time_base
+                );
+
+                streamCtx.pts_offset = converted_pts;  // 记录偏移量
+                streamCtx.last_output_pts = 0;         // 输出从0开始
+                frameToEncode->pts = 0;
+
+                LOGGER_INFO("First frame timestamp mapping - Input PTS: " + std::to_string(converted_pts) +
+                            " -> Output PTS: 0");
+            } else {
+                // 后续帧：基于实际时间生成时间戳
+                int64_t current_real_time = av_gettime();
+                int64_t elapsed_us = current_real_time - streamCtx.real_time_start;
+
+                // 根据目标帧率计算期望的帧序号
+                double target_fps = av_q2d(streamCtx.encoderContext->framerate);
+                if (target_fps <= 0) target_fps = 25.0;  // 默认25fps
+
+                int64_t expected_frame_number = (int64_t)(elapsed_us * target_fps / 1000000.0);
+
+                // 转换为编码器时间基准的PTS
+                int64_t real_time_pts = av_rescale_q(expected_frame_number,
+                                                     av_make_q(1, (int)target_fps),
+                                                     streamCtx.encoderContext->time_base);
+
+                // 平滑处理：避免突然跳跃
+                if (streamCtx.last_output_pts != AV_NOPTS_VALUE) {
+                    int64_t pts_diff = real_time_pts - streamCtx.last_output_pts;
+
+                    // 如果差异过大，进行平滑过渡
+                    if (pts_diff > 5 || pts_diff <= 0) {
+                        real_time_pts = streamCtx.last_output_pts + 1;
+                        LOGGER_DEBUG("Smoothed PTS transition: " + std::to_string(real_time_pts));
+                    }
+                }
+
+                streamCtx.last_output_pts = real_time_pts;
+                frameToEncode->pts = real_time_pts;
+            }
+
+            // 确保DTS不大于PTS
+            frameToEncode->pkt_dts = frameToEncode->pts;
 
             // 将帧发送到编码器
             ret = avcodec_send_frame(streamCtx.encoderContext, frameToEncode);
@@ -1865,7 +1935,8 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 );
 
                 // 写入数据包
-                ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+//                ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+                ret = av_write_frame(outputFormatContext_, encodedPacket);
 
                 // 无论写入是否成功，都释放数据包
                 av_packet_free(&encodedPacket);
@@ -2285,7 +2356,8 @@ void StreamProcessor::processAudioPacket(AVPacket* packet, StreamContext& stream
             );
 
             // 写入包
-            ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+//            ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+            ret = av_write_frame(outputFormatContext_, encodedPacket);
             av_packet_free(&encodedPacket);
 
             if (ret < 0) {
