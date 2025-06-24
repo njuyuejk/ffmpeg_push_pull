@@ -6,87 +6,6 @@
 #include <vector>
 #include "nlohmann/json.hpp"  // 直接包含整个json.hpp
 
-/**
- * @brief 跟踪配置结构体
- */
-struct TrackingConfig {
-    std::string trackerType = "CSRT";        // 跟踪器类型：CSRT, KCF, MOSSE
-    int detectionInterval = 10;              // AI检测间隔（帧数）
-    int maxTargets = 15;                     // 最大跟踪目标数
-    int maxLostFrames = 30;                  // 目标丢失最大帧数
-    int minDetectionConfidence = 50;         // 最小检测置信度(%)
-    bool enableTrajectory = true;            // 是否显示轨迹
-    int trajectoryLength = 50;               // 轨迹点数量
-    float overlapThreshold = 0.3f;           // 重叠阈值
-    bool enableVisualization = true;         // 是否启用可视化
-    bool enableCallback = true;              // 是否启用回调
-    int callbackInterval = 1;                // 回调间隔（帧数）
-
-    // JSON序列化/反序列化方法
-    static TrackingConfig fromJson(const nlohmann::json& j);
-    nlohmann::json toJson() const;
-};
-
-/**
- * @brief AI模型配置结构体
- */
-struct AIModelConfig {
-    std::string modelPath;                   // 模型文件路径
-    float confidenceThreshold = 0.5f;        // 置信度阈值
-    float nmsThreshold = 0.45f;              // NMS阈值
-    int inputWidth = 640;                    // 输入宽度
-    int inputHeight = 640;                   // 输入高度
-    std::vector<std::string> classNames;     // 类别名称列表
-    bool enableGPU = false;                  // 是否启用GPU加速
-    std::map<std::string, std::string> customParams; // 自定义参数
-
-    // JSON序列化/反序列化方法
-    static AIModelConfig fromJson(const nlohmann::json& j);
-    nlohmann::json toJson() const;
-};
-
-/**
- * @brief 跟踪流配置结构体
- */
-struct TrackingStreamConfig {
-    std::string id;                          // 流ID
-
-    // 输入配置
-    struct InputConfig {
-        std::string url;                     // 输入URL
-        bool lowLatencyMode = true;          // 低延迟模式
-        std::map<std::string, std::string> extraOptions; // 额外选项
-
-        static InputConfig fromJson(const nlohmann::json& j);
-        nlohmann::json toJson() const;
-    } input;
-
-    // 输出配置
-    struct OutputConfig {
-        std::string url;                     // 输出URL
-        std::string format = "flv";          // 输出格式
-        int videoBitrate = 4000000;          // 视频码率
-        int audioBitrate = 128000;           // 音频码率
-        bool lowLatencyMode = true;          // 低延迟模式
-        int keyframeInterval = 30;           // 关键帧间隔
-        std::map<std::string, std::string> extraOptions; // 额外选项
-
-        static OutputConfig fromJson(const nlohmann::json& j);
-        nlohmann::json toJson() const;
-    } output;
-
-    AIModelConfig aiModel;                   // AI模型配置
-    TrackingConfig tracking;                 // 跟踪配置
-    bool autoStart = false;                  // 是否自动启动
-    bool enabled = true;                     // 是否启用
-
-    // JSON序列化/反序列化方法
-    static TrackingStreamConfig fromJson(const nlohmann::json& j);
-    nlohmann::json toJson() const;
-
-    // 验证配置有效性
-    bool validate() const;
-};
 
 struct ModelConfig {
     int modelType = 0;            // 模型类型
@@ -225,22 +144,6 @@ struct HTTPServerConfig {
     nlohmann::json toJson() const;
 };
 
-/**
- * @brief 全局跟踪配置
- */
-struct GlobalTrackingConfig {
-    bool enabled = false;                    // 是否启用跟踪功能
-    std::string defaultTrackerType = "CSRT"; // 默认跟踪器类型
-    int defaultDetectionInterval = 10;       // 默认检测间隔
-    int maxTargetsPerStream = 20;           // 每个流的最大目标数
-    int maxLostFrames = 30;                 // 最大丢失帧数
-    int minDetectionConfidence = 50;        // 最小检测置信度(%)
-    bool enableVisualization = true;        // 是否启用可视化
-    int trackingThreadPriority = 0;         // 跟踪线程优先级（0=normal, 1=high）
-
-    static GlobalTrackingConfig fromJson(const nlohmann::json& j);
-    nlohmann::json toJson() const;
-};
 
 /**
  * @brief 应用配置类
@@ -321,52 +224,10 @@ public:
     static const std::vector<MQTTServerConfig>& getMQTTServers(); // 获取所有MQTT服务器配置
 
     /**
-     * @brief 获取HTTP服务器配置
-     * @return HTTP服务器配置
-     */
+ * @brief 获取HTTP服务器配置
+ * @return HTTP服务器配置
+ */
     static const HTTPServerConfig& getHTTPServerConfig();
-
-    // 新增：跟踪相关配置方法
-
-    /**
-     * @brief 获取全局跟踪配置
-     */
-    static const GlobalTrackingConfig& getGlobalTrackingConfig();
-
-    /**
-     * @brief 设置全局跟踪配置
-     */
-    static void setGlobalTrackingConfig(const GlobalTrackingConfig& config);
-
-    /**
-     * @brief 获取所有跟踪流配置
-     */
-    static const std::vector<TrackingStreamConfig>& getTrackingStreamConfigs();
-
-    /**
-     * @brief 添加跟踪流配置
-     */
-    static void addTrackingStreamConfig(const TrackingStreamConfig& config);
-
-    /**
-     * @brief 通过ID查找跟踪流配置
-     */
-    static TrackingStreamConfig findTrackingStreamConfigById(const std::string& id);
-
-    /**
-     * @brief 更新跟踪流配置
-     */
-    static bool updateTrackingStreamConfig(const TrackingStreamConfig& config);
-
-    /**
-     * @brief 删除跟踪流配置
-     */
-    static bool removeTrackingStreamConfig(const std::string& id);
-
-    /**
-     * @brief 检查跟踪功能是否启用
-     */
-    static bool isTrackingEnabled();
 
 private:
     static std::vector<StreamConfig> streamConfigs;
@@ -382,10 +243,6 @@ private:
 
     static std::vector<MQTTServerConfig> mqttServers; // MQTT服务器配置列表
     static HTTPServerConfig httpServerConfig; // HTTP服务器配置
-
-    // 新增：跟踪相关静态成员
-    static GlobalTrackingConfig globalTrackingConfig;  // 全局跟踪配置
-    static std::vector<TrackingStreamConfig> trackingStreamConfigs; // 跟踪流配置列表
 };
 
 #endif // STREAM_CONFIG_H

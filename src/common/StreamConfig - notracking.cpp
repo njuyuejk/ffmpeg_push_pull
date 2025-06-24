@@ -45,439 +45,6 @@ std::string AppConfig::dirPath = "/root/data";
 std::vector<MQTTServerConfig> AppConfig::mqttServers;
 HTTPServerConfig AppConfig::httpServerConfig;
 
-// 新增：跟踪相关静态成员初始化
-GlobalTrackingConfig AppConfig::globalTrackingConfig;
-std::vector<TrackingStreamConfig> AppConfig::trackingStreamConfigs;
-
-// TrackingConfig 实现
-TrackingConfig TrackingConfig::fromJson(const nlohmann::json& j) {
-    TrackingConfig config;
-
-    if (j.contains("tracker_type") && j["tracker_type"].is_string()) {
-        config.trackerType = j["tracker_type"];
-    }
-
-    if (j.contains("detection_interval") && j["detection_interval"].is_number()) {
-        config.detectionInterval = j["detection_interval"];
-    }
-
-    if (j.contains("max_targets") && j["max_targets"].is_number()) {
-        config.maxTargets = j["max_targets"];
-    }
-
-    if (j.contains("max_lost_frames") && j["max_lost_frames"].is_number()) {
-        config.maxLostFrames = j["max_lost_frames"];
-    }
-
-    if (j.contains("min_detection_confidence") && j["min_detection_confidence"].is_number()) {
-        config.minDetectionConfidence = j["min_detection_confidence"];
-    }
-
-    if (j.contains("enable_trajectory") && j["enable_trajectory"].is_boolean()) {
-        config.enableTrajectory = j["enable_trajectory"];
-    }
-
-    if (j.contains("trajectory_length") && j["trajectory_length"].is_number()) {
-        config.trajectoryLength = j["trajectory_length"];
-    }
-
-    if (j.contains("overlap_threshold") && j["overlap_threshold"].is_number()) {
-        config.overlapThreshold = j["overlap_threshold"];
-    }
-
-    if (j.contains("enable_visualization") && j["enable_visualization"].is_boolean()) {
-        config.enableVisualization = j["enable_visualization"];
-    }
-
-    if (j.contains("enable_callback") && j["enable_callback"].is_boolean()) {
-        config.enableCallback = j["enable_callback"];
-    }
-
-    if (j.contains("callback_interval") && j["callback_interval"].is_number()) {
-        config.callbackInterval = j["callback_interval"];
-    }
-
-    return config;
-}
-
-nlohmann::json TrackingConfig::toJson() const {
-    nlohmann::json j;
-
-    j["tracker_type"] = trackerType;
-    j["detection_interval"] = detectionInterval;
-    j["max_targets"] = maxTargets;
-    j["max_lost_frames"] = maxLostFrames;
-    j["min_detection_confidence"] = minDetectionConfidence;
-    j["enable_trajectory"] = enableTrajectory;
-    j["trajectory_length"] = trajectoryLength;
-    j["overlap_threshold"] = overlapThreshold;
-    j["enable_visualization"] = enableVisualization;
-    j["enable_callback"] = enableCallback;
-    j["callback_interval"] = callbackInterval;
-
-    return j;
-}
-
-// AIModelConfig 实现
-AIModelConfig AIModelConfig::fromJson(const nlohmann::json& j) {
-    AIModelConfig config;
-
-    if (j.contains("model_path") && j["model_path"].is_string()) {
-        config.modelPath = j["model_path"];
-    }
-
-    if (j.contains("confidence_threshold") && j["confidence_threshold"].is_number()) {
-        config.confidenceThreshold = j["confidence_threshold"];
-    }
-
-    if (j.contains("nms_threshold") && j["nms_threshold"].is_number()) {
-        config.nmsThreshold = j["nms_threshold"];
-    }
-
-    if (j.contains("input_width") && j["input_width"].is_number()) {
-        config.inputWidth = j["input_width"];
-    }
-
-    if (j.contains("input_height") && j["input_height"].is_number()) {
-        config.inputHeight = j["input_height"];
-    }
-
-    if (j.contains("class_names") && j["class_names"].is_array()) {
-        for (const auto& name : j["class_names"]) {
-            if (name.is_string()) {
-                config.classNames.push_back(name);
-            }
-        }
-    }
-
-    if (j.contains("enable_gpu") && j["enable_gpu"].is_boolean()) {
-        config.enableGPU = j["enable_gpu"];
-    }
-
-    if (j.contains("custom_params") && j["custom_params"].is_object()) {
-        for (auto& [key, value] : j["custom_params"].items()) {
-            if (value.is_string()) {
-                config.customParams[key] = value;
-            } else if (value.is_number()) {
-                config.customParams[key] = std::to_string(value.get<double>());
-            } else if (value.is_boolean()) {
-                config.customParams[key] = value.get<bool>() ? "true" : "false";
-            }
-        }
-    }
-
-    return config;
-}
-
-nlohmann::json AIModelConfig::toJson() const {
-    nlohmann::json j;
-
-    j["model_path"] = modelPath;
-    j["confidence_threshold"] = confidenceThreshold;
-    j["nms_threshold"] = nmsThreshold;
-    j["input_width"] = inputWidth;
-    j["input_height"] = inputHeight;
-    j["class_names"] = classNames;
-    j["enable_gpu"] = enableGPU;
-
-    nlohmann::json customParamsJson;
-    for (const auto& [key, value] : customParams) {
-        // 尝试转换为其他类型
-        if (value == "true" || value == "false") {
-            customParamsJson[key] = (value == "true");
-        } else {
-            try {
-                double numValue = std::stod(value);
-                if (numValue == std::floor(numValue)) {
-                    customParamsJson[key] = static_cast<int>(numValue);
-                } else {
-                    customParamsJson[key] = numValue;
-                }
-            } catch (...) {
-                customParamsJson[key] = value;
-            }
-        }
-    }
-    j["custom_params"] = customParamsJson;
-
-    return j;
-}
-
-// TrackingStreamConfig::InputConfig 实现
-TrackingStreamConfig::InputConfig TrackingStreamConfig::InputConfig::fromJson(const nlohmann::json& j) {
-    InputConfig config;
-
-    if (j.contains("url") && j["url"].is_string()) {
-        config.url = j["url"];
-    }
-
-    if (j.contains("low_latency_mode") && j["low_latency_mode"].is_boolean()) {
-        config.lowLatencyMode = j["low_latency_mode"];
-    }
-
-    if (j.contains("extra_options") && j["extra_options"].is_object()) {
-        for (auto& [key, value] : j["extra_options"].items()) {
-            if (value.is_string()) {
-                config.extraOptions[key] = value;
-            } else if (value.is_number()) {
-                config.extraOptions[key] = std::to_string(value.get<double>());
-            } else if (value.is_boolean()) {
-                config.extraOptions[key] = value.get<bool>() ? "true" : "false";
-            }
-        }
-    }
-
-    return config;
-}
-
-nlohmann::json TrackingStreamConfig::InputConfig::toJson() const {
-    nlohmann::json j;
-
-    j["url"] = url;
-    j["low_latency_mode"] = lowLatencyMode;
-
-    nlohmann::json extraOptionsJson;
-    for (const auto& [key, value] : extraOptions) {
-        if (value == "true" || value == "false") {
-            extraOptionsJson[key] = (value == "true");
-        } else {
-            try {
-                double numValue = std::stod(value);
-                if (numValue == std::floor(numValue)) {
-                    extraOptionsJson[key] = static_cast<int>(numValue);
-                } else {
-                    extraOptionsJson[key] = numValue;
-                }
-            } catch (...) {
-                extraOptionsJson[key] = value;
-            }
-        }
-    }
-    j["extra_options"] = extraOptionsJson;
-
-    return j;
-}
-
-// TrackingStreamConfig::OutputConfig 实现
-TrackingStreamConfig::OutputConfig TrackingStreamConfig::OutputConfig::fromJson(const nlohmann::json& j) {
-    OutputConfig config;
-
-    if (j.contains("url") && j["url"].is_string()) {
-        config.url = j["url"];
-    }
-
-    if (j.contains("format") && j["format"].is_string()) {
-        config.format = j["format"];
-    }
-
-    if (j.contains("video_bitrate") && j["video_bitrate"].is_number()) {
-        config.videoBitrate = j["video_bitrate"];
-    }
-
-    if (j.contains("audio_bitrate") && j["audio_bitrate"].is_number()) {
-        config.audioBitrate = j["audio_bitrate"];
-    }
-
-    if (j.contains("low_latency_mode") && j["low_latency_mode"].is_boolean()) {
-        config.lowLatencyMode = j["low_latency_mode"];
-    }
-
-    if (j.contains("keyframe_interval") && j["keyframe_interval"].is_number()) {
-        config.keyframeInterval = j["keyframe_interval"];
-    }
-
-    if (j.contains("extra_options") && j["extra_options"].is_object()) {
-        for (auto& [key, value] : j["extra_options"].items()) {
-            if (value.is_string()) {
-                config.extraOptions[key] = value;
-            } else if (value.is_number()) {
-                config.extraOptions[key] = std::to_string(value.get<double>());
-            } else if (value.is_boolean()) {
-                config.extraOptions[key] = value.get<bool>() ? "true" : "false";
-            }
-        }
-    }
-
-    return config;
-}
-
-nlohmann::json TrackingStreamConfig::OutputConfig::toJson() const {
-    nlohmann::json j;
-
-    j["url"] = url;
-    j["format"] = format;
-    j["video_bitrate"] = videoBitrate;
-    j["audio_bitrate"] = audioBitrate;
-    j["low_latency_mode"] = lowLatencyMode;
-    j["keyframe_interval"] = keyframeInterval;
-
-    nlohmann::json extraOptionsJson;
-    for (const auto& [key, value] : extraOptions) {
-        if (value == "true" || value == "false") {
-            extraOptionsJson[key] = (value == "true");
-        } else {
-            try {
-                double numValue = std::stod(value);
-                if (numValue == std::floor(numValue)) {
-                    extraOptionsJson[key] = static_cast<int>(numValue);
-                } else {
-                    extraOptionsJson[key] = numValue;
-                }
-            } catch (...) {
-                extraOptionsJson[key] = value;
-            }
-        }
-    }
-    j["extra_options"] = extraOptionsJson;
-
-    return j;
-}
-
-// TrackingStreamConfig 实现
-TrackingStreamConfig TrackingStreamConfig::fromJson(const nlohmann::json& j) {
-    TrackingStreamConfig config;
-
-    if (j.contains("id") && j["id"].is_string()) {
-        config.id = j["id"];
-    }
-
-    if (j.contains("input") && j["input"].is_object()) {
-        config.input = InputConfig::fromJson(j["input"]);
-    }
-
-    if (j.contains("output") && j["output"].is_object()) {
-        config.output = OutputConfig::fromJson(j["output"]);
-    }
-
-    if (j.contains("ai_model") && j["ai_model"].is_object()) {
-        config.aiModel = AIModelConfig::fromJson(j["ai_model"]);
-    }
-
-    if (j.contains("tracking") && j["tracking"].is_object()) {
-        config.tracking = TrackingConfig::fromJson(j["tracking"]);
-    }
-
-    if (j.contains("auto_start") && j["auto_start"].is_boolean()) {
-        config.autoStart = j["auto_start"];
-    }
-
-    if (j.contains("enabled") && j["enabled"].is_boolean()) {
-        config.enabled = j["enabled"];
-    }
-
-    return config;
-}
-
-nlohmann::json TrackingStreamConfig::toJson() const {
-    nlohmann::json j;
-
-    j["id"] = id;
-    j["input"] = input.toJson();
-    j["output"] = output.toJson();
-    j["ai_model"] = aiModel.toJson();
-    j["tracking"] = tracking.toJson();
-    j["auto_start"] = autoStart;
-    j["enabled"] = enabled;
-
-    return j;
-}
-
-bool TrackingStreamConfig::validate() const {
-    // 检查ID
-    if (id.empty()) {
-        LOGGER_ERROR("跟踪流配置ID不能为空");
-        return false;
-    }
-
-    // 检查输入URL
-    if (input.url.empty()) {
-        LOGGER_ERROR("跟踪流输入URL不能为空");
-        return false;
-    }
-
-    // 检查输出URL
-    if (output.url.empty()) {
-        LOGGER_ERROR("跟踪流输出URL不能为空");
-        return false;
-    }
-
-    // 检查AI模型路径
-    if (aiModel.modelPath.empty()) {
-        LOGGER_WARNING("跟踪流AI模型路径为空，将无法进行AI检测");
-    }
-
-    // 检查跟踪参数合理性
-    if (tracking.detectionInterval < 1 || tracking.detectionInterval > 100) {
-        LOGGER_ERROR("检测间隔必须在1-100帧之间");
-        return false;
-    }
-
-    if (tracking.maxTargets < 1 || tracking.maxTargets > 100) {
-        LOGGER_ERROR("最大目标数必须在1-100之间");
-        return false;
-    }
-
-    if (tracking.minDetectionConfidence < 0 || tracking.minDetectionConfidence > 100) {
-        LOGGER_ERROR("最小检测置信度必须在0-100之间");
-        return false;
-    }
-
-    return true;
-}
-
-// GlobalTrackingConfig 实现
-GlobalTrackingConfig GlobalTrackingConfig::fromJson(const nlohmann::json& j) {
-    GlobalTrackingConfig config;
-
-    if (j.contains("enabled") && j["enabled"].is_boolean()) {
-        config.enabled = j["enabled"];
-    }
-
-    if (j.contains("default_tracker_type") && j["default_tracker_type"].is_string()) {
-        config.defaultTrackerType = j["default_tracker_type"];
-    }
-
-    if (j.contains("default_detection_interval") && j["default_detection_interval"].is_number()) {
-        config.defaultDetectionInterval = j["default_detection_interval"];
-    }
-
-    if (j.contains("max_targets_per_stream") && j["max_targets_per_stream"].is_number()) {
-        config.maxTargetsPerStream = j["max_targets_per_stream"];
-    }
-
-    if (j.contains("max_lost_frames") && j["max_lost_frames"].is_number()) {
-        config.maxLostFrames = j["max_lost_frames"];
-    }
-
-    if (j.contains("min_detection_confidence") && j["min_detection_confidence"].is_number()) {
-        config.minDetectionConfidence = j["min_detection_confidence"];
-    }
-
-    if (j.contains("enable_visualization") && j["enable_visualization"].is_boolean()) {
-        config.enableVisualization = j["enable_visualization"];
-    }
-
-    if (j.contains("tracking_thread_priority") && j["tracking_thread_priority"].is_number()) {
-        config.trackingThreadPriority = j["tracking_thread_priority"];
-    }
-
-    return config;
-}
-
-nlohmann::json GlobalTrackingConfig::toJson() const {
-    nlohmann::json j;
-
-    j["enabled"] = enabled;
-    j["default_tracker_type"] = defaultTrackerType;
-    j["default_detection_interval"] = defaultDetectionInterval;
-    j["max_targets_per_stream"] = maxTargetsPerStream;
-    j["max_lost_frames"] = maxLostFrames;
-    j["min_detection_confidence"] = minDetectionConfidence;
-    j["enable_visualization"] = enableVisualization;
-    j["tracking_thread_priority"] = trackingThreadPriority;
-
-    return j;
-}
 
 StreamConfig StreamConfig::createDefault() {
     StreamConfig config;
@@ -744,7 +311,6 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
         // 清除现有配置
         streamConfigs.clear();
         extraOptions.clear();
-        trackingStreamConfigs.clear(); // 新增：清除跟踪流配置
 
         // 加载常规设置
         if (configJson.contains("general")) {
@@ -775,14 +341,7 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
             if (general.contains("http_server") && general["http_server"].is_object()) {
                 httpServerConfig = HTTPServerConfig::fromJson(general["http_server"]);
                 LOGGER_INFO("Loaded HTTP server configuration: " + httpServerConfig.host + ":" +
-                            std::to_string(httpServerConfig.port));
-            }
-
-            // 新增：加载全局跟踪配置
-            if (general.contains("tracking") && general["tracking"].is_object()) {
-                globalTrackingConfig = GlobalTrackingConfig::fromJson(general["tracking"]);
-                LOGGER_INFO("Loaded global tracking configuration, enabled: " +
-                            std::string(globalTrackingConfig.enabled ? "true" : "false"));
+                             std::to_string(httpServerConfig.port));
             }
 
             // 加载其他额外选项
@@ -799,7 +358,7 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
             }
         }
 
-        // 加载普通流配置
+        // 加载流配置
         if (configJson.contains("streams") && configJson["streams"].is_array()) {
             for (auto& streamJson : configJson["streams"]) {
                 StreamConfig config = StreamConfig::fromJson(streamJson);
@@ -809,19 +368,6 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
             }
         }
 
-        // 新增：加载跟踪流配置
-        if (configJson.contains("tracking_streams") && configJson["tracking_streams"].is_array()) {
-            for (auto& trackingStreamJson : configJson["tracking_streams"]) {
-                TrackingStreamConfig config = TrackingStreamConfig::fromJson(trackingStreamJson);
-                if (config.validate()) {
-                    trackingStreamConfigs.push_back(config);
-                }
-            }
-
-            LOGGER_INFO("Loaded " + std::to_string(trackingStreamConfigs.size()) + " tracking stream configurations");
-        }
-
-        // 加载MQTT服务器配置
         if (configJson.contains("mqtt_servers") && configJson["mqtt_servers"].is_array()) {
             mqttServers.clear(); // 清除现有的MQTT服务器配置
 
@@ -836,13 +382,7 @@ bool AppConfig::loadFromFile(const std::string& configFilePath) {
         // 输出加载信息
         LOGGER_INFO("Loaded " + std::to_string(streamConfigs.size()) + " stream configurations");
         LOGGER_INFO("Global watchdog settings: useWatchdog=" + std::string(useWatchdog ? "true" : "false") +
-                    ", interval=" + std::to_string(watchdogInterval) + "s");
-
-        // 新增：输出跟踪配置信息
-        if (globalTrackingConfig.enabled) {
-            LOGGER_INFO("Tracking enabled with " + std::to_string(trackingStreamConfigs.size()) +
-                        " tracking streams configured");
-        }
+                     ", interval=" + std::to_string(watchdogInterval) + "s");
 
         for (const auto& config : streamConfigs) {
             LOGGER_DEBUG("Loaded stream: " + config.id + " (" + config.inputUrl + " -> " + config.outputUrl + ")");
@@ -891,9 +431,6 @@ bool AppConfig::saveToFile(const std::string& configFilePath) {
         // 添加HTTP服务器配置
         general["http_server"] = httpServerConfig.toJson();
 
-        // 新增：添加全局跟踪配置
-        general["tracking"] = globalTrackingConfig.toJson();
-
         // 添加一些常见的应用设置
         general["monitorInterval"] = 30;
         general["autoRestartStreams"] = true;
@@ -923,26 +460,12 @@ bool AppConfig::saveToFile(const std::string& configFilePath) {
 
         configJson["general"] = general;
 
-        // 添加普通流配置
+        // 添加流配置
         json streamsJson = json::array();
         for (const auto& config : streamConfigs) {
             streamsJson.push_back(config.toJson());
         }
         configJson["streams"] = streamsJson;
-
-        // 新增：添加跟踪流配置
-        json trackingStreamsJson = json::array();
-        for (const auto& config : trackingStreamConfigs) {
-            trackingStreamsJson.push_back(config.toJson());
-        }
-        configJson["tracking_streams"] = trackingStreamsJson;
-
-        // 添加MQTT服务器配置
-        json mqttServersJson = json::array();
-        for (const auto& config : mqttServers) {
-            mqttServersJson.push_back(config.toJson());
-        }
-        configJson["mqtt_servers"] = mqttServersJson;
 
         // 写入文件
         std::ofstream file(configFilePath);
@@ -1054,72 +577,6 @@ const std::vector<MQTTServerConfig>& AppConfig::getMQTTServers() {
 // HTTP服务器配置获取器
 const HTTPServerConfig& AppConfig::getHTTPServerConfig() {
     return httpServerConfig;
-}
-
-// 新增：跟踪相关配置方法实现
-
-const GlobalTrackingConfig& AppConfig::getGlobalTrackingConfig() {
-    return globalTrackingConfig;
-}
-
-void AppConfig::setGlobalTrackingConfig(const GlobalTrackingConfig& config) {
-    globalTrackingConfig = config;
-}
-
-const std::vector<TrackingStreamConfig>& AppConfig::getTrackingStreamConfigs() {
-    return trackingStreamConfigs;
-}
-
-void AppConfig::addTrackingStreamConfig(const TrackingStreamConfig& config) {
-    trackingStreamConfigs.push_back(config);
-}
-
-TrackingStreamConfig AppConfig::findTrackingStreamConfigById(const std::string& id) {
-    auto it = std::find_if(trackingStreamConfigs.begin(), trackingStreamConfigs.end(),
-                           [&id](const TrackingStreamConfig& config) {
-                               return config.id == id;
-                           });
-
-    if (it != trackingStreamConfigs.end()) {
-        return *it;
-    }
-
-    // 返回默认的跟踪流配置
-    TrackingStreamConfig defaultConfig;
-    defaultConfig.id = id;
-    return defaultConfig;
-}
-
-bool AppConfig::updateTrackingStreamConfig(const TrackingStreamConfig& config) {
-    auto it = std::find_if(trackingStreamConfigs.begin(), trackingStreamConfigs.end(),
-                           [&config](const TrackingStreamConfig& c) {
-                               return c.id == config.id;
-                           });
-
-    if (it != trackingStreamConfigs.end()) {
-        *it = config;
-        return true;
-    }
-
-    return false;
-}
-
-bool AppConfig::removeTrackingStreamConfig(const std::string& id) {
-    auto it = std::find_if(trackingStreamConfigs.begin(), trackingStreamConfigs.end(),
-                           [&id](const TrackingStreamConfig& config) {
-                               return config.id == id;
-                           });
-
-    if (it != trackingStreamConfigs.end()) {
-        trackingStreamConfigs.erase(it);
-        return true;
-    }
-
-    return false;
-}
-
-bool AppConfig::isTrackingEnabled() {
-    return globalTrackingConfig.enabled;
 }
 
 // MQTTSubscriptionConfig实现
