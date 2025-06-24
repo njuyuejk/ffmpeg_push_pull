@@ -11,6 +11,7 @@
 #include "AIService/rknnPool.h"
 #include <string>
 #include <memory>
+#include "ffmpeg_base/TrackingStreamProcessor.h"  // 添加跟踪处理器头文件
 
 struct ModelPoolEntry {
     std::vector<std::unique_ptr<rknn_lite>> rkpool; // 模型集合
@@ -190,6 +191,15 @@ private:
 
     void handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult, const std::string& targetValue);
 
+    /**
+     * @brief 跟踪流相关方法
+     */
+    void initializeTrackingStreams();
+    void startAllTrackingStreams();
+    void stopAllTrackingStreams();
+    void monitorTrackingStreams();
+    void setupTrackingCallbacks();
+
 private:
     // 成员变量
     bool running_;                           // 运行状态
@@ -242,6 +252,10 @@ private:
     // 添加线程相关成员
     std::unique_ptr<std::thread> mqttAIStatusThread;
     std::atomic<bool> mqttAIStatusStarted{false};
+
+    // 添加跟踪流管理器
+    std::unique_ptr<TrackingStreamManager> trackingStreamManager_;
+    bool trackingEnabled_ = false;  // 跟踪功能是否启用
 
 };
 

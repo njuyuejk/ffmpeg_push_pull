@@ -40,8 +40,8 @@ bool TrackingStreamProcessor::start() {
 
         // 创建输入流处理器（仅拉流模式）
         StreamConfig inputConfigCopy = inputConfig_;
-        inputConfigCopy.pushEnabled = false;  // 仅拉流
-        inputConfigCopy.aiEnabled = false;    // 不使用内置AI
+        inputConfigCopy.pushEnabled = true;  // 仅拉流
+        inputConfigCopy.aiEnabled = true;    // 不使用内置AI
 
         inputProcessor_ = std::make_unique<StreamProcessor>(inputConfigCopy);
 

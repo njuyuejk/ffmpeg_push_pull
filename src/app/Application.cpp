@@ -121,6 +121,17 @@ bool Application::initialize(const std::string& configFilePath) {
     // 创建流管理器
     streamManager_ = std::make_unique<MultiStreamManager>(AppConfig::getThreadPoolSize());
 
+    // 检查是否启用跟踪功能
+    trackingEnabled_ = AppConfig::isTrackingEnabled();
+    if (trackingEnabled_) {
+        // 创建跟踪流管理器
+        trackingStreamManager_ = std::make_unique<TrackingStreamManager>();
+        LOGGER_INFO("Tracking feature enabled, initializing tracking stream manager");
+
+        // 初始化跟踪流配置
+        initializeTrackingStreams();
+    }
+
     // 设置看门狗
     if (useWatchdog_) {
         try {
@@ -157,8 +168,18 @@ int Application::run() {
     // 启动所有配置的流
     startAllStreams();
 
+    // 启动跟踪流
+    if (trackingEnabled_) {
+        startAllTrackingStreams();
+    }
+
     // 设置自定义帧处理
     setupCustomFrameProcessing();
+
+    // 设置跟踪回调
+    if (trackingEnabled_) {
+        setupTrackingCallbacks();
+    }
 
     lastPeriodicReconnectTime_ = time(nullptr);
 
@@ -167,6 +188,11 @@ int Application::run() {
     // 监控循环
     while (running_) {
         monitorStreams();
+
+        // 监控跟踪流
+        if (trackingEnabled_) {
+            monitorTrackingStreams();
+        }
 
         // 延迟
         for (int i = 0; i < monitorIntervalSeconds_ && running_; i++) {
@@ -219,6 +245,18 @@ void Application::cleanup() {
 
     modelPools_.clear();
     std::vector<std::unique_ptr<ModelPoolEntry>>().swap(modelPools_);
+
+    // 停止跟踪流
+    if (trackingEnabled_ && trackingStreamManager_) {
+        try {
+            stopAllTrackingStreams();
+            trackingStreamManager_.reset();
+            LOGGER_INFO("Tracking stream manager cleaned up");
+        } catch (const std::exception& e) {
+            LOGGER_ERROR("Error cleaning up tracking stream manager: " + std::string(e.what()));
+        }
+    }
+
 
     // 使用单独的线程执行清理，防止潜在的阻塞
     std::thread cleanupThread([this, &cleanupCompleted]() {
@@ -1779,4 +1817,145 @@ void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dst
     // 中控话题 wubarobot/inner/ai_event
     publishSystemStatus("main_server", "wubarobot/inner/ai_event", serialized_message);
     LOGGER_DEBUG("已为模型类型 " + std::to_string(model->modelType) + " 发布AI事件");
+}
+
+void Application::startAllTrackingStreams() {
+    if (!trackingStreamManager_) {
+        return;
+    }
+
+    auto trackingStreamIds = trackingStreamManager_->listTrackingStreams();
+    int successCount = 0;
+
+    for (const auto& streamId : trackingStreamIds) {
+        // 检查是否需要自动启动
+        auto config = AppConfig::findTrackingStreamConfigById(streamId);
+        if (!config.autoStart) {
+            LOGGER_INFO("Skipping auto-start for tracking stream: " + streamId);
+            continue;
+        }
+
+        if (trackingStreamManager_->startTrackingStream(streamId)) {
+            LOGGER_INFO("Started tracking stream: " + streamId);
+            successCount++;
+        } else {
+            LOGGER_ERROR("Failed to start tracking stream: " + streamId);
+        }
+    }
+
+    LOGGER_INFO("Started " + std::to_string(successCount) + " of " +
+                std::to_string(trackingStreamIds.size()) + " tracking streams");
+}
+
+void Application::stopAllTrackingStreams() {
+    if (!trackingStreamManager_) {
+        return;
+    }
+
+    trackingStreamManager_->stopAll();
+    LOGGER_INFO("Stopped all tracking streams");
+}
+
+void Application::monitorTrackingStreams() {
+    if (!trackingStreamManager_) {
+        return;
+    }
+
+    auto trackingStreamIds = trackingStreamManager_->listTrackingStreams();
+
+    LOGGER_INFO("Running tracking streams (" + std::to_string(trackingStreamIds.size()) + "):");
+
+    for (const auto& streamId : trackingStreamIds) {
+        auto processor = trackingStreamManager_->getTrackingProcessor(streamId);
+        if (processor) {
+            std::string status = processor->hasError() ? "ERROR" :
+                                 (processor->isRunning() ? "RUNNING" : "STOPPED");
+            int targetCount = processor->getCurrentTargetCount();
+
+            LOGGER_INFO("  - " + streamId + " [" + status + "] Targets: " +
+                        std::to_string(targetCount));
+        }
+    }
+}
+
+void Application::setupTrackingCallbacks() {
+    if (!trackingStreamManager_) {
+        return;
+    }
+
+    auto trackingStreamIds = trackingStreamManager_->listTrackingStreams();
+
+    for (const auto& streamId : trackingStreamIds) {
+        auto processor = trackingStreamManager_->getTrackingProcessor(streamId);
+        if (processor) {
+            // 设置跟踪结果回调
+            processor->setTrackingCallback([this, streamId](const std::vector<TrackingTarget>& targets) {
+                // 处理跟踪结果
+                if (!targets.empty()) {
+                    LOGGER_DEBUG("Tracking stream " + streamId + " detected " +
+                                 std::to_string(targets.size()) + " targets");
+
+                    // 可以在这里将跟踪结果发送到MQTT或其他系统
+                    // 例如：publishTrackingResults(streamId, targets);
+                }
+            });
+        }
+    }
+}
+
+void Application::initializeTrackingStreams() {
+    if (!trackingStreamManager_) {
+        return;
+    }
+
+    // 获取跟踪流配置
+    const auto& trackingConfigs = AppConfig::getTrackingStreamConfigs();
+    LOGGER_INFO("Found " + std::to_string(trackingConfigs.size()) + " tracking stream configurations");
+
+    for (const auto& config : trackingConfigs) {
+        if (!config.enabled) {
+            LOGGER_INFO("Tracking stream " + config.id + " is disabled, skipping");
+            continue;
+        }
+
+        try {
+            // 创建输入流配置
+            StreamConfig inputConfig;
+            inputConfig.id = config.id + "_input";
+            inputConfig.inputUrl = config.input.url;
+            inputConfig.lowLatencyMode = config.input.lowLatencyMode;
+            inputConfig.extraOptions = config.input.extraOptions;
+            inputConfig.pushEnabled = true;  // 仅拉流
+            inputConfig.aiEnabled = true;    // 使用自定义AI
+
+            // 创建输出流配置
+            StreamConfig outputConfig;
+            outputConfig.id = config.id + "_output";
+            outputConfig.outputUrl = config.output.url;
+            outputConfig.outputFormat = config.output.format;
+            outputConfig.videoBitrate = config.output.videoBitrate;
+            outputConfig.audioBitrate = config.output.audioBitrate;
+            outputConfig.lowLatencyMode = config.output.lowLatencyMode;
+            outputConfig.keyframeInterval = config.output.keyframeInterval;
+            outputConfig.extraOptions = config.output.extraOptions;
+
+            // 创建跟踪流
+            std::string trackingStreamId = trackingStreamManager_->createTrackingStream(
+                    inputConfig, outputConfig, config.aiModel.modelPath
+            );
+
+            // 配置跟踪器
+            auto processor = trackingStreamManager_->getTrackingProcessor(trackingStreamId);
+            if (processor) {
+                processor->setTrackerType(config.tracking.trackerType);
+                processor->setDetectionInterval(config.tracking.detectionInterval);
+                processor->setMaxTargets(config.tracking.maxTargets);
+
+                LOGGER_INFO("Configured tracking stream: " + trackingStreamId);
+            }
+
+        } catch (const std::exception& e) {
+            LOGGER_ERROR("Failed to create tracking stream " + config.id + ": " + std::string(e.what()));
+        }
+    }
 }

@@ -8,17 +8,26 @@
     "watchdogInterval": 5,
     "dirPath": "/root/data",
     "http_server": {
-      "host": "127.0.0.1",
-      "port": 9000,
-      "connection_timeout": 5,
-      "read_timeout": 5
+      "host": "192.168.2.19",
+      "port": 8888,
+      "connection_timeout": 5
     },
     "extraOptions": {
       "periodicReconnectInterval": 180,
       "mqttMonitoringEnabled": true,
       "mqttHealthCheckInterval": 30,
-      "monitorInterval": 10,
+      "monitorInterval": 300,
       "autoRestartStreams": true
+    },
+    "tracking": {
+      "enabled": true,
+      "default_tracker_type": "CSRT",
+      "default_detection_interval": 10,
+      "max_targets_per_stream": 20,
+      "max_lost_frames": 30,
+      "min_detection_confidence": 50,
+      "enable_visualization": true,
+      "tracking_thread_priority": 0
     }
   },
   "mqtt_servers": [
@@ -34,12 +43,20 @@
       "reconnect_interval": 5,
       "subscriptions": [
         {
-          "topic": "stream/control",
-          "qos": 1
+          "topic": "test/airesult",
+          "qos": 2
         },
         {
           "topic": "system/status",
           "qos": 1
+        },
+        {
+          "topic": "wubarobot/logic_to_terminal/ai_enable",
+          "qos": 2
+        },
+	{
+          "topic": "wubarobot/terminal_to_logic/test_recognize_meter_ask",
+          "qos": 2
         }
       ]
     }
@@ -47,53 +64,20 @@
   "streams": [
     {
       "id": "stream_rtsp1",
-      "inputUrl": "rtsp://suo58:swai12345@192.168.20.22:554/Streaming/Channels/101?transportmode=unicast&profile=Profile_1",
-      "outputUrl": "rtmp://127.0.0.1:10085/hls/DvbuYNtNR?sign=vvxuLNpNRz",
-      "outputFormat": "flv",
-      "videoBitrate": 4000000,
-      "audioBitrate": 128000,
-      "lowLatencyMode": true,
-      "keyframeInterval": 30,
-      "bufferSize": 1000000,
-      "enableHardwareAccel": false,
-      "hwaccelType": "cuda",
-      "width": 0,
-      "height": 0,
-      "pushEnabled": true,
-      "extraOptions": {
-        "autoStart": true,
-        "maxReconnectAttempts": 5,
-        "noDataTimeout": 10000,
-        "input_rtsp_transport": "tcp",
-        "input_stimeout": 5000000,
-        "input_probesize": 5242880,
-        "input_analyzeduration": 5000000,
-        "input_fflags": "+genpts+igndts",
-        "input_reconnect": 1,
-        "input_reconnect_streamed": 1,
-        "input_reconnect_delay_max": 5,
-        "video_codec_id": "h264",
-        "encoder_zerolatency": 1,
-        "output_flush_packets": 1,
-        "output_fflags": "nobuffer",
-        "hwaccel_pix_fmt": "nv12"
-      }
-    },
-    {
-      "id": "stream_file1",
       "inputUrl": "rtsp://suo58:swai12345@192.168.20.23:554/Streaming/Channels/101?transportmode=unicast&profile=Profile_1",
-      "outputUrl": "rtmp://127.0.0.1:10085/hls/orIMW55NR?sign=TrIaWccNRz",
+      "outputUrl": "rtmp://192.168.2.19:10085/hls/P35NdHENR?sign=EqcHdNEHgz",
       "outputFormat": "flv",
-      "videoBitrate": 4000000,
-      "audioBitrate": 128000,
+      "videoBitrate": 1000000,
+      "audioBitrate": 64000,
       "lowLatencyMode": true,
-      "keyframeInterval": 30,
-      "bufferSize": 1000000,
-      "enableHardwareAccel": false,
-      "hwaccelType": "cuda",
+      "keyframeInterval": 10,
+      "bufferSize": 512000,
+      "enableHardwareAccel": true,
+      "hwaccelType": "rkmpp",
       "width": 0,
       "height": 0,
-      "pushEnabled": true,
+      "pushEnabled": false,
+      "isLocalFile": true,
       "aiEnabled": true,
       "models": [
         {
@@ -106,15 +90,36 @@
           }
         },
         {
-          "modelType": 3,
-          "enabled": false,
+          "modelType": 2,
+          "enabled": true,
           "params": {
-            "confidence_threshold": "0.5"
+            "confidence_threshold": "0.6"
           }
         },
         {
           "modelType": 4,
           "enabled": true,
+          "params": {
+            "confidence_threshold": "0.5"
+          }
+        },
+	      {
+          "modelType": 5,
+          "enabled": true,
+          "params": {
+            "confidence_threshold": "0.5"
+          }
+        },
+        {
+          "modelType": 6,
+          "enabled": true,
+          "params": {
+            "confidence_threshold": "0.5"
+          }
+        },
+        {
+          "modelType": 7,
+          "enabled": false,
           "params": {
             "confidence_threshold": "0.5"
           }
@@ -125,9 +130,9 @@
         "maxReconnectAttempts": 5,
         "noDataTimeout": 10000,
         "input_rtsp_transport": "tcp",
-        "input_stimeout": 5000000,
-        "input_probesize": 5242880,
-        "input_analyzeduration": 5000000,
+        "input_stimeout": 3000000,
+        "input_probesize": 1048576,
+        "input_analyzeduration": 1000000,
         "input_fflags": "+genpts+igndts",
         "input_reconnect": 1,
         "input_reconnect_streamed": 1,
@@ -138,6 +143,50 @@
         "output_fflags": "nobuffer",
         "hwaccel_pix_fmt": "nv12"
       }
+    }
+  ],
+  "tracking_streams": [
+    {
+      "id": "tracking_stream_1",
+      "input": {
+        "url": "rtsp://suo58:swai12345@192.168.20.23:554/Streaming/Channels/101?transportmode=unicast&profile=Profile_1",
+        "lowLatencyMode": true,
+        "extraOptions": {
+          "rtsp_transport": "tcp",
+          "stimeout": "5000000"
+        }
+      },
+      "output": {
+        "url": "rtmp://192.168.2.19:10085/hls/P35NdHENR?sign=EqcHdNEHgz",
+        "format": "flv",
+        "video_bitrate": 1000000,
+        "audio_bitrate": 64000,
+        "low_latency_mode": true,
+        "keyframe_interval": 10
+      },
+      "ai_model": {
+        "model_path": "./model/yolov8_relu_person_best.rknn",
+        "confidence_threshold": 0.5,
+        "nms_threshold": 0.45,
+        "input_width": 640,
+        "input_height": 640,
+        "enable_gpu": false
+      },
+      "tracking": {
+        "tracker_type": "CSRT",
+        "detection_interval": 10,
+        "max_targets": 15,
+        "max_lost_frames": 30,
+        "min_detection_confidence": 50,
+        "enable_trajectory": true,
+        "trajectory_length": 50,
+        "overlap_threshold": 0.3,
+        "enable_visualization": true,
+        "enable_callback": true,
+        "callback_interval": 1
+      },
+      "auto_start": true,
+      "enabled": true
     }
   ]
 }
