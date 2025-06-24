@@ -221,6 +221,10 @@ void StreamProcessor::initialize() {
         if (ret < 0) {
             throw FFmpegException("Failed to write output header", ret);
         }
+//        // 立即刷新头部信息
+//        if (config_.lowLatencyMode && outputFormatContext_->pb) {
+//            avio_flush(outputFormatContext_->pb);
+//        }
     } else {
         setupInputStreams();
         LOGGER_INFO("Stream " + config_.id + " initialized in pull-only mode (no pushing)");
@@ -1849,58 +1853,68 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
 //                    streamCtx.encoderContext->time_base
 //            );
 
+            // 方法一
             // 每个流独立的时间戳管理（避免静态变量问题）
             if (streamCtx.first_frame_processed) {
-                // 第一帧：建立时间基准映射
                 streamCtx.first_frame_processed = false;
-                streamCtx.real_time_start = av_gettime();  // 实际处理开始时间
 
-                // 原始时间戳转换
-                int64_t converted_pts = av_rescale_q(
-                        frameToEncode->pts,
+                // 记录第一帧的时间戳作为基准
+                streamCtx.pts_offset = frameToEncode->pts;
+
+                // 直接转换时间戳，保持相对关系
+                frameToEncode->pts = av_rescale_q(
+                        frameToEncode->pts - streamCtx.pts_offset,  // 从0开始
                         streamCtx.decoderContext->time_base,
                         streamCtx.encoderContext->time_base
                 );
 
-                streamCtx.pts_offset = converted_pts;  // 记录偏移量
-                streamCtx.last_output_pts = 0;         // 输出从0开始
-                frameToEncode->pts = 0;
+                streamCtx.last_output_pts = frameToEncode->pts;
 
-                LOGGER_INFO("First frame timestamp mapping - Input PTS: " + std::to_string(converted_pts) +
-                            " -> Output PTS: 0");
+                LOGGER_INFO("First frame timestamp - Input base: " + std::to_string(streamCtx.pts_offset) +
+                            " -> Output PTS: " + std::to_string(frameToEncode->pts));
             } else {
-                // 后续帧：基于实际时间生成时间戳
-                int64_t current_real_time = av_gettime();
-                int64_t elapsed_us = current_real_time - streamCtx.real_time_start;
+                // 后续帧：保持原始时间戳的相对关系
+                int64_t relative_pts = frameToEncode->pts - streamCtx.pts_offset;
 
-                // 根据目标帧率计算期望的帧序号
-                double target_fps = av_q2d(streamCtx.encoderContext->framerate);
-                if (target_fps <= 0) target_fps = 25.0;  // 默认25fps
+                frameToEncode->pts = av_rescale_q(
+                        relative_pts,
+                        streamCtx.decoderContext->time_base,
+                        streamCtx.encoderContext->time_base
+                );
 
-                int64_t expected_frame_number = (int64_t)(elapsed_us * target_fps / 1000000.0);
-
-                // 转换为编码器时间基准的PTS
-                int64_t real_time_pts = av_rescale_q(expected_frame_number,
-                                                     av_make_q(1, (int)target_fps),
-                                                     streamCtx.encoderContext->time_base);
-
-                // 平滑处理：避免突然跳跃
-                if (streamCtx.last_output_pts != AV_NOPTS_VALUE) {
-                    int64_t pts_diff = real_time_pts - streamCtx.last_output_pts;
-
-                    // 如果差异过大，进行平滑过渡
-                    if (pts_diff > 5 || pts_diff <= 0) {
-                        real_time_pts = streamCtx.last_output_pts + 1;
-                        LOGGER_DEBUG("Smoothed PTS transition: " + std::to_string(real_time_pts));
-                    }
+                // 确保时间戳单调递增，但允许小幅调整
+                if (frameToEncode->pts <= streamCtx.last_output_pts) {
+                    frameToEncode->pts = streamCtx.last_output_pts + 1;
                 }
 
-                streamCtx.last_output_pts = real_time_pts;
-                frameToEncode->pts = real_time_pts;
+                streamCtx.last_output_pts = frameToEncode->pts;
             }
 
-            // 确保DTS不大于PTS
+            // 设置DTS
             frameToEncode->pkt_dts = frameToEncode->pts;
+
+//            // 方法二
+//            // 步骤1：将当前帧的PTS从输入流的时间基转换到编码器的时间基
+//            int64_t current_pts = av_rescale_q(
+//                    frameToEncode->pts,
+//                    streamCtx.inputStream->time_base,
+//                    streamCtx.encoderContext->time_base
+//            );
+//
+//            // 步骤2：时间戳平滑处理
+//            // 检查当前PTS是否落后于上一帧的PTS
+//            if (streamCtx.last_output_pts != AV_NOPTS_VALUE && current_pts <= streamCtx.last_output_pts) {
+//                // 如果发生时间戳回退或停滞，就在上一帧的基础上增加一个小的增量
+//                // 这可以防止卡顿和编码器报错
+//                current_pts = streamCtx.last_output_pts + 1;
+//            }
+//
+//            // 更新帧的时间戳
+//            frameToEncode->pts = current_pts;
+//            frameToEncode->pkt_dts = current_pts; // 在低延迟场景下，DTS可以等于PTS
+//
+//            // 步骤3：记录当前帧的PTS，供下一帧参考
+//            streamCtx.last_output_pts = current_pts;
 
             // 将帧发送到编码器
             ret = avcodec_send_frame(streamCtx.encoderContext, frameToEncode);
@@ -1943,6 +1957,11 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
 
                 if (ret < 0) {
                     throw FFmpegException("Error writing encoded packet", ret);
+                }
+
+                // 立即刷新头部信息
+                if (config_.lowLatencyMode && outputFormatContext_->pb) {
+                    avio_flush(outputFormatContext_->pb);
                 }
             }
 
@@ -2362,6 +2381,11 @@ void StreamProcessor::processAudioPacket(AVPacket* packet, StreamContext& stream
 
             if (ret < 0) {
                 throw FFmpegException("Error writing encoded audio packet", ret);
+            }
+
+            // 立即刷新头部信息
+            if (config_.lowLatencyMode && outputFormatContext_->pb) {
+                avio_flush(outputFormatContext_->pb);
             }
         }
 

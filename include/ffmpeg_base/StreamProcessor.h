@@ -108,13 +108,8 @@ private:
 
         // 时间戳管理
         bool first_frame_processed = true;     // 是否为第一帧
-        int64_t real_time_start = 0;           // 实际处理开始时间
         int64_t pts_offset = 0;                // PTS偏移量
         int64_t last_output_pts = AV_NOPTS_VALUE;  // 上一个输出PTS
-
-        // 统计信息
-        int64_t processed_frames = 0;          // 已处理帧数
-        int64_t dropped_frames = 0;            // 丢弃帧数
     };
 
     // 成员变量
