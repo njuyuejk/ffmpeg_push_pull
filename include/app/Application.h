@@ -11,6 +11,7 @@
 #include "AIService/rknnPool.h"
 #include <string>
 #include <memory>
+#include "AITrackingAlgorithm.h"
 
 struct ModelPoolEntry {
     std::vector<std::unique_ptr<rknn_lite>> rkpool; // 模型集合
@@ -190,6 +191,15 @@ private:
 
     void handleModelWarning(SingleModelEntry* model, const cv::Mat& dstMat, const std::string& plateResult, const std::string& targetValue);
 
+    /**
+     * @brief 初始化AI跟踪算法
+     * @param streamId 流ID
+     * @param config 流配置
+     */
+    void initializeTrackingForStream(const std::string& streamId, const StreamConfig& config);
+
+    void handleTrackingResults(const std::string& streamId, const TrackingResult& result, int64_t pts);
+
 private:
     // 成员变量
     bool running_;                           // 运行状态
@@ -243,6 +253,8 @@ private:
     std::unique_ptr<std::thread> mqttAIStatusThread;
     std::atomic<bool> mqttAIStatusStarted{false};
 
+    // 跟踪算法
+    std::map<std::string, std::shared_ptr<AITrackingAlgorithm>> trackingAlgorithms_;
 };
 
 /**

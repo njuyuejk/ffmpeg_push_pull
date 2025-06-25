@@ -3615,6 +3615,10 @@ void StreamProcessor::processTrackingFrame(std::unique_ptr<TrackingFrameData> fr
             }
         }
 
+        if (processedFrame) {
+            av_frame_free(&processedFrame);
+        }
+
         LOGGER_DEBUG("Tracking processed frame with " + std::to_string(result.objects.size()) +
                      " objects in " + std::to_string(processingTimeMs) + "ms");
 

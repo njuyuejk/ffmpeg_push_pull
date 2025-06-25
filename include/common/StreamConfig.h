@@ -34,6 +34,7 @@ struct StreamConfig {
     bool pushEnabled = true;
     bool aiEnabled = false;
     bool isLocalFile = false;
+    bool trackingEnabled = false;
 
     std::vector<ModelConfig> models;  // 多个模型配置
 

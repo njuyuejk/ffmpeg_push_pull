@@ -220,6 +220,9 @@ void Application::cleanup() {
     modelPools_.clear();
     std::vector<std::unique_ptr<ModelPoolEntry>>().swap(modelPools_);
 
+    // 清理跟踪算法
+    trackingAlgorithms_.clear();
+
     // 使用单独的线程执行清理，防止潜在的阻塞
     std::thread cleanupThread([this, &cleanupCompleted]() {
         try {
@@ -593,6 +596,31 @@ void Application::setupCustomFrameProcessing() {
                 });
 
                 LOGGER_INFO("Custom video frame processing set up for stream: " + streamId);
+            }
+        } else if (config.pushEnabled && config.trackingEnabled) {
+            // 获取StreamProcessor指针
+            auto processor = streamManager_->getStreamProcessor(streamId);
+
+            // 初始化AI跟踪算法
+            initializeTrackingForStream(streamId, config);
+
+            if (processor) {
+
+                // 启用跟踪处理
+                processor->enableTracking(config.trackingEnabled);
+
+                // 设置跟踪算法
+                auto trackingAlgorithm = trackingAlgorithms_[streamId];
+                if (trackingAlgorithm) {
+                    processor->setTrackingAlgorithm(trackingAlgorithm);
+                }
+
+                // 设置跟踪结果回调
+                processor->setTrackingResultCallback([this, streamId](const TrackingResult& result, int64_t pts) {
+                    handleTrackingResults(streamId, result, pts);
+                });
+
+                LOGGER_INFO("AI tracking enabled for stream: " + streamId);
             }
         }
     }
@@ -1779,4 +1807,142 @@ void Application::handleModelWarning(SingleModelEntry* model, const cv::Mat& dst
     // 中控话题 wubarobot/inner/ai_event
     publishSystemStatus("main_server", "wubarobot/inner/ai_event", serialized_message);
     LOGGER_DEBUG("已为模型类型 " + std::to_string(model->modelType) + " 发布AI事件");
+}
+
+// 初始化特定流的跟踪算法
+void Application::initializeTrackingForStream(const std::string& streamId, const StreamConfig& config) {
+    try {
+        // 准备模型配置
+        std::map<int, std::string> models_config;
+
+        for (const auto& modelConfig : config.models) {
+            if (!modelConfig.enabled) {
+                continue;
+            }
+
+            std::string model_path;
+            int model_type = modelConfig.modelType;
+
+            // 根据模型类型设置默认路径
+            switch (model_type) {
+                case 1:
+                    model_path = "./model/yolov8n-fire-smoke.rknn";
+                    break;
+                case 2:
+                    model_path = "./model/yolov8_relu_person_best.rknn";
+                    break;
+                case 3:
+                    model_path = "./model/yolov8n-p2-uav.rknn";
+                    break;
+                case 4:
+                    model_path = "./model/yolov8-plate.rknn";
+                    break;
+                case 5:
+                    model_path = "./model/meter_yolov8s_v2_200.rknn";
+                    break;
+                case 6:
+                    model_path = "./model/DBNet_water_meter.rknn";
+                    break;
+                case 7:
+                    model_path = "./model/yolov8n_crack_seg.rknn";
+                    break;
+                default:
+                    continue;
+            }
+
+            // 检查自定义模型路径
+            auto it = modelConfig.modelParams.find("model_path");
+            if (it != modelConfig.modelParams.end() && !it->second.empty()) {
+                model_path = it->second;
+            }
+
+            if (model_type == 2) {
+                models_config[model_type] = model_path;
+            }
+        }
+
+        if (models_config.empty()) {
+            LOGGER_WARNING("No valid models configured for tracking in stream: " + streamId);
+            return;
+        }
+
+        int detection_interval = 3;
+        std::string tracking_type = "CSRT";
+        // 检查配置中是否有重连相关参数
+        for (const auto& [key, value] : config.extraOptions) {
+            if (key == "detection_interval") {
+                detection_interval = std::stoi(value);
+            } else if (key == "tracking_type") {
+                // 配置中以毫秒为单位，转换为微秒
+                tracking_type = value;
+            }
+        }
+
+
+        // 创建AI跟踪算法实例
+        auto trackingAlgorithm = std::make_shared<AITrackingAlgorithm>(
+                models_config,
+                detection_interval,      // 检测间隔：每5帧检测一次
+                tracking_type  // 使用CSRT跟踪器
+        );
+
+        // 配置置信度阈值
+        for (const auto& modelConfig : config.models) {
+            if (modelConfig.enabled) {
+                auto threshold_it = modelConfig.modelParams.find("confidence_threshold");
+                if (threshold_it != modelConfig.modelParams.end()) {
+                    float threshold = std::stof(threshold_it->second);
+                    if (modelConfig.modelType == 2) {
+                        trackingAlgorithm->setConfidenceThreshold(modelConfig.modelType, threshold);
+                    }
+                }
+            }
+        }
+
+        // 存储跟踪算法实例
+        trackingAlgorithms_[streamId] = trackingAlgorithm;
+
+        LOGGER_INFO("Initialized AI tracking algorithm for stream " + streamId +
+                    " with " + std::to_string(models_config.size()) + " models");
+
+    } catch (const std::exception& e) {
+        LOGGER_ERROR("Failed to initialize tracking for stream " + streamId + ": " + std::string(e.what()));
+    }
+}
+
+// 处理跟踪结果的回调函数
+void Application::handleTrackingResults(const std::string& streamId, const TrackingResult& result, int64_t pts) {
+    if (!result.success) {
+        LOGGER_ERROR("Tracking failed for stream " + streamId + ": " + result.error_message);
+        return;
+    }
+
+    if (result.objects.empty()) {
+        return; // 没有检测到目标
+    }
+
+    try {
+        // 获取跟踪算法实例以获取统计信息
+        auto trackingAlgorithm = trackingAlgorithms_[streamId];
+        if (!trackingAlgorithm) {
+            return;
+        }
+
+        auto stats = trackingAlgorithm->getStatistics();
+
+        LOGGER_DEBUG("Stream " + streamId + " tracking results: " +
+                     std::to_string(result.objects.size()) + " objects, " +
+                     std::to_string(stats.active_objects) + " active trackers");
+
+//        // 定期发布跟踪统计信息到MQTT
+//        static std::chrono::steady_clock::time_point last_stats_publish;
+//        auto now = std::chrono::steady_clock::now();
+//        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats_publish).count() >= 10) {
+//            publishTrackingStatistics(streamId, stats);
+//            last_stats_publish = now;
+//        }
+
+    } catch (const std::exception& e) {
+        LOGGER_ERROR("Error handling tracking results for stream " + streamId + ": " + std::string(e.what()));
+    }
 }

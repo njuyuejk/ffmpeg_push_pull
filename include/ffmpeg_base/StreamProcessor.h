@@ -263,7 +263,7 @@ private:
 
     // 跟踪处理队列相关
     std::queue<std::unique_ptr<TrackingFrameData>> trackingQueue_;
-    std::mutex trackingQueueMutex_;
+    mutable std::mutex trackingQueueMutex_;
     std::condition_variable trackingQueueCondVar_;
     static const size_t MAX_TRACKING_QUEUE_SIZE = 10;  // 跟踪队列大小（较小以减少延迟）
     std::atomic<bool> trackingFinished_;      // 跟踪处理是否完成

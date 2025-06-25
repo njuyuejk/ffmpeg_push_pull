@@ -55,6 +55,7 @@ StreamConfig StreamConfig::createDefault() {
     config.pushEnabled = true;
     config.aiEnabled = false;
     config.isLocalFile = false;
+    config.trackingEnabled = false;
     config.modelType = 1;
     config.videoCodec = "libx264";
     config.audioCodec = "aac";
@@ -90,6 +91,7 @@ StreamConfig StreamConfig::fromJson(const json& j) {
     if (j.contains("pushEnabled") && j["pushEnabled"].is_boolean()) config.pushEnabled = j["pushEnabled"];
     if (j.contains("aiEnabled") && j["aiEnabled"].is_boolean()) config.aiEnabled = j["aiEnabled"];
     if (j.contains("isLocalFile") && j["isLocalFile"].is_boolean()) config.isLocalFile = j["isLocalFile"];
+    if (j.contains("trackingEnabled") && j["trackingEnabled"].is_boolean()) config.trackingEnabled = j["trackingEnabled"];
     if (j.contains("modelType") && j["modelType"].is_number()) config.modelType = j["modelType"];
     if (j.contains("videoCodec") && j["videoCodec"].is_string()) config.videoCodec = j["videoCodec"];
     if (j.contains("audioCodec") && j["audioCodec"].is_string()) config.audioCodec = j["audioCodec"];
@@ -164,6 +166,7 @@ json StreamConfig::toJson() const {
     j["pushEnabled"] = pushEnabled;
     j["aiEnabled"] = aiEnabled;
     j["isLocalFile"] = isLocalFile;
+    j["trackingEnabled"] = trackingEnabled;
     j["modelType"] = modelType;
     j["videoCodec"] = videoCodec;
     j["audioCodec"] = audioCodec;
