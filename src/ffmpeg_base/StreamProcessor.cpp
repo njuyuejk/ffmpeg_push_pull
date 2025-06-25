@@ -13,12 +13,18 @@ StreamProcessor::StreamProcessor(const StreamConfig& config)
           lastFrameTime_(0), noDataTimeout_(10000000), // 10秒无数据视为停滞
           isReconnecting_(false), inputFormatContext_(nullptr),
           outputFormatContext_(nullptr),
-          videoFrameCallback_(nullptr), audioFrameCallback_(nullptr) {
+          videoFrameCallback_(nullptr), audioFrameCallback_(nullptr),
+          processingThread_(nullptr), pushThread_(nullptr), trackingThread_(nullptr), // 新增跟踪线程
+          trackingEnabled_(false), trackingFinished_(false) {
 
     // 验证配置
     if (!config.validate()) {
         throw FFmpegException("Invalid stream configuration for: " + config.id);
     }
+
+    // 初始化跟踪统计
+    trackingStats_ = {};
+    lastStatsUpdate_ = std::chrono::high_resolution_clock::now();
 
     // 检查配置中是否有重连相关参数
     for (const auto& [key, value] : config.extraOptions) {
@@ -27,6 +33,8 @@ StreamProcessor::StreamProcessor(const StreamConfig& config)
         } else if (key == "noDataTimeout") {
             // 配置中以毫秒为单位，转换为微秒
             noDataTimeout_ = std::stoll(value) * 1000;
+        } else if (key == "enableTracking") {
+            trackingEnabled_ = (value == "true" || value == "1");
         }
     }
 
@@ -41,6 +49,12 @@ StreamProcessor::StreamProcessor(const StreamConfig& config)
 StreamProcessor::~StreamProcessor() {
     try {
         stop();
+
+        // 确保线程资源被释放（智能指针会自动处理）
+        processingThread_.reset();
+        pushThread_.reset();
+        trackingThread_.reset();
+
         cleanup();
     } catch (const std::exception& e) {
         LOGGER_ERROR("Exception in StreamProcessor destructor: " + std::string(e.what()));
@@ -61,8 +75,30 @@ void StreamProcessor::start() {
         hasError_ = false;
         reconnectAttempts_ = 0;  // 重置重连计数器
         lastFrameTime_ = av_gettime(); // 初始化最后一帧时间
+        decodingFinished_ = false;
+        trackingFinished_ = false; // 重置跟踪完成标志
 
-        processingThread_ = std::thread(&StreamProcessor::processLoop, this);
+//        processingThread_ = std::thread(&StreamProcessor::processLoop, this);
+//
+//        // 仅在推流启用时启动推流线程
+//        if (config_.pushEnabled) {
+//            pushThread_ = std::thread(&StreamProcessor::pushLoop, this);
+//        }
+
+        // 使用智能指针创建线程
+        processingThread_ = std::make_unique<std::thread>(&StreamProcessor::processLoop, this);
+
+        // 启动跟踪处理线程（如果启用了跟踪）
+        if (trackingEnabled_ && trackingAlgorithm_) {
+            trackingThread_ = std::make_unique<std::thread>(&StreamProcessor::trackingLoop, this);
+            LOGGER_INFO("Started tracking thread for stream: " + config_.id);
+        }
+
+        // 仅在推流启用时启动推流线程
+        if (config_.pushEnabled) {
+            pushThread_ = std::make_unique<std::thread>(&StreamProcessor::pushLoop, this);
+        }
+
         LOGGER_INFO("Started stream processing: " + config_.id + " (" +
                      config_.inputUrl + " -> " + config_.outputUrl + ")");
     } catch (const FFmpegException& e) {
@@ -79,103 +115,212 @@ void StreamProcessor::start() {
 void StreamProcessor::stop() {
     LOGGER_INFO("Request to stop stream: " + config_.id);
 
-    // 首先将运行标志设置为false，通知处理线程退出
     bool wasRunning = isRunning_.exchange(false);
-
-    // 如果之前不是运行状态，直接返回
     if (!wasRunning) {
         LOGGER_INFO("Stream " + config_.id + " already stopped, no action needed");
         return;
     }
 
-    // 检查处理线程是否存在和可加入
-    if (!processingThread_.joinable()) {
-        LOGGER_INFO("Processing thread for stream " + config_.id + " is not joinable");
-        return;
-    }
+    // 通知所有线程解码已完成
+    decodingFinished_ = true;
+    trackingFinished_ = true;
+    queueCondVar_.notify_all();
+    trackingQueueCondVar_.notify_all();
 
-    try {
-        // 设置线程分离标志
-        bool shouldDetach = false;
+//    // 等待处理线程结束
+//    if (processingThread_.joinable()) {
+//        processingThread_.join();
+//    }
+//
+//    // 等待推流线程结束
+//    if (pushThread_.joinable()) {
+//        pushThread_.join();
+//    }
 
-        // 尝试温和地等待线程结束
-        {
-            LOGGER_DEBUG("Waiting for processing thread to end for stream: " + config_.id);
+    // 等待处理线程结束
+    if (processingThread_ && processingThread_->joinable()) {
+        try {
+            // 尝试等待线程正常结束
+            if (processingThread_->joinable()) {
+                // 使用 future 实现超时等待
+                std::promise<void> promise;
+                std::future<void> future = promise.get_future();
 
-            // 使用单独的线程和超时来等待处理线程
-            std::atomic<bool> threadJoined{false};
-
-            // 创建用于等待的线程
-            std::thread joinThread([this, &threadJoined]() {
-                try {
-                    if (this->processingThread_.joinable()) {
-                        this->processingThread_.join();
-                        threadJoined = true;
+                std::thread waiter([this, &promise]() {
+                    try {
+                        if (this->processingThread_ && this->processingThread_->joinable()) {
+                            this->processingThread_->join();
+                        }
+                        promise.set_value();
+                    } catch (...) {
+                        promise.set_exception(std::current_exception());
                     }
-                } catch (const std::exception& e) {
-                    LOGGER_ERROR("Exception joining processing thread: " + std::string(e.what()));
-                } catch (...) {
-                    LOGGER_ERROR("Unknown exception joining processing thread");
+                });
+
+                // 等待最多5秒
+                if (future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+                    LOGGER_WARNING("Timeout waiting for processing thread, detaching");
+                    if (processingThread_->joinable()) {
+                        processingThread_->detach();
+                    }
                 }
-            });
 
-            // 等待最多5秒
-            for (int i = 0; i < 10 && !threadJoined; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            }
-
-            if (!threadJoined) {
-                LOGGER_WARNING("Timeout joining processing thread for stream: " + config_.id);
-                shouldDetach = true;
-            }
-
-            // 确保等待线程完成或分离
-            if (joinThread.joinable()) {
-                if (threadJoined) {
-                    joinThread.join();
-                } else {
-                    joinThread.detach();
+                if (waiter.joinable()) {
+                    waiter.join();
                 }
             }
-        }
-
-        // 如果需要，分离处理线程
-        if (shouldDetach && processingThread_.joinable()) {
-            try {
-                processingThread_.detach();
-                LOGGER_INFO("Detached processing thread for stream " + config_.id);
-            } catch (const std::exception& e) {
-                LOGGER_ERROR("Exception detaching processing thread: " + std::string(e.what()));
-            }
-        }
-
-        // 确保进行完整的资源清理
-        cleanup();
-
-        LOGGER_INFO("Stream " + config_.id + " successfully stopped");
-    } catch (const std::exception& e) {
-        LOGGER_ERROR("Exception stopping stream " + config_.id + ": " + std::string(e.what()));
-
-        // 最后的安全措施 - 尝试分离线程而不是让它挂起
-        if (processingThread_.joinable()) {
-            try {
-                processingThread_.detach();
-            } catch (...) {
-                LOGGER_ERROR("Final attempt to detach processing thread failed");
-            }
-        }
-    } catch (...) {
-        LOGGER_ERROR("Unknown exception stopping stream " + config_.id);
-
-        // 类似的最终安全措施
-        if (processingThread_.joinable()) {
-            try {
-                processingThread_.detach();
-            } catch (...) {
-                // 不再记录，因为日志系统也可能有问题
+        } catch (const std::exception& e) {
+            LOGGER_ERROR("Exception stopping processing thread: " + std::string(e.what()));
+            if (processingThread_->joinable()) {
+                processingThread_->detach();
             }
         }
     }
+    processingThread_.reset();
+
+    // 等待跟踪线程结束
+    if (trackingThread_ && trackingThread_->joinable()) {
+        try {
+            trackingThread_->join();
+        } catch (const std::exception& e) {
+            LOGGER_ERROR("Exception stopping tracking thread: " + std::string(e.what()));
+            if (trackingThread_->joinable()) {
+                trackingThread_->detach();
+            }
+        }
+    }
+    trackingThread_.reset();
+
+    // 等待推流线程结束
+    if (pushThread_ && pushThread_->joinable()) {
+        try {
+            pushThread_->join();
+        } catch (const std::exception& e) {
+            LOGGER_ERROR("Exception stopping push thread: " + std::string(e.what()));
+            if (pushThread_->joinable()) {
+                pushThread_->detach();
+            }
+        }
+    }
+    pushThread_.reset();
+
+    // 清空队列
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        while (!frameQueue_.empty()) {
+            frameQueue_.pop();
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(trackingQueueMutex_);
+        while (!trackingQueue_.empty()) {
+            trackingQueue_.pop();
+        }
+    }
+
+    cleanup();
+    LOGGER_INFO("Stream " + config_.id + " successfully stopped");
+
+//    LOGGER_INFO("Request to stop stream: " + config_.id);
+//
+//    // 首先将运行标志设置为false，通知处理线程退出
+//    bool wasRunning = isRunning_.exchange(false);
+//
+//    // 如果之前不是运行状态，直接返回
+//    if (!wasRunning) {
+//        LOGGER_INFO("Stream " + config_.id + " already stopped, no action needed");
+//        return;
+//    }
+//
+//    // 检查处理线程是否存在和可加入
+//    if (!processingThread_.joinable()) {
+//        LOGGER_INFO("Processing thread for stream " + config_.id + " is not joinable");
+//        return;
+//    }
+//
+//    try {
+//        // 设置线程分离标志
+//        bool shouldDetach = false;
+//
+//        // 尝试温和地等待线程结束
+//        {
+//            LOGGER_DEBUG("Waiting for processing thread to end for stream: " + config_.id);
+//
+//            // 使用单独的线程和超时来等待处理线程
+//            std::atomic<bool> threadJoined{false};
+//
+//            // 创建用于等待的线程
+//            std::thread joinThread([this, &threadJoined]() {
+//                try {
+//                    if (this->processingThread_.joinable()) {
+//                        this->processingThread_.join();
+//                        threadJoined = true;
+//                    }
+//                } catch (const std::exception& e) {
+//                    LOGGER_ERROR("Exception joining processing thread: " + std::string(e.what()));
+//                } catch (...) {
+//                    LOGGER_ERROR("Unknown exception joining processing thread");
+//                }
+//            });
+//
+//            // 等待最多5秒
+//            for (int i = 0; i < 10 && !threadJoined; ++i) {
+//                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+//            }
+//
+//            if (!threadJoined) {
+//                LOGGER_WARNING("Timeout joining processing thread for stream: " + config_.id);
+//                shouldDetach = true;
+//            }
+//
+//            // 确保等待线程完成或分离
+//            if (joinThread.joinable()) {
+//                if (threadJoined) {
+//                    joinThread.join();
+//                } else {
+//                    joinThread.detach();
+//                }
+//            }
+//        }
+//
+//        // 如果需要，分离处理线程
+//        if (shouldDetach && processingThread_.joinable()) {
+//            try {
+//                processingThread_.detach();
+//                LOGGER_INFO("Detached processing thread for stream " + config_.id);
+//            } catch (const std::exception& e) {
+//                LOGGER_ERROR("Exception detaching processing thread: " + std::string(e.what()));
+//            }
+//        }
+//
+//        // 确保进行完整的资源清理
+//        cleanup();
+//
+//        LOGGER_INFO("Stream " + config_.id + " successfully stopped");
+//    } catch (const std::exception& e) {
+//        LOGGER_ERROR("Exception stopping stream " + config_.id + ": " + std::string(e.what()));
+//
+//        // 最后的安全措施 - 尝试分离线程而不是让它挂起
+//        if (processingThread_.joinable()) {
+//            try {
+//                processingThread_.detach();
+//            } catch (...) {
+//                LOGGER_ERROR("Final attempt to detach processing thread failed");
+//            }
+//        }
+//    } catch (...) {
+//        LOGGER_ERROR("Unknown exception stopping stream " + config_.id);
+//
+//        // 类似的最终安全措施
+//        if (processingThread_.joinable()) {
+//            try {
+//                processingThread_.detach();
+//            } catch (...) {
+//                // 不再记录，因为日志系统也可能有问题
+//            }
+//        }
+//    }
 }
 
 bool StreamProcessor::isRunning() const {
@@ -871,6 +1016,9 @@ void StreamProcessor::setupVideoStream(AVStream* inputStream) {
         if (encoder->id == AV_CODEC_ID_H264 || encoder->id == AV_CODEC_ID_HEVC) {
             av_opt_set(streamCtx.encoderContext->priv_data, "preset", "ultrafast", 0);
             av_opt_set(streamCtx.encoderContext->priv_data, "tune", "zerolatency", 0);
+
+            av_opt_set(streamCtx.encoderContext->priv_data, "threads", "auto", 0); // 多线程编码
+
             // 使用baseline profile提高兼容性
             if (encoder->id == AV_CODEC_ID_H264) {
                 av_opt_set(streamCtx.encoderContext->priv_data, "profile", "baseline", 0);
@@ -1441,11 +1589,25 @@ void StreamProcessor::processLoop() {
                                 if (streamCtx.decoderContext) {
                                     avcodec_flush_buffers(streamCtx.decoderContext);
                                 }
+                                // 重置时间戳标志
+                                streamCtx.first_frame_processed = true;
+                                streamCtx.last_output_pts = AV_NOPTS_VALUE;
                             }
 
                             for (auto& streamCtx : audioStreams_) {
                                 if (streamCtx.decoderContext) {
                                     avcodec_flush_buffers(streamCtx.decoderContext);
+                                }
+                                // 重置时间戳标志
+                                streamCtx.first_frame_processed = true;
+                                streamCtx.last_output_pts = AV_NOPTS_VALUE;
+                            }
+
+                            // 清空帧队列，避免时间戳混乱
+                            {
+                                std::lock_guard<std::mutex> lock(queueMutex_);
+                                while (!frameQueue_.empty()) {
+                                    frameQueue_.pop();
                                 }
                             }
 
@@ -1635,7 +1797,6 @@ void StreamProcessor::processLoop() {
 void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& streamCtx) {
     int ret;
     bool frameAcquired = false;
-    bool hwFrameUsed = false;
     bool callbackFrameUsed = false;
     // 准备用于回调的帧（转换为NV12格式供AI处理）
     AVFrame* callbackFrame = nullptr;
@@ -1650,7 +1811,6 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
         while (ret >= 0) {
             // 在每个循环开始时重置标志
             frameAcquired = false;
-            hwFrameUsed = false;
             callbackFrameUsed = false;
 
             // 重置callbackFrame指针
@@ -1719,132 +1879,263 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
                 callbackFrame = streamCtx.frame;
             }
 
+            int fps = streamCtx.inputStream ? (int) av_q2d(streamCtx.inputStream->avg_frame_rate) : 25;
+
             // 调用帧处理回调函数（如果设置了）
             if (callbackFrame) {
-                int fps = streamCtx.inputStream ? (int)av_q2d(streamCtx.inputStream->avg_frame_rate) : 25;
                 handleVideoFrame(callbackFrame, pts, fps);
             }
 
-            // 如果是仅拉流模式，我们不需要编码或写入帧
-            if (!config_.pushEnabled) {
-                // 释放帧
-                if (frameAcquired) {
-                    av_frame_unref(streamCtx.frame);
+            // 如果启用跟踪处理，将帧发送到跟踪队列
+            if (trackingEnabled_ && trackingAlgorithm_ && callbackFrame) {
+                // 创建用于跟踪处理的帧副本
+                AVFrame* trackingFrame = convertFrameForTracking(callbackFrame);
+                if (trackingFrame) {
+                    enqueueTrackingFrame(streamCtx.frame, trackingFrame,
+                                         streamCtx.streamIndex, pts,
+                                         streamCtx.frame->pkt_dts,
+                                         streamCtx.inputStream->time_base, fps);
+
+                    av_frame_free(&trackingFrame);
                 }
-                if (callbackFrameUsed && callbackFrame) {
-                    av_frame_free(&callbackFrame);
-                }
-                continue;
+            } else if (config_.pushEnabled) {
+                // 如果没有启用跟踪或没有设置跟踪算法，直接将帧加入编码队列
+                enqueueFrame(streamCtx.frame, streamCtx, true);
             }
 
-            // 推流处理 - 使用原始帧进行编码
-            AVFrame* frameToEncode = streamCtx.frame;
-
-            // 对于DRM_PRIME格式的帧，可以直接用于硬件编码
-            if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME &&
-                streamCtx.encoderContext->hw_frames_ctx) {
-                // 直接使用DRM_PRIME帧进行硬件编码
-                LOGGER_DEBUG("Using DRM_PRIME frame directly for hardware encoding");
-                frameToEncode = streamCtx.frame;
-            } else if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME &&
-                       !streamCtx.encoderContext->hw_frames_ctx) {
-                // 需要转换DRM_PRIME到软件格式
-                if (!streamCtx.hwFrame->data[0]) {
-                    streamCtx.hwFrame->width = streamCtx.frame->width;
-                    streamCtx.hwFrame->height = streamCtx.frame->height;
-                    streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
-                    ret = av_frame_get_buffer(streamCtx.hwFrame, 32);
-                    if (ret < 0) {
-                        throw FFmpegException("Failed to allocate buffer for encoding frame", ret);
-                    }
-                }
-
-                ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
-                if (ret < 0) {
-                    throw FFmpegException("Error transferring DRM_PRIME data for encoding", ret);
-                }
-                frameToEncode = streamCtx.hwFrame;
-                hwFrameUsed = true;
+            if (frameAcquired) {
+                av_frame_unref(streamCtx.frame);
             }
-
-            // 检查是否需要缩放或格式转换
-            bool needsConversion = false;
-
-            // 如果分辨率不同，需要缩放
-            if (streamCtx.encoderContext->width != frameToEncode->width ||
-                streamCtx.encoderContext->height != frameToEncode->height) {
-                needsConversion = true;
+            if (callbackFrameUsed && callbackFrame) {
+                av_frame_free(&callbackFrame);
             }
+        }
+    } catch (const FFmpegException& e) {
+        // 即使在异常情况下也清理帧
+        if (frameAcquired) {
+            av_frame_unref(streamCtx.frame);
+        }
 
-            // 如果格式不同且不是硬件到硬件的转换
-            if (streamCtx.encoderContext->pix_fmt != frameToEncode->format) {
-                // 对于DRM_PRIME到DRM_PRIME，通常不需要转换
-                if (!(frameToEncode->format == AV_PIX_FMT_DRM_PRIME &&
-                      streamCtx.encoderContext->pix_fmt == AV_PIX_FMT_DRM_PRIME)) {
-                    needsConversion = true;
-                }
-            }
+        if (callbackFrameUsed && callbackFrame) {
+            av_frame_free(&callbackFrame);
+        }
 
-            // 如果使用硬件帧上下文，可以跳过某些转换
-            if (streamCtx.encoderContext->hw_frames_ctx &&
-                frameToEncode->format == AV_PIX_FMT_DRM_PRIME &&
-                streamCtx.encoderContext->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
-                LOGGER_DEBUG("Using direct DRM_PRIME to DRM_PRIME encoding, skipping conversion");
-                needsConversion = false;
-            }
+        // 重新抛出异常
+        throw;
+    }
 
-            // 如果需要缩放或格式转换
-            if (needsConversion) {
-                LOGGER_DEBUG("Frame conversion needed for encoding");
-
-                // 如果需要，初始化缩放上下文
-                if (!streamCtx.swsContext) {
-                    AVPixelFormat srcFormat = (AVPixelFormat)frameToEncode->format;
-                    if (srcFormat == AV_PIX_FMT_DRM_PRIME) {
-                        srcFormat = AV_PIX_FMT_NV12;  // DRM_PRIME的底层格式通常是NV12
-                        LOGGER_WARNING("Converting DRM_PRIME to NV12 for scaling context");
-                    }
-
-                    streamCtx.swsContext = sws_getContext(
-                            frameToEncode->width, frameToEncode->height,
-                            srcFormat,
-                            streamCtx.encoderContext->width, streamCtx.encoderContext->height,
-                            streamCtx.encoderContext->pix_fmt,
-                            SWS_BILINEAR, nullptr, nullptr, nullptr
-                    );
-
-                    if (!streamCtx.swsContext) {
-                        throw FFmpegException("Failed to create scaling context for encoding");
-                    }
-                    LOGGER_INFO("Created scaling context for encoding conversion");
-                }
-
-                // 分配转换输出帧
-                if (!streamCtx.hwFrame->data[0] || hwFrameUsed) {
-                    if (hwFrameUsed) {
-                        av_frame_unref(streamCtx.hwFrame);
-                    }
-                    streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
-                    streamCtx.hwFrame->width = streamCtx.encoderContext->width;
-                    streamCtx.hwFrame->height = streamCtx.encoderContext->height;
-                    ret = av_frame_get_buffer(streamCtx.hwFrame, 0);
-                    if (ret < 0) {
-                        throw FFmpegException("Failed to allocate frame buffer for conversion", ret);
-                    }
-                }
-
-                // 执行转换
-                ret = sws_scale(streamCtx.swsContext, frameToEncode->data,
-                                frameToEncode->linesize, 0, frameToEncode->height,
-                                streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
-                if (ret < 0) {
-                    throw FFmpegException("Error during frame conversion for encoding", ret);
-                }
-
-                streamCtx.hwFrame->pts = frameToEncode->pts;
-                frameToEncode = streamCtx.hwFrame;
-                hwFrameUsed = true;
-            }
+//    int ret;
+//    bool frameAcquired = false;
+//    bool hwFrameUsed = false;
+//    bool callbackFrameUsed = false;
+//    // 准备用于回调的帧（转换为NV12格式供AI处理）
+//    AVFrame* callbackFrame = nullptr;
+//
+//    try {
+//        // 将数据包发送到解码器
+//        ret = avcodec_send_packet(streamCtx.decoderContext, packet);
+//        if (ret < 0) {
+//            throw FFmpegException("Error sending packet to decoder", ret);
+//        }
+//
+//        while (ret >= 0) {
+//            // 在每个循环开始时重置标志
+//            frameAcquired = false;
+//            hwFrameUsed = false;
+//            callbackFrameUsed = false;
+//
+//            // 重置callbackFrame指针
+//            if (callbackFrame && callbackFrameUsed) {
+//                av_frame_free(&callbackFrame);
+//                callbackFrame = nullptr;
+//                callbackFrameUsed = false;
+//            }
+//
+//            // 接收解码后的帧
+//            ret = avcodec_receive_frame(streamCtx.decoderContext, streamCtx.frame);
+//            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+//                LOGGER_DEBUG("Decoder frame receive failed, errorCode: " + std::to_string(ret));
+//                break;
+//            } else if (ret < 0) {
+//                throw FFmpegException("Error receiving frame from decoder", ret);
+//            }
+//
+//            frameAcquired = true;
+//
+//            // 更新最后一帧时间以防止重连
+//            lastFrameTime_ = av_gettime();
+//
+//            // 计算时间戳
+//            int64_t pts = streamCtx.frame->pts;
+//            if (streamCtx.inputStream) {
+//                pts = av_rescale_q(pts, streamCtx.inputStream->time_base, {1, 1000});
+//            }
+//
+//            if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME) {
+//                LOGGER_DEBUG("Processing DRM_PRIME frame for callback");
+//
+//                // 为回调分配NV12帧
+//                callbackFrame = av_frame_alloc();
+//                if (!callbackFrame) {
+//                    throw FFmpegException("Failed to allocate callback frame");
+//                }
+//
+//                callbackFrame->width = streamCtx.frame->width;
+//                callbackFrame->height = streamCtx.frame->height;
+//                callbackFrame->format = AV_PIX_FMT_NV12;
+//
+//                ret = av_frame_get_buffer(callbackFrame, 32);
+//                if (ret < 0) {
+//                    av_frame_free(&callbackFrame);
+//                    throw FFmpegException("Failed to allocate buffer for callback frame", ret);
+//                }
+//
+//                // 从DRM_PRIME转换到NV12
+//                ret = av_hwframe_transfer_data(callbackFrame, streamCtx.frame, 0);
+//                if (ret < 0) {
+//                    LOGGER_WARNING("Failed to transfer DRM_PRIME data to NV12 for callback");
+//                    av_frame_free(&callbackFrame);
+//                    callbackFrame = nullptr;
+//                } else {
+//                    callbackFrame->pts = streamCtx.frame->pts;
+//                    callbackFrameUsed = true;
+//                    LOGGER_DEBUG("Successfully converted DRM_PRIME to NV12 for callback");
+//                }
+//            } else if (streamCtx.frame->format == AV_PIX_FMT_NV12) {
+//                // 直接使用NV12帧
+//                callbackFrame = streamCtx.frame;
+//            } else {
+//                // 对于其他格式，可能需要转换
+//                LOGGER_DEBUG("Frame format: " + std::to_string(streamCtx.frame->format));
+//                callbackFrame = streamCtx.frame;
+//            }
+//
+//            // 调用帧处理回调函数（如果设置了）
+//            if (callbackFrame) {
+//                int fps = streamCtx.inputStream ? (int)av_q2d(streamCtx.inputStream->avg_frame_rate) : 25;
+//                handleVideoFrame(callbackFrame, pts, fps);
+//            }
+//
+//            // 如果是仅拉流模式，我们不需要编码或写入帧
+//            if (!config_.pushEnabled) {
+//                // 释放帧
+//                if (frameAcquired) {
+//                    av_frame_unref(streamCtx.frame);
+//                }
+//                if (callbackFrameUsed && callbackFrame) {
+//                    av_frame_free(&callbackFrame);
+//                }
+//                continue;
+//            }
+//
+//            // 推流处理 - 使用原始帧进行编码
+//            AVFrame* frameToEncode = streamCtx.frame;
+//
+//            // 对于DRM_PRIME格式的帧，可以直接用于硬件编码
+//            if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME &&
+//                streamCtx.encoderContext->hw_frames_ctx) {
+//                // 直接使用DRM_PRIME帧进行硬件编码
+//                LOGGER_DEBUG("Using DRM_PRIME frame directly for hardware encoding");
+//                frameToEncode = streamCtx.frame;
+//            } else if (streamCtx.frame->format == AV_PIX_FMT_DRM_PRIME &&
+//                       !streamCtx.encoderContext->hw_frames_ctx) {
+//                // 需要转换DRM_PRIME到软件格式
+//                if (!streamCtx.hwFrame->data[0]) {
+//                    streamCtx.hwFrame->width = streamCtx.frame->width;
+//                    streamCtx.hwFrame->height = streamCtx.frame->height;
+//                    streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
+//                    ret = av_frame_get_buffer(streamCtx.hwFrame, 32);
+//                    if (ret < 0) {
+//                        throw FFmpegException("Failed to allocate buffer for encoding frame", ret);
+//                    }
+//                }
+//
+//                ret = av_hwframe_transfer_data(streamCtx.hwFrame, streamCtx.frame, 0);
+//                if (ret < 0) {
+//                    throw FFmpegException("Error transferring DRM_PRIME data for encoding", ret);
+//                }
+//                frameToEncode = streamCtx.hwFrame;
+//                hwFrameUsed = true;
+//            }
+//
+//            // 检查是否需要缩放或格式转换
+//            bool needsConversion = false;
+//
+//            // 如果分辨率不同，需要缩放
+//            if (streamCtx.encoderContext->width != frameToEncode->width ||
+//                streamCtx.encoderContext->height != frameToEncode->height) {
+//                needsConversion = true;
+//            }
+//
+//            // 如果格式不同且不是硬件到硬件的转换
+//            if (streamCtx.encoderContext->pix_fmt != frameToEncode->format) {
+//                // 对于DRM_PRIME到DRM_PRIME，通常不需要转换
+//                if (!(frameToEncode->format == AV_PIX_FMT_DRM_PRIME &&
+//                      streamCtx.encoderContext->pix_fmt == AV_PIX_FMT_DRM_PRIME)) {
+//                    needsConversion = true;
+//                }
+//            }
+//
+//            // 如果使用硬件帧上下文，可以跳过某些转换
+//            if (streamCtx.encoderContext->hw_frames_ctx &&
+//                frameToEncode->format == AV_PIX_FMT_DRM_PRIME &&
+//                streamCtx.encoderContext->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
+//                LOGGER_DEBUG("Using direct DRM_PRIME to DRM_PRIME encoding, skipping conversion");
+//                needsConversion = false;
+//            }
+//
+//            // 如果需要缩放或格式转换
+//            if (needsConversion) {
+//                LOGGER_DEBUG("Frame conversion needed for encoding");
+//
+//                // 如果需要，初始化缩放上下文
+//                if (!streamCtx.swsContext) {
+//                    AVPixelFormat srcFormat = (AVPixelFormat)frameToEncode->format;
+//                    if (srcFormat == AV_PIX_FMT_DRM_PRIME) {
+//                        srcFormat = AV_PIX_FMT_NV12;  // DRM_PRIME的底层格式通常是NV12
+//                        LOGGER_WARNING("Converting DRM_PRIME to NV12 for scaling context");
+//                    }
+//
+//                    streamCtx.swsContext = sws_getContext(
+//                            frameToEncode->width, frameToEncode->height,
+//                            srcFormat,
+//                            streamCtx.encoderContext->width, streamCtx.encoderContext->height,
+//                            streamCtx.encoderContext->pix_fmt,
+//                            SWS_BILINEAR, nullptr, nullptr, nullptr
+//                    );
+//
+//                    if (!streamCtx.swsContext) {
+//                        throw FFmpegException("Failed to create scaling context for encoding");
+//                    }
+//                    LOGGER_INFO("Created scaling context for encoding conversion");
+//                }
+//
+//                // 分配转换输出帧
+//                if (!streamCtx.hwFrame->data[0] || hwFrameUsed) {
+//                    if (hwFrameUsed) {
+//                        av_frame_unref(streamCtx.hwFrame);
+//                    }
+//                    streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
+//                    streamCtx.hwFrame->width = streamCtx.encoderContext->width;
+//                    streamCtx.hwFrame->height = streamCtx.encoderContext->height;
+//                    ret = av_frame_get_buffer(streamCtx.hwFrame, 0);
+//                    if (ret < 0) {
+//                        throw FFmpegException("Failed to allocate frame buffer for conversion", ret);
+//                    }
+//                }
+//
+//                // 执行转换
+//                ret = sws_scale(streamCtx.swsContext, frameToEncode->data,
+//                                frameToEncode->linesize, 0, frameToEncode->height,
+//                                streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
+//                if (ret < 0) {
+//                    throw FFmpegException("Error during frame conversion for encoding", ret);
+//                }
+//
+//                streamCtx.hwFrame->pts = frameToEncode->pts;
+//                frameToEncode = streamCtx.hwFrame;
+//                hwFrameUsed = true;
+//            }
 
 //            // 重新计算时间戳
 //            frameToEncode->pts = av_rescale_q(
@@ -1853,45 +2144,45 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
 //                    streamCtx.encoderContext->time_base
 //            );
 
-            // 方法一
-            // 每个流独立的时间戳管理（避免静态变量问题）
-            if (streamCtx.first_frame_processed) {
-                streamCtx.first_frame_processed = false;
-
-                // 记录第一帧的时间戳作为基准
-                streamCtx.pts_offset = frameToEncode->pts;
-
-                // 直接转换时间戳，保持相对关系
-                frameToEncode->pts = av_rescale_q(
-                        frameToEncode->pts - streamCtx.pts_offset,  // 从0开始
-                        streamCtx.decoderContext->time_base,
-                        streamCtx.encoderContext->time_base
-                );
-
-                streamCtx.last_output_pts = frameToEncode->pts;
-
-                LOGGER_INFO("First frame timestamp - Input base: " + std::to_string(streamCtx.pts_offset) +
-                            " -> Output PTS: " + std::to_string(frameToEncode->pts));
-            } else {
-                // 后续帧：保持原始时间戳的相对关系
-                int64_t relative_pts = frameToEncode->pts - streamCtx.pts_offset;
-
-                frameToEncode->pts = av_rescale_q(
-                        relative_pts,
-                        streamCtx.decoderContext->time_base,
-                        streamCtx.encoderContext->time_base
-                );
-
-                // 确保时间戳单调递增，但允许小幅调整
-                if (frameToEncode->pts <= streamCtx.last_output_pts) {
-                    frameToEncode->pts = streamCtx.last_output_pts + 1;
-                }
-
-                streamCtx.last_output_pts = frameToEncode->pts;
-            }
-
-            // 设置DTS
-            frameToEncode->pkt_dts = frameToEncode->pts;
+//            // 方法一
+//            // 每个流独立的时间戳管理（避免静态变量问题）
+//            if (streamCtx.first_frame_processed) {
+//                streamCtx.first_frame_processed = false;
+//
+//                // 记录第一帧的时间戳作为基准
+//                streamCtx.pts_offset = frameToEncode->pts;
+//
+//                // 直接转换时间戳，保持相对关系
+//                frameToEncode->pts = av_rescale_q(
+//                        frameToEncode->pts - streamCtx.pts_offset,  // 从0开始
+//                        streamCtx.decoderContext->time_base,
+//                        streamCtx.encoderContext->time_base
+//                );
+//
+//                streamCtx.last_output_pts = frameToEncode->pts;
+//
+//                LOGGER_INFO("First frame timestamp - Input base: " + std::to_string(streamCtx.pts_offset) +
+//                            " -> Output PTS: " + std::to_string(frameToEncode->pts));
+//            } else {
+//                // 后续帧：保持原始时间戳的相对关系
+//                int64_t relative_pts = frameToEncode->pts - streamCtx.pts_offset;
+//
+//                frameToEncode->pts = av_rescale_q(
+//                        relative_pts,
+//                        streamCtx.decoderContext->time_base,
+//                        streamCtx.encoderContext->time_base
+//                );
+//
+//                // 确保时间戳单调递增，但允许小幅调整
+//                if (frameToEncode->pts <= streamCtx.last_output_pts) {
+//                    frameToEncode->pts = streamCtx.last_output_pts + 1;
+//                }
+//
+//                streamCtx.last_output_pts = frameToEncode->pts;
+//            }
+//
+//            // 设置DTS
+//            frameToEncode->pkt_dts = frameToEncode->pts;
 
 //            // 方法二
 //            // 步骤1：将当前帧的PTS从输入流的时间基转换到编码器的时间基
@@ -1916,85 +2207,85 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
 //            // 步骤3：记录当前帧的PTS，供下一帧参考
 //            streamCtx.last_output_pts = current_pts;
 
-            // 将帧发送到编码器
-            ret = avcodec_send_frame(streamCtx.encoderContext, frameToEncode);
-            if (ret < 0) {
-                throw FFmpegException("Error sending frame to encoder", ret);
-            }
-
-            // 处理编码后的数据包
-            while (ret >= 0) {
-                AVPacket* encodedPacket = av_packet_alloc();
-                if (!encodedPacket) {
-                    throw FFmpegException("Failed to allocate encoded packet");
-                }
-
-                ret = avcodec_receive_packet(streamCtx.encoderContext, encodedPacket);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                    av_packet_free(&encodedPacket);
-                    break;
-                } else if (ret < 0) {
-                    av_packet_free(&encodedPacket);
-                    throw FFmpegException("Error receiving packet from encoder", ret);
-                }
-
-                // 准备输出数据包
-                encodedPacket->stream_index = streamCtx.outputStream->index;
-
-                // 重新计算时间戳
-                av_packet_rescale_ts(
-                        encodedPacket,
-                        streamCtx.encoderContext->time_base,
-                        streamCtx.outputStream->time_base
-                );
-
-                // 写入数据包
-//                ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
-                ret = av_write_frame(outputFormatContext_, encodedPacket);
-
-                // 无论写入是否成功，都释放数据包
-                av_packet_free(&encodedPacket);
-
-                if (ret < 0) {
-                    throw FFmpegException("Error writing encoded packet", ret);
-                }
-
-                // 立即刷新头部信息
-                if (config_.lowLatencyMode && outputFormatContext_->pb) {
-                    avio_flush(outputFormatContext_->pb);
-                }
-            }
-
-            // 完成后始终取消引用帧
-            if (frameAcquired) {
-                av_frame_unref(streamCtx.frame);
-            }
-
-            if (hwFrameUsed) {
-                av_frame_unref(streamCtx.hwFrame);
-            }
-
-            if (callbackFrameUsed && callbackFrame) {
-                av_frame_free(&callbackFrame);
-            }
-        }
-    } catch (const FFmpegException& e) {
-        // 即使在异常情况下也清理帧
-        if (frameAcquired) {
-            av_frame_unref(streamCtx.frame);
-        }
-
-        if (hwFrameUsed) {
-            av_frame_unref(streamCtx.hwFrame);
-        }
-
-        if (callbackFrameUsed && callbackFrame) {
-            av_frame_free(&callbackFrame);
-        }
-
-        // 重新抛出异常
-        throw;
-    }
+//            // 将帧发送到编码器
+//            ret = avcodec_send_frame(streamCtx.encoderContext, frameToEncode);
+//            if (ret < 0) {
+//                throw FFmpegException("Error sending frame to encoder", ret);
+//            }
+//
+//            // 处理编码后的数据包
+//            while (ret >= 0) {
+//                AVPacket* encodedPacket = av_packet_alloc();
+//                if (!encodedPacket) {
+//                    throw FFmpegException("Failed to allocate encoded packet");
+//                }
+//
+//                ret = avcodec_receive_packet(streamCtx.encoderContext, encodedPacket);
+//                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+//                    av_packet_free(&encodedPacket);
+//                    break;
+//                } else if (ret < 0) {
+//                    av_packet_free(&encodedPacket);
+//                    throw FFmpegException("Error receiving packet from encoder", ret);
+//                }
+//
+//                // 准备输出数据包
+//                encodedPacket->stream_index = streamCtx.outputStream->index;
+//
+//                // 重新计算时间戳
+//                av_packet_rescale_ts(
+//                        encodedPacket,
+//                        streamCtx.encoderContext->time_base,
+//                        streamCtx.outputStream->time_base
+//                );
+//
+//                // 写入数据包
+////                ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+//                ret = av_write_frame(outputFormatContext_, encodedPacket);
+//
+//                // 无论写入是否成功，都释放数据包
+//                av_packet_free(&encodedPacket);
+//
+//                if (ret < 0) {
+//                    throw FFmpegException("Error writing encoded packet", ret);
+//                }
+//
+//                // 立即刷新头部信息
+//                if (config_.lowLatencyMode && outputFormatContext_->pb) {
+//                    avio_flush(outputFormatContext_->pb);
+//                }
+//            }
+//
+//            // 完成后始终取消引用帧
+//            if (frameAcquired) {
+//                av_frame_unref(streamCtx.frame);
+//            }
+//
+//            if (hwFrameUsed) {
+//                av_frame_unref(streamCtx.hwFrame);
+//            }
+//
+//            if (callbackFrameUsed && callbackFrame) {
+//                av_frame_free(&callbackFrame);
+//            }
+//        }
+//    } catch (const FFmpegException& e) {
+//        // 即使在异常情况下也清理帧
+//        if (frameAcquired) {
+//            av_frame_unref(streamCtx.frame);
+//        }
+//
+//        if (hwFrameUsed) {
+//            av_frame_unref(streamCtx.hwFrame);
+//        }
+//
+//        if (callbackFrameUsed && callbackFrame) {
+//            av_frame_free(&callbackFrame);
+//        }
+//
+//        // 重新抛出异常
+//        throw;
+//    }
 }
 
 //void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& streamCtx) {
@@ -2322,76 +2613,115 @@ void StreamProcessor::processAudioPacket(AVPacket* packet, StreamContext& stream
         // 更新最后一帧时间
         lastFrameTime_ = av_gettime();
 
-        // 处理音频帧
+        // 计算时间戳
         int64_t pts = streamCtx.frame->pts;
         if (streamCtx.inputStream) {
             // 转换为毫秒时间戳
             pts = av_rescale_q(pts, streamCtx.inputStream->time_base, {1, 1000});
         }
 
-        // 调用帧处理函数
-        handleAudioFrame(streamCtx.frame, pts, (int)av_q2d(streamCtx.inputStream->avg_frame_rate));
+        // 调用音频帧处理回调
+        int fps = streamCtx.inputStream ? (int)av_q2d(streamCtx.inputStream->avg_frame_rate) : 0;
+        handleAudioFrame(streamCtx.frame, pts, fps);
 
-        // 如果是仅拉流模式，我们不需要编码或写入帧
-        if (!config_.pushEnabled) {
-            // 释放帧
-            av_frame_unref(streamCtx.frame);
-            continue;
+        // 如果启用推流，将帧加入队列
+        if (config_.pushEnabled) {
+            enqueueFrame(streamCtx.frame, streamCtx, false);  // false 表示音频帧
         }
 
-        // 重新计算PTS
-        streamCtx.frame->pts = av_rescale_q(
-                streamCtx.frame->pts,
-                streamCtx.decoderContext->time_base,
-                streamCtx.encoderContext->time_base
-        );
-
-        // 发送帧到编码器
-        ret = avcodec_send_frame(streamCtx.encoderContext, streamCtx.frame);
-        if (ret < 0) {
-            throw FFmpegException("Error sending frame to audio encoder", ret);
-        }
-
-        while (ret >= 0) {
-            // 接收编码包
-            AVPacket* encodedPacket = av_packet_alloc();
-            ret = avcodec_receive_packet(streamCtx.encoderContext, encodedPacket);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                av_packet_free(&encodedPacket);
-                break;
-            } else if (ret < 0) {
-                av_packet_free(&encodedPacket);
-                throw FFmpegException("Error receiving packet from audio encoder", ret);
-            }
-
-            // 准备要写入的包
-            encodedPacket->stream_index = streamCtx.outputStream->index;
-
-            // 重新计算时间戳
-            av_packet_rescale_ts(
-                    encodedPacket,
-                    streamCtx.encoderContext->time_base,
-                    streamCtx.outputStream->time_base
-            );
-
-            // 写入包
-//            ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
-            ret = av_write_frame(outputFormatContext_, encodedPacket);
-            av_packet_free(&encodedPacket);
-
-            if (ret < 0) {
-                throw FFmpegException("Error writing encoded audio packet", ret);
-            }
-
-            // 立即刷新头部信息
-            if (config_.lowLatencyMode && outputFormatContext_->pb) {
-                avio_flush(outputFormatContext_->pb);
-            }
-        }
-
-        // 不再需要帧时释放它
+        // 释放帧引用
         av_frame_unref(streamCtx.frame);
     }
+//    int ret;
+//
+//    // 发送包到解码器
+//    ret = avcodec_send_packet(streamCtx.decoderContext, packet);
+//    if (ret < 0) {
+//        throw FFmpegException("Error sending packet to audio decoder", ret);
+//    }
+//
+//    while (ret >= 0) {
+//        // 接收解码帧
+//        ret = avcodec_receive_frame(streamCtx.decoderContext, streamCtx.frame);
+//        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+//            break;
+//        } else if (ret < 0) {
+//            throw FFmpegException("Error receiving frame from audio decoder", ret);
+//        }
+//
+//        // 更新最后一帧时间
+//        lastFrameTime_ = av_gettime();
+//
+//        // 处理音频帧
+//        int64_t pts = streamCtx.frame->pts;
+//        if (streamCtx.inputStream) {
+//            // 转换为毫秒时间戳
+//            pts = av_rescale_q(pts, streamCtx.inputStream->time_base, {1, 1000});
+//        }
+//
+//        // 调用帧处理函数
+//        handleAudioFrame(streamCtx.frame, pts, (int)av_q2d(streamCtx.inputStream->avg_frame_rate));
+//
+//        // 如果是仅拉流模式，我们不需要编码或写入帧
+//        if (!config_.pushEnabled) {
+//            // 释放帧
+//            av_frame_unref(streamCtx.frame);
+//            continue;
+//        }
+//
+//        // 重新计算PTS
+//        streamCtx.frame->pts = av_rescale_q(
+//                streamCtx.frame->pts,
+//                streamCtx.decoderContext->time_base,
+//                streamCtx.encoderContext->time_base
+//        );
+//
+//        // 发送帧到编码器
+//        ret = avcodec_send_frame(streamCtx.encoderContext, streamCtx.frame);
+//        if (ret < 0) {
+//            throw FFmpegException("Error sending frame to audio encoder", ret);
+//        }
+//
+//        while (ret >= 0) {
+//            // 接收编码包
+//            AVPacket* encodedPacket = av_packet_alloc();
+//            ret = avcodec_receive_packet(streamCtx.encoderContext, encodedPacket);
+//            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+//                av_packet_free(&encodedPacket);
+//                break;
+//            } else if (ret < 0) {
+//                av_packet_free(&encodedPacket);
+//                throw FFmpegException("Error receiving packet from audio encoder", ret);
+//            }
+//
+//            // 准备要写入的包
+//            encodedPacket->stream_index = streamCtx.outputStream->index;
+//
+//            // 重新计算时间戳
+//            av_packet_rescale_ts(
+//                    encodedPacket,
+//                    streamCtx.encoderContext->time_base,
+//                    streamCtx.outputStream->time_base
+//            );
+//
+//            // 写入包
+////            ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+//            ret = av_write_frame(outputFormatContext_, encodedPacket);
+//            av_packet_free(&encodedPacket);
+//
+//            if (ret < 0) {
+//                throw FFmpegException("Error writing encoded audio packet", ret);
+//            }
+//
+//            // 立即刷新头部信息
+//            if (config_.lowLatencyMode && outputFormatContext_->pb) {
+//                avio_flush(outputFormatContext_->pb);
+//            }
+//        }
+//
+//        // 不再需要帧时释放它
+//        av_frame_unref(streamCtx.frame);
+//    }
 }
 
 void StreamProcessor::cleanup() {
@@ -2632,5 +2962,776 @@ void StreamProcessor::handleAudioFrame(const AVFrame* frame, int64_t pts, int fp
         } catch (...) {
             LOGGER_ERROR("Unknown exception in audio frame callback");
         }
+    }
+}
+
+// 添加帧入队方法
+void StreamProcessor::enqueueFrame(AVFrame* frame, StreamContext& streamCtx, bool isVideo) {
+    if (!config_.pushEnabled) {
+        return;
+    }
+
+    auto frameData = std::make_unique<FrameData>();
+    frameData->frame = av_frame_alloc();
+    if (!frameData->frame) {
+        LOGGER_ERROR("Failed to allocate frame for queue");
+        return;
+    }
+
+    // 复制帧数据
+    if (av_frame_ref(frameData->frame, frame) < 0) {
+        LOGGER_ERROR("Failed to reference frame for queue");
+        return;
+    }
+
+    frameData->streamIndex = streamCtx.streamIndex;
+    frameData->pts = frame->pts;
+    frameData->dts = frame->pkt_dts;
+    frameData->timeBase = streamCtx.inputStream->time_base;
+    frameData->isVideo = isVideo;
+
+//    // 将帧加入队列
+//    {
+//        std::unique_lock<std::mutex> lock(queueMutex_);
+//
+//        // 如果队列满了，等待或丢弃最旧的帧
+//        if (frameQueue_.size() >= MAX_QUEUE_SIZE) {
+//            // 丢弃最旧的帧
+//            LOGGER_WARNING("Frame queue full, dropping oldest frame");
+//            frameQueue_.pop();
+//        }
+//
+//        frameQueue_.push(std::move(frameData));
+//    }
+
+    // 将帧加入队列
+    {
+        std::unique_lock<std::mutex> lock(queueMutex_);
+
+        // 如果队列满了，采用更智能的丢帧策略
+        if (frameQueue_.size() >= MAX_QUEUE_SIZE) {
+            // 统计当前队列中视频帧和音频帧的数量
+            size_t videoFrameCount = 0;
+            size_t audioFrameCount = 0;
+
+            // 创建临时队列来重新组织帧
+            std::queue<std::unique_ptr<FrameData>> tempQueue;
+
+            while (!frameQueue_.empty()) {
+                auto& frontFrame = frameQueue_.front();
+                if (frontFrame->isVideo) {
+                    videoFrameCount++;
+                } else {
+                    audioFrameCount++;
+                }
+                tempQueue.push(std::move(frameQueue_.front()));
+                frameQueue_.pop();
+            }
+
+            // 恢复队列
+            frameQueue_ = std::move(tempQueue);
+
+            // 智能丢帧策略
+            if (isVideo && videoFrameCount > audioFrameCount * 2) {
+                // 如果视频帧过多，优先丢弃非关键帧
+                LOGGER_WARNING("Frame queue full, dropping oldest video frame (V:" +
+                               std::to_string(videoFrameCount) + " A:" +
+                               std::to_string(audioFrameCount) + ")");
+
+                // 找到并丢弃最旧的非关键视频帧
+                bool dropped = false;
+                std::queue<std::unique_ptr<FrameData>> newQueue;
+
+                while (!frameQueue_.empty()) {
+                    auto& frontFrame = frameQueue_.front();
+                    if (!dropped && frontFrame->isVideo &&
+                        !(frontFrame->frame->key_frame || frontFrame->frame->pict_type == AV_PICTURE_TYPE_I)) {
+                        // 丢弃这个非关键帧
+                        frameQueue_.pop();
+                        dropped = true;
+                    } else {
+                        newQueue.push(std::move(frameQueue_.front()));
+                        frameQueue_.pop();
+                    }
+                }
+
+                // 如果没有找到非关键帧，就丢弃最旧的帧
+                if (!dropped && !newQueue.empty()) {
+                    std::queue<std::unique_ptr<FrameData>> finalQueue;
+                    bool firstSkipped = false;
+                    while (!newQueue.empty()) {
+                        if (!firstSkipped) {
+                            newQueue.pop();
+                            firstSkipped = true;
+                        } else {
+                            finalQueue.push(std::move(newQueue.front()));
+                            newQueue.pop();
+                        }
+                    }
+                    frameQueue_ = std::move(finalQueue);
+                } else {
+                    frameQueue_ = std::move(newQueue);
+                }
+            } else {
+                // 默认策略：丢弃最旧的帧
+                LOGGER_WARNING("Frame queue full, dropping oldest frame");
+                frameQueue_.pop();
+            }
+        }
+
+        frameQueue_.push(std::move(frameData));
+    }
+
+    // 通知推流线程
+    queueCondVar_.notify_one();
+}
+
+// 新增推流循环方法
+void StreamProcessor::pushLoop() {
+    LOGGER_INFO("Starting push loop for stream: " + config_.id);
+
+    while (isRunning_ || !frameQueue_.empty()) {
+        std::unique_ptr<FrameData> frameData;
+
+        // 从队列获取帧
+        {
+            std::unique_lock<std::mutex> lock(queueMutex_);
+
+            // 等待帧或退出信号
+            queueCondVar_.wait(lock, [this] {
+                return !frameQueue_.empty() || decodingFinished_ || !isRunning_;
+            });
+
+            if (!frameQueue_.empty()) {
+                frameData = std::move(frameQueue_.front());
+                frameQueue_.pop();
+            } else if (decodingFinished_ && frameQueue_.empty()) {
+                // 解码完成且队列为空，退出循环
+                break;
+            } else {
+                continue;
+            }
+        }
+
+        // 编码和推送帧
+        if (frameData && frameData->frame) {
+            try {
+                encodeAndPushFrame(std::move(frameData));
+            } catch (const FFmpegException& e) {
+                LOGGER_ERROR("Error in push loop: " + std::string(e.what()));
+                hasError_ = true;
+            }
+        }
+    }
+
+    LOGGER_INFO("Exiting push loop for stream: " + config_.id);
+}
+
+// 新增编码和推送帧的方法
+void StreamProcessor::encodeAndPushFrame(std::unique_ptr<FrameData> frameData) {
+    if (!frameData || !frameData->frame) {
+        return;
+    }
+
+    // 查找对应的流上下文
+    StreamContext* streamCtx = nullptr;
+
+    if (frameData->isVideo) {
+        for (auto& ctx : videoStreams_) {
+            if (ctx.streamIndex == frameData->streamIndex) {
+                streamCtx = &ctx;
+                break;
+            }
+        }
+    } else {
+        for (auto& ctx : audioStreams_) {
+            if (ctx.streamIndex == frameData->streamIndex) {
+                streamCtx = &ctx;
+                break;
+            }
+        }
+    }
+
+    if (!streamCtx || !streamCtx->encoderContext) {
+        return;
+    }
+
+    // 执行编码
+    if (frameData->isVideo) {
+        encodeVideoFrame(*streamCtx, frameData->frame);
+    } else {
+        encodeAudioFrame(*streamCtx, frameData->frame);
+    }
+}
+
+// 添加独立的视频编码方法
+void StreamProcessor::encodeVideoFrame(StreamContext& streamCtx, AVFrame* frame) {
+    int ret;
+    AVFrame* frameToEncode = frame;
+    bool hwFrameUsed = false;
+
+    // 处理格式转换和缩放
+    if (streamCtx.encoderContext->width != frame->width ||
+        streamCtx.encoderContext->height != frame->height ||
+        streamCtx.encoderContext->pix_fmt != frame->format) {
+
+        // 需要转换
+        if (!streamCtx.swsContext) {
+            AVPixelFormat srcFormat = (AVPixelFormat)frame->format;
+            streamCtx.swsContext = sws_getContext(
+                    frame->width, frame->height, srcFormat,
+                    streamCtx.encoderContext->width, streamCtx.encoderContext->height,
+                    streamCtx.encoderContext->pix_fmt,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr
+            );
+
+            if (!streamCtx.swsContext) {
+                throw FFmpegException("Failed to create scaling context");
+            }
+        }
+
+        // 分配硬件帧
+        if (!streamCtx.hwFrame->data[0]) {
+            streamCtx.hwFrame->format = streamCtx.encoderContext->pix_fmt;
+            streamCtx.hwFrame->width = streamCtx.encoderContext->width;
+            streamCtx.hwFrame->height = streamCtx.encoderContext->height;
+            ret = av_frame_get_buffer(streamCtx.hwFrame, 32);
+            if (ret < 0) {
+                throw FFmpegException("Failed to allocate frame buffer", ret);
+            }
+        }
+
+        // 执行转换
+        ret = sws_scale(streamCtx.swsContext, frame->data, frame->linesize,
+                        0, frame->height, streamCtx.hwFrame->data, streamCtx.hwFrame->linesize);
+        if (ret < 0) {
+            throw FFmpegException("Error during frame scaling", ret);
+        }
+
+        streamCtx.hwFrame->pts = frame->pts;
+        frameToEncode = streamCtx.hwFrame;
+        hwFrameUsed = true;
+    }
+
+//    // 时间戳处理
+//    frameToEncode->pts = av_rescale_q(
+//            frameToEncode->pts,
+//            streamCtx.decoderContext->time_base,
+//            streamCtx.encoderContext->time_base
+//    );
+
+//    // 方法一
+//    // 每个流独立的时间戳管理（避免静态变量问题）
+//    if (streamCtx.first_frame_processed) {
+//        streamCtx.first_frame_processed = false;
+//
+//        // 记录第一帧的时间戳作为基准
+//        streamCtx.pts_offset = frameToEncode->pts;
+//
+//        // 直接转换时间戳，保持相对关系
+//        frameToEncode->pts = av_rescale_q(
+//                frameToEncode->pts - streamCtx.pts_offset,  // 从0开始
+//                streamCtx.decoderContext->time_base,
+//                streamCtx.encoderContext->time_base
+//        );
+//
+//        streamCtx.last_output_pts = frameToEncode->pts;
+//
+//        LOGGER_INFO("First frame timestamp - Input base: " + std::to_string(streamCtx.pts_offset) +
+//                    " -> Output PTS: " + std::to_string(frameToEncode->pts));
+//    } else {
+//        // 后续帧：保持原始时间戳的相对关系
+//        int64_t relative_pts = frameToEncode->pts - streamCtx.pts_offset;
+//
+//        frameToEncode->pts = av_rescale_q(
+//                relative_pts,
+//                streamCtx.decoderContext->time_base,
+//                streamCtx.encoderContext->time_base
+//        );
+//
+//        // 确保时间戳单调递增，但允许小幅调整
+//        if (frameToEncode->pts <= streamCtx.last_output_pts) {
+//            frameToEncode->pts = streamCtx.last_output_pts + 1;
+//        }
+//
+//        streamCtx.last_output_pts = frameToEncode->pts;
+//    }
+//
+//    // 设置DTS
+//    frameToEncode->pkt_dts = frameToEncode->pts;
+
+    // 方法二
+    // 时间戳处理 - 添加更严格的时间戳管理
+    if (streamCtx.first_frame_processed) {
+        streamCtx.first_frame_processed = false;
+        streamCtx.pts_offset = frameToEncode->pts;
+        streamCtx.last_output_pts = 0;
+        LOGGER_INFO("First video frame - resetting timestamps");
+    }
+
+    // 计算相对时间戳
+    int64_t relative_pts = frameToEncode->pts - streamCtx.pts_offset;
+
+    // 转换时间戳
+    frameToEncode->pts = av_rescale_q(
+            relative_pts,
+            streamCtx.decoderContext->time_base,
+            streamCtx.encoderContext->time_base
+    );
+
+    // 确保时间戳单调递增
+    if (frameToEncode->pts <= streamCtx.last_output_pts) {
+        frameToEncode->pts = streamCtx.last_output_pts + 1;
+        LOGGER_DEBUG("Adjusted video PTS to maintain monotonic increase");
+    }
+
+    streamCtx.last_output_pts = frameToEncode->pts;
+
+    // 发送帧到编码器
+    ret = avcodec_send_frame(streamCtx.encoderContext, frameToEncode);
+    if (ret < 0) {
+        if (hwFrameUsed) av_frame_unref(streamCtx.hwFrame);
+        throw FFmpegException("Error sending frame to encoder", ret);
+    }
+
+    // 接收编码后的包
+    while (ret >= 0) {
+        AVPacket* encodedPacket = av_packet_alloc();
+        if (!encodedPacket) {
+            if (hwFrameUsed) av_frame_unref(streamCtx.hwFrame);
+            throw FFmpegException("Failed to allocate encoded packet");
+        }
+
+        ret = avcodec_receive_packet(streamCtx.encoderContext, encodedPacket);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            av_packet_free(&encodedPacket);
+            break;
+        } else if (ret < 0) {
+            av_packet_free(&encodedPacket);
+            if (hwFrameUsed) av_frame_unref(streamCtx.hwFrame);
+            throw FFmpegException("Error receiving packet from encoder", ret);
+        }
+
+        // 设置流索引和时间戳
+        encodedPacket->stream_index = streamCtx.outputStream->index;
+        av_packet_rescale_ts(encodedPacket, streamCtx.encoderContext->time_base,
+                             streamCtx.outputStream->time_base);
+
+//        // 写入输出
+//        {
+//            std::lock_guard<std::mutex> lock(ffmpegMutex_);
+//            ret = av_write_frame(outputFormatContext_, encodedPacket);
+//        }
+
+//        // 确保 DTS <= PTS
+//        if (encodedPacket->dts > encodedPacket->pts) {
+//            encodedPacket->dts = encodedPacket->pts;
+//            LOGGER_DEBUG("Adjusted DTS to be <= PTS");
+//        }
+//
+//        // 对于某些格式（如RTMP），需要确保时间戳从0开始且单调递增
+//        if (encodedPacket->pts < 0) {
+//            LOGGER_WARNING("Negative PTS detected, adjusting to 0");
+//            encodedPacket->pts = 0;
+//            encodedPacket->dts = 0;
+//        }
+
+        // 写入输出 - 使用 av_interleaved_write_frame 以确保正确的交错
+        {
+            std::lock_guard<std::mutex> lock(ffmpegMutex_);
+            // 对于实时流，使用 av_write_frame；对于文件，使用 av_interleaved_write_frame
+            if (config_.outputUrl.find("rtmp://") == 0 ||
+                config_.outputUrl.find("rtsp://") == 0) {
+                ret = av_write_frame(outputFormatContext_, encodedPacket);
+            } else {
+                ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+            }
+        }
+
+        av_packet_free(&encodedPacket);
+
+        if (ret < 0) {
+            if (hwFrameUsed) av_frame_unref(streamCtx.hwFrame);
+            throw FFmpegException("Error writing encoded packet", ret);
+        }
+
+        // 低延迟模式下刷新输出
+        if (config_.lowLatencyMode && outputFormatContext_->pb) {
+            avio_flush(outputFormatContext_->pb);
+        }
+    }
+
+    if (hwFrameUsed) {
+        av_frame_unref(streamCtx.hwFrame);
+    }
+}
+
+void StreamProcessor::encodeAudioFrame(StreamContext& streamCtx, AVFrame* frame) {
+    int ret;
+
+    // 确保我们有有效的上下文
+    if (!streamCtx.encoderContext || !frame) {
+        LOGGER_ERROR("音频编码的编码器上下文或帧无效");
+        return;
+    }
+
+    // 音频帧通常不需要像视频帧那样的格式转换，
+    // 但我们应该检查是否需要重采样
+    AVFrame* frameToEncode = frame;
+
+    // TODO: 如果需要采样格式、采样率或声道布局转换，
+    // 您需要在这里初始化并使用 SwrContext，类似于视频使用 SwsContext 的方式
+
+//    // 为编码器的时间基准调整 PTS
+//    frameToEncode->pts = av_rescale_q(
+//            frameToEncode->pts,
+//            streamCtx.decoderContext->time_base,
+//            streamCtx.encoderContext->time_base
+//    );
+
+    // 方法一
+    // 时间戳处理
+    if (streamCtx.first_frame_processed) {
+        streamCtx.first_frame_processed = false;
+        streamCtx.pts_offset = frameToEncode->pts;
+        streamCtx.last_output_pts = 0;
+        LOGGER_INFO("First audio frame - resetting timestamps");
+    }
+
+    // 计算相对时间戳
+    int64_t relative_pts = frameToEncode->pts - streamCtx.pts_offset;
+
+    // 转换时间戳
+    frameToEncode->pts = av_rescale_q(
+            relative_pts,
+            streamCtx.decoderContext->time_base,
+            streamCtx.encoderContext->time_base
+    );
+
+    // 确保时间戳单调递增
+    if (frameToEncode->pts <= streamCtx.last_output_pts) {
+        frameToEncode->pts = streamCtx.last_output_pts + 1;
+        LOGGER_DEBUG("Adjusted audio PTS to maintain monotonic increase");
+    }
+
+    streamCtx.last_output_pts = frameToEncode->pts;
+
+    // 将帧发送到编码器
+    ret = avcodec_send_frame(streamCtx.encoderContext, frameToEncode);
+    if (ret < 0) {
+        throw FFmpegException("向编码器发送音频帧时出错", ret);
+    }
+
+    // 接收编码后的数据包
+    while (ret >= 0) {
+        AVPacket* encodedPacket = av_packet_alloc();
+        if (!encodedPacket) {
+            throw FFmpegException("分配音频编码数据包失败");
+        }
+
+        ret = avcodec_receive_packet(streamCtx.encoderContext, encodedPacket);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            av_packet_free(&encodedPacket);
+            break;
+        } else if (ret < 0) {
+            av_packet_free(&encodedPacket);
+            throw FFmpegException("从音频编码器接收数据包时出错", ret);
+        }
+
+        // 设置流索引并重新缩放时间戳
+        encodedPacket->stream_index = streamCtx.outputStream->index;
+        av_packet_rescale_ts(
+                encodedPacket,
+                streamCtx.encoderContext->time_base,
+                streamCtx.outputStream->time_base
+        );
+
+//        // 线程安全地写入输出
+//        {
+//            std::lock_guard<std::mutex> lock(ffmpegMutex_);
+//            ret = av_write_frame(outputFormatContext_, encodedPacket);
+//        }
+
+//        // 确保 DTS <= PTS
+//        if (encodedPacket->dts > encodedPacket->pts) {
+//            encodedPacket->dts = encodedPacket->pts;
+//        }
+//
+//        // 确保非负时间戳
+//        if (encodedPacket->pts < 0) {
+//            encodedPacket->pts = 0;
+//            encodedPacket->dts = 0;
+//        }
+
+        // 线程安全地写入输出
+        {
+            std::lock_guard<std::mutex> lock(ffmpegMutex_);
+            if (config_.outputUrl.find("rtmp://") == 0 ||
+                config_.outputUrl.find("rtsp://") == 0) {
+                ret = av_write_frame(outputFormatContext_, encodedPacket);
+            } else {
+                ret = av_interleaved_write_frame(outputFormatContext_, encodedPacket);
+            }
+        }
+
+        av_packet_free(&encodedPacket);
+
+        if (ret < 0) {
+            throw FFmpegException("写入编码音频数据包时出错", ret);
+        }
+
+        // 在低延迟模式下刷新输出
+        if (config_.lowLatencyMode && outputFormatContext_->pb) {
+            avio_flush(outputFormatContext_->pb);
+        }
+    }
+}
+
+// 新增方法：设置跟踪结果回调函数
+void StreamProcessor::setTrackingResultCallback(TrackingResultCallback callback) {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    trackingResultCallback_ = callback;
+    LOGGER_INFO("Tracking result callback set for stream: " + config_.id);
+}
+
+// 新增方法：设置跟踪算法
+void StreamProcessor::setTrackingAlgorithm(std::shared_ptr<ITrackingAlgorithm> algorithm) {
+    std::lock_guard<std::mutex> lock(trackingMutex_);
+    trackingAlgorithm_ = algorithm;
+    LOGGER_INFO("Tracking algorithm set for stream: " + config_.id +
+                " (algorithm: " + (algorithm ? algorithm->getName() : "none") + ")");
+}
+
+// 新增方法：启用或禁用跟踪处理
+void StreamProcessor::enableTracking(bool enable) {
+    trackingEnabled_ = enable;
+    LOGGER_INFO("Tracking " + std::string(enable ? "enabled" : "disabled") +
+                " for stream: " + config_.id);
+}
+
+// 新增方法：检查跟踪是否启用
+bool StreamProcessor::isTrackingEnabled() const {
+    return trackingEnabled_;
+}
+
+// 新增方法：获取跟踪处理统计信息
+StreamProcessor::TrackingStats StreamProcessor::getTrackingStats() const {
+    std::lock_guard<std::mutex> lock(trackingStatsMutex_);
+    auto stats = trackingStats_;
+
+    // 更新队列大小
+    {
+        std::lock_guard<std::mutex> queueLock(trackingQueueMutex_);
+        stats.queue_size = trackingQueue_.size();
+    }
+
+    return stats;
+}
+
+// 新增方法：跟踪处理循环
+void StreamProcessor::trackingLoop() {
+    LOGGER_INFO("Starting tracking loop for stream: " + config_.id);
+
+    while (isRunning_ || !trackingQueue_.empty()) {
+        std::unique_ptr<TrackingFrameData> frameData;
+
+        // 从跟踪队列获取帧
+        {
+            std::unique_lock<std::mutex> lock(trackingQueueMutex_);
+
+            // 等待帧或退出信号
+            trackingQueueCondVar_.wait(lock, [this] {
+                return !trackingQueue_.empty() || trackingFinished_ || !isRunning_;
+            });
+
+            if (!trackingQueue_.empty()) {
+                frameData = std::move(trackingQueue_.front());
+                trackingQueue_.pop();
+            } else if (trackingFinished_ && trackingQueue_.empty()) {
+                // 跟踪处理完成且队列为空，退出循环
+                break;
+            } else {
+                continue;
+            }
+        }
+
+        // 处理跟踪帧
+        if (frameData && frameData->processing_frame) {
+            try {
+                processTrackingFrame(std::move(frameData));
+            } catch (const std::exception& e) {
+                LOGGER_ERROR("Error in tracking loop: " + std::string(e.what()));
+                updateTrackingStats(false, 0.0);
+            }
+        }
+    }
+
+    LOGGER_INFO("Exiting tracking loop for stream: " + config_.id);
+}
+
+// 新增方法：处理跟踪帧
+void StreamProcessor::processTrackingFrame(std::unique_ptr<TrackingFrameData> frameData) {
+    if (!frameData || !frameData->processing_frame || !trackingAlgorithm_) {
+        return;
+    }
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    TrackingResult result;
+    AVFrame* processedFrame = nullptr;
+
+    try {
+        // 执行跟踪算法
+        std::lock_guard<std::mutex> lock(trackingMutex_);
+        processedFrame = trackingAlgorithm_->processFrame(frameData->processing_frame, result);
+
+        auto endTime = std::chrono::high_resolution_clock::now();
+        double processingTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+
+        // 更新统计信息
+        updateTrackingStats(result.success, processingTimeMs);
+
+        // 调用跟踪结果回调
+        if (trackingResultCallback_) {
+            std::lock_guard<std::mutex> callbackLock(callbackMutex_);
+            trackingResultCallback_(result, frameData->pts);
+        }
+
+        // 如果需要推流，将处理后的帧（或原始帧）加入编码队列
+        if (config_.pushEnabled) {
+            AVFrame* frameToEncode = processedFrame ? processedFrame : frameData->original_frame;
+
+            // 查找对应的流上下文
+            StreamContext* streamCtx = nullptr;
+            for (auto& ctx : videoStreams_) {
+                if (ctx.streamIndex == frameData->streamIndex) {
+                    streamCtx = &ctx;
+                    break;
+                }
+            }
+
+            if (streamCtx) {
+                enqueueFrame(frameToEncode, *streamCtx, true);
+            }
+        }
+
+        LOGGER_DEBUG("Tracking processed frame with " + std::to_string(result.objects.size()) +
+                     " objects in " + std::to_string(processingTimeMs) + "ms");
+
+    } catch (const std::exception& e) {
+        auto endTime = std::chrono::high_resolution_clock::now();
+        double processingTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+
+        updateTrackingStats(false, processingTimeMs);
+        LOGGER_ERROR("Tracking algorithm error: " + std::string(e.what()));
+
+        // 如果跟踪失败，仍然需要将原始帧发送到编码队列（如果启用推流）
+        if (config_.pushEnabled) {
+            StreamContext* streamCtx = nullptr;
+            for (auto& ctx : videoStreams_) {
+                if (ctx.streamIndex == frameData->streamIndex) {
+                    streamCtx = &ctx;
+                    break;
+                }
+            }
+
+            if (streamCtx) {
+                enqueueFrame(frameData->original_frame, *streamCtx, true);
+            }
+        }
+    }
+}
+
+// 新增方法：将帧加入跟踪队列
+void StreamProcessor::enqueueTrackingFrame(AVFrame* originalFrame, AVFrame* processingFrame,
+                                           int streamIndex, int64_t pts, int64_t dts,
+                                           AVRational timeBase, int fps) {
+    auto frameData = std::make_unique<TrackingFrameData>();
+
+    // 分配并复制原始帧
+    frameData->original_frame = av_frame_alloc();
+    if (!frameData->original_frame) {
+        LOGGER_ERROR("Failed to allocate original frame for tracking queue");
+        return;
+    }
+
+    if (av_frame_ref(frameData->original_frame, originalFrame) < 0) {
+        LOGGER_ERROR("Failed to reference original frame for tracking queue");
+        return;
+    }
+
+    // 设置处理帧（已经转换为NV12格式）
+    frameData->processing_frame = processingFrame;
+    frameData->streamIndex = streamIndex;
+    frameData->pts = pts;
+    frameData->dts = dts;
+    frameData->timeBase = timeBase;
+    frameData->fps = fps;
+
+    // 将帧加入跟踪队列
+    {
+        std::unique_lock<std::mutex> lock(trackingQueueMutex_);
+
+        // 如果队列满了，丢弃最旧的帧以保持低延迟
+        if (trackingQueue_.size() >= MAX_TRACKING_QUEUE_SIZE) {
+            LOGGER_WARNING("Tracking queue full, dropping oldest frame");
+            trackingQueue_.pop();
+        }
+
+        trackingQueue_.push(std::move(frameData));
+    }
+
+    // 通知跟踪线程
+    trackingQueueCondVar_.notify_one();
+}
+
+// 新增方法：为跟踪转换帧格式
+AVFrame* StreamProcessor::convertFrameForTracking(const AVFrame* srcFrame) {
+    if (!srcFrame) {
+        return nullptr;
+    }
+
+    // 如果已经是NV12格式，直接复制
+    if (srcFrame->format == AV_PIX_FMT_NV12) {
+        AVFrame* dstFrame = av_frame_alloc();
+        if (!dstFrame) {
+            LOGGER_ERROR("Failed to allocate frame for tracking conversion");
+            return nullptr;
+        }
+
+        if (av_frame_ref(dstFrame, srcFrame) < 0) {
+            LOGGER_ERROR("Failed to reference frame for tracking");
+            av_frame_free(&dstFrame);
+            return nullptr;
+        }
+
+        return dstFrame;
+    }
+
+    // TODO: 如果需要从其他格式转换到NV12，在这里实现
+    // 目前假设输入已经是NV12格式
+    LOGGER_WARNING("Frame format conversion for tracking not implemented for format: " +
+                   std::to_string(srcFrame->format));
+    return nullptr;
+}
+
+// 新增方法：更新跟踪统计信息
+void StreamProcessor::updateTrackingStats(bool success, double processingTimeMs) {
+    std::lock_guard<std::mutex> lock(trackingStatsMutex_);
+
+    trackingStats_.total_frames++;
+    if (success) {
+        trackingStats_.successful_frames++;
+    } else {
+        trackingStats_.failed_frames++;
+    }
+
+    // 更新平均处理时间（移动平均）
+    if (trackingStats_.total_frames == 1) {
+        trackingStats_.avg_processing_time_ms = processingTimeMs;
+    } else {
+        double alpha = 0.1; // 平滑因子
+        trackingStats_.avg_processing_time_ms =
+                alpha * processingTimeMs + (1.0 - alpha) * trackingStats_.avg_processing_time_ms;
     }
 }
