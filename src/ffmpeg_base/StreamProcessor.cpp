@@ -88,12 +88,6 @@ void StreamProcessor::start() {
         // 使用智能指针创建线程
         processingThread_ = std::make_unique<std::thread>(&StreamProcessor::processLoop, this);
 
-        // 启动跟踪处理线程（如果启用了跟踪）
-        if (trackingEnabled_ && trackingAlgorithm_) {
-            trackingThread_ = std::make_unique<std::thread>(&StreamProcessor::trackingLoop, this);
-            LOGGER_INFO("Started tracking thread for stream: " + config_.id);
-        }
-
         // 仅在推流启用时启动推流线程
         if (config_.pushEnabled) {
             pushThread_ = std::make_unique<std::thread>(&StreamProcessor::pushLoop, this);
@@ -1898,7 +1892,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
 
                     av_frame_free(&trackingFrame);
                 }
-            } else if (config_.pushEnabled) {
+            } else if (config_.pushEnabled && !trackingEnabled_) {
                 // 如果没有启用跟踪或没有设置跟踪算法，直接将帧加入编码队列
                 enqueueFrame(streamCtx.frame, streamCtx, true);
             }
@@ -3599,7 +3593,7 @@ void StreamProcessor::processTrackingFrame(std::unique_ptr<TrackingFrameData> fr
 
         // 如果需要推流，将处理后的帧（或原始帧）加入编码队列
         if (config_.pushEnabled) {
-            AVFrame* frameToEncode = processedFrame ? processedFrame : frameData->original_frame;
+//            AVFrame* frameToEncode = processedFrame ? processedFrame : frameData->original_frame;
 
             // 查找对应的流上下文
             StreamContext* streamCtx = nullptr;
@@ -3610,8 +3604,8 @@ void StreamProcessor::processTrackingFrame(std::unique_ptr<TrackingFrameData> fr
                 }
             }
 
-            if (streamCtx) {
-                enqueueFrame(frameToEncode, *streamCtx, true);
+            if (streamCtx && processedFrame) {
+                enqueueFrame(processedFrame, *streamCtx, true);
             }
         }
 
@@ -3628,6 +3622,11 @@ void StreamProcessor::processTrackingFrame(std::unique_ptr<TrackingFrameData> fr
 
         updateTrackingStats(false, processingTimeMs);
         LOGGER_ERROR("Tracking algorithm error: " + std::string(e.what()));
+
+        // 释放处理后的帧
+        if (processedFrame) {
+            av_frame_free(&processedFrame);
+        }
 
         // 如果跟踪失败，仍然需要将原始帧发送到编码队列（如果启用推流）
         if (config_.pushEnabled) {
@@ -3737,5 +3736,13 @@ void StreamProcessor::updateTrackingStats(bool success, double processingTimeMs)
         double alpha = 0.1; // 平滑因子
         trackingStats_.avg_processing_time_ms =
                 alpha * processingTimeMs + (1.0 - alpha) * trackingStats_.avg_processing_time_ms;
+    }
+}
+
+void StreamProcessor::startTrackingThread() {
+    // 启动跟踪处理线程（如果启用了跟踪）
+    if (trackingEnabled_ && trackingAlgorithm_) {
+        trackingThread_ = std::make_unique<std::thread>(&StreamProcessor::trackingLoop, this);
+        LOGGER_INFO("Started tracking thread for stream: " + config_.id);
     }
 }

@@ -85,12 +85,9 @@ public:
 
     /**
      * @brief 初始化跟踪算法
-     * @param width 视频宽度
-     * @param height 视频高度
-     * @param fps 帧率
      * @return 是否初始化成功
      */
-    virtual bool initialize(int width, int height, int fps) = 0;
+    virtual bool initialize() = 0;
 
     /**
      * @brief 处理单帧图像
@@ -194,6 +191,8 @@ public:
      * @param algorithm 跟踪算法实例
      */
     void setTrackingAlgorithm(std::shared_ptr<ITrackingAlgorithm> algorithm);
+
+    void startTrackingThread();
 
     /**
      * @brief 启用或禁用跟踪处理

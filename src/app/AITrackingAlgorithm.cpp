@@ -35,6 +35,8 @@ AITrackingAlgorithm::AITrackingAlgorithm(const std::map<int, std::string>& model
     statistics_ = {};
     last_stats_update_ = std::chrono::steady_clock::now();
 
+    initializeColors();
+
     LOGGER_INFO("AITrackingAlgorithm created with " + std::to_string(models_config.size()) +
                 " models, detection interval: " + std::to_string(detection_interval) +
                 ", tracker type: " + tracker_type);
@@ -46,18 +48,11 @@ AITrackingAlgorithm::~AITrackingAlgorithm() {
 }
 
 // 初始化算法
-bool AITrackingAlgorithm::initialize(int width, int height, int fps) {
+bool AITrackingAlgorithm::initialize() {
     if (initialized_) {
         LOGGER_WARNING("AITrackingAlgorithm already initialized");
         return true;
     }
-
-    frame_width_ = width;
-    frame_height_ = height;
-    fps_ = fps;
-
-    LOGGER_INFO("Initializing AITrackingAlgorithm for " + std::to_string(width) + "x" +
-                std::to_string(height) + " @ " + std::to_string(fps) + " FPS");
 
     // 初始化AI模型
     if (!initializeModels()) {
@@ -84,6 +79,9 @@ AVFrame* AITrackingAlgorithm::processFrame(const AVFrame* frame, TrackingResult&
         result.error_message = "Algorithm not initialized";
         return nullptr;
     }
+
+    frame_height_ = frame->height;
+    frame_width_ = frame->width;
 
     auto start_time = std::chrono::steady_clock::now();
 
@@ -129,6 +127,14 @@ AVFrame* AITrackingAlgorithm::processFrame(const AVFrame* frame, TrackingResult&
         auto tracking_end = std::chrono::steady_clock::now();
         double tracking_time_ms = std::chrono::duration<double, std::milli>(tracking_end - tracking_start).count();
 
+        // 在输出图像上绘制跟踪结果
+        drawTrackingResults(current_frame_, result);
+
+        // 将处理后的cv::Mat转换为AVFrame
+
+        std::unique_ptr<AVFrame> outputFrame = std::make_unique<AVFrame>();
+        CvMatToAVFrame(current_frame_, outputFrame.get());
+
         // 准备结果
         result.success = true;
         result.objects.clear();
@@ -155,7 +161,11 @@ AVFrame* AITrackingAlgorithm::processFrame(const AVFrame* frame, TrackingResult&
                      std::to_string(result.objects.size()) + " active objects, " +
                      std::to_string(total_time_ms) + "ms total");
 
-        return nullptr; // 不修改原始帧
+        if (should_detect_) {
+            return outputFrame.release();
+        } else {
+            return nullptr;
+        }
 
     } catch (const std::exception& e) {
         result.success = false;
@@ -623,4 +633,76 @@ cv::Rect2d AITrackingAlgorithm::clipBoundingBox(const cv::Rect2d& rect) const {
     }
 
     return clipped;
+}
+
+void AITrackingAlgorithm::drawTrackingResults(cv::Mat& frame, const TrackingResult& result) {
+    if (!result.success || result.objects.empty()) {
+        return;
+    }
+
+    for (size_t i = 0; i < result.objects.size(); i++) {
+        const cv::Rect& bbox = result.objects[i];
+        int objectId = (i < result.object_ids.size()) ? result.object_ids[i] : -1;
+
+        // 获取颜色
+        cv::Scalar color = getColorForId(objectId);
+
+        // 绘制边界框
+        cv::rectangle(frame, bbox, color, 2);
+
+        // 绘制目标ID
+        if (objectId >= 0) {
+            std::string label = "ID: " + std::to_string(objectId);
+            int baseline = 0;
+            cv::Size textSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.6, 2, &baseline);
+
+            // 背景矩形
+            cv::Point textOrg(bbox.x, bbox.y - 10);
+            if (textOrg.y < textSize.height) {
+                textOrg.y = bbox.y + bbox.height + textSize.height + 10;
+            }
+
+            cv::rectangle(frame,
+                          cv::Point(textOrg.x, textOrg.y - textSize.height - baseline),
+                          cv::Point(textOrg.x + textSize.width, textOrg.y + baseline),
+                          color, cv::FILLED);
+
+            // 绘制文本
+            cv::putText(frame, label, textOrg, cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                        cv::Scalar(255, 255, 255), 2);
+        }
+
+        // 绘制中心点
+        cv::Point center(bbox.x + bbox.width / 2, bbox.y + bbox.height / 2);
+        cv::circle(frame, center, 3, color, -1);
+    }
+
+    // 在左上角显示统计信息
+    std::string info = "Tracking: " + std::to_string(result.objects.size()) + " objects";
+    cv::putText(frame, info, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                cv::Scalar(0, 255, 0), 2);
+}
+
+cv::Scalar AITrackingAlgorithm::getColorForId(int id) {
+    if (id < 0) {
+        return cv::Scalar(128, 128, 128); // 灰色用于无效ID
+    }
+
+    return colors_[id % colors_.size()];
+}
+
+void AITrackingAlgorithm::initializeColors() {
+    // 预定义一些颜色用于绘制不同的跟踪目标
+    colors_ = {
+            cv::Scalar(255, 0, 0),    // 红色
+            cv::Scalar(0, 255, 0),    // 绿色
+            cv::Scalar(0, 0, 255),    // 蓝色
+            cv::Scalar(255, 255, 0),  // 青色
+            cv::Scalar(255, 0, 255),  // 品红
+            cv::Scalar(0, 255, 255),  // 黄色
+            cv::Scalar(128, 0, 128),  // 紫色
+            cv::Scalar(255, 165, 0),  // 橙色
+            cv::Scalar(0, 128, 0),    // 深绿
+            cv::Scalar(128, 128, 0)   // 橄榄色
+    };
 }

@@ -73,7 +73,7 @@ public:
     virtual ~AITrackingAlgorithm();
 
     // ITrackingAlgorithm接口实现
-    bool initialize(int width, int height, int fps) override;
+    bool initialize() override;
     AVFrame* processFrame(const AVFrame* frame, TrackingResult& result) override;
     void cleanup() override;
     std::string getName() const override;
@@ -144,6 +144,9 @@ private:
     mutable std::mutex stats_mutex_;
     Statistics statistics_;
     std::chrono::steady_clock::time_point last_stats_update_;
+
+    // 绘制相关
+    std::vector<cv::Scalar> colors_;
 
     // 内部方法
 
@@ -235,6 +238,12 @@ private:
      * @return 裁剪后的边界框
      */
     cv::Rect2d clipBoundingBox(const cv::Rect2d& rect) const;
+
+    void drawTrackingResults(cv::Mat& frame, const TrackingResult& result);
+
+    cv::Scalar getColorForId(int id);
+
+    void initializeColors();
 };
 
 #endif // AI_TRACKING_ALGORITHM_H

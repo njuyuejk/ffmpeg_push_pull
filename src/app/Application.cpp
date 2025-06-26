@@ -612,8 +612,14 @@ void Application::setupCustomFrameProcessing() {
                 // 设置跟踪算法
                 auto trackingAlgorithm = trackingAlgorithms_[streamId];
                 if (trackingAlgorithm) {
+                    if (!trackingAlgorithm->initialize()) {
+                        LOGGER_ERROR("tracking algorithm initialize failed");
+                        return;
+                    }
                     processor->setTrackingAlgorithm(trackingAlgorithm);
                 }
+
+                processor->startTrackingThread();
 
                 // 设置跟踪结果回调
                 processor->setTrackingResultCallback([this, streamId](const TrackingResult& result, int64_t pts) {
