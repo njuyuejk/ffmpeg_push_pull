@@ -5,6 +5,7 @@
 #ifndef FFMPEG_PULL_PUSH_OPENCV2AVFRAME_H
 #define FFMPEG_PULL_PUSH_OPENCV2AVFRAME_H
 #include "opencv2/opencv.hpp"
+#include "logger/Logger.h"
 extern "C"
 {
 #include <libavcodec/avcodec.h>

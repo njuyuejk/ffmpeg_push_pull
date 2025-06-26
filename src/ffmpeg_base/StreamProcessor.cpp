@@ -1876,7 +1876,7 @@ void StreamProcessor::processVideoPacket(AVPacket* packet, StreamContext& stream
             int fps = streamCtx.inputStream ? (int) av_q2d(streamCtx.inputStream->avg_frame_rate) : 25;
 
             // 调用帧处理回调函数（如果设置了）
-            if (callbackFrame) {
+            if (callbackFrame && config_.aiEnabled) {
                 handleVideoFrame(callbackFrame, pts, fps);
             }
 

@@ -130,11 +130,6 @@ AVFrame* AITrackingAlgorithm::processFrame(const AVFrame* frame, TrackingResult&
         // 在输出图像上绘制跟踪结果
         drawTrackingResults(current_frame_, result);
 
-        // 将处理后的cv::Mat转换为AVFrame
-
-        std::unique_ptr<AVFrame> outputFrame = std::make_unique<AVFrame>();
-        CvMatToAVFrame(current_frame_, outputFrame.get());
-
         // 准备结果
         result.success = true;
         result.objects.clear();
@@ -161,8 +156,34 @@ AVFrame* AITrackingAlgorithm::processFrame(const AVFrame* frame, TrackingResult&
                      std::to_string(result.objects.size()) + " active objects, " +
                      std::to_string(total_time_ms) + "ms total");
 
+        // 如果需要返回处理后的帧
         if (should_detect_) {
-            return outputFrame.release();
+            // 创建并正确初始化AVFrame
+            AVFrame* outputFrame = av_frame_alloc();
+            if (!outputFrame) {
+                LOGGER_ERROR("Failed to allocate output AVFrame");
+                result.success = false;
+                result.error_message = "Memory allocation failed";
+                return nullptr;
+            }
+
+            // 将处理后的cv::Mat转换为AVFrame
+            CvMatToAVFrame(current_frame_, outputFrame);
+
+            // 检查转换是否成功
+            if (outputFrame->width <= 0 || outputFrame->height <= 0) {
+                LOGGER_ERROR("Failed to convert processed Mat to AVFrame");
+                av_frame_free(&outputFrame);
+                result.success = false;
+                result.error_message = "Frame conversion failed";
+                return nullptr;
+            }
+
+            // 复制时间戳信息
+            outputFrame->pts = frame->pts;
+            outputFrame->pkt_dts = frame->pkt_dts;
+
+            return outputFrame;
         } else {
             return nullptr;
         }
